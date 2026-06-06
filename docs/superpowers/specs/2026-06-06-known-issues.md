@@ -86,6 +86,12 @@ floor and never reconciles a z-change with the client.
 
 ## ISSUE-1b — Creature stackpos >= 10 sends the wrong move/turn wire form
 
+**Status:** RESOLVED (commit `9012567`). Live testing of ISSUE-1 exposed a broader
+stackpos problem — the server's items.otb stackpos disagreeing with OTClient's
+`.dat` placement on *any* decorated tile, not just at 10 — so creature move
+(`0x6D`) and turn (`0x6B`) now use the creature-id form `[0xFFFF][id]`, which
+ignores stackpos entirely. The `>= 10` case below is covered by the same fix.
+
 **Severity:** Low — unreachable on real M4 walkable tiles; deferred follow-up of
 ISSUE-1, recorded so it is not silently dropped.
 
