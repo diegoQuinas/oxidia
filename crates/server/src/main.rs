@@ -3,6 +3,7 @@
 //! Tibia server binary: load config, set up tracing, run the listeners.
 
 mod config;
+mod game_service;
 mod login_service;
 
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
+use game_service::handle_game;
 use login_service::{LoginConfig, handle_login};
 
 #[tokio::main]
@@ -58,9 +60,21 @@ async fn main() -> Result<()> {
         motd_num: 1,
     });
 
+    // Load the world for the game port.
+    let items_bytes =
+        std::fs::read("reference/tfs/data/items/items.otb").context("reading items.otb")?;
+    let map_bytes =
+        std::fs::read("reference/tfs/data/world/forgotten.otbm").context("reading forgotten.otbm")?;
+    let items = formats::otb::parse(&items_bytes).context("parsing items.otb")?;
+    let map = formats::otbm::parse(&map_bytes).context("parsing forgotten.otbm")?;
+    let static_map = std::sync::Arc::new(world::map::StaticMap::from_formats(&map, &items));
+    let world_handle = world::game::spawn(static_map);
+    info!(spawn = ?world_handle.map.spawn(), "world loaded");
+
+    let rsa_for_login = Arc::clone(&rsa);
     let login_handler = move |stream, peer| {
         let store = Arc::clone(&store);
-        let rsa = Arc::clone(&rsa);
+        let rsa = Arc::clone(&rsa_for_login);
         let login_cfg = Arc::clone(&login_cfg);
         async move {
             let mut stream = stream;
@@ -70,12 +84,29 @@ async fn main() -> Result<()> {
         }
     };
 
+    let game_handler = {
+        let rsa = Arc::clone(&rsa);
+        let world = world_handle.clone();
+        move |stream, peer| {
+            let rsa = Arc::clone(&rsa);
+            let world = world.clone();
+            async move {
+                let mut stream = stream;
+                let ts: u32 = 0x5EED_0000;
+                let rnd: u8 = 0x2A;
+                if let Err(error) = handle_game(&mut stream, &rsa, &world, ts, rnd).await {
+                    warn!(%peer, %error, "game handler failed");
+                }
+            }
+        }
+    };
+
     let login = tokio::spawn(net::serve_with(
         net::Protocol::Login,
         login_addr,
         login_handler,
     ));
-    let game = tokio::spawn(net::serve(net::Protocol::Game, game_addr));
+    let game = tokio::spawn(net::serve_with(net::Protocol::Game, game_addr, game_handler));
 
     // If either listener exits (bind error), bring the whole process down.
     tokio::select! {
@@ -86,12 +117,46 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolve a [`EnvFilter`] from a config string, falling back to a safe
+/// default when the string is not a valid filter directive.
+fn resolve_filter(default_filter: &str) -> EnvFilter {
+    const FALLBACK: &str = "info";
+
+    EnvFilter::try_new(default_filter).unwrap_or_else(|err| {
+        eprintln!("invalid log filter {default_filter:?} ({err}); falling back to {FALLBACK:?}");
+        EnvFilter::new(FALLBACK)
+    })
+}
+
 /// Initialise `tracing`. `RUST_LOG` takes precedence over the config filter.
 fn init_tracing(default_filter: &str) {
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| resolve_filter(default_filter));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_filter_is_used_as_is() {
+        assert_eq!(resolve_filter("debug").to_string(), "debug");
+    }
+
+    #[test]
+    fn valid_per_target_filter_survives() {
+        // The whole point of EnvFilter: per-target directives must pass through.
+        let resolved = resolve_filter("server=debug,info").to_string();
+        assert!(resolved.contains("server=debug"), "got: {resolved}");
+    }
+
+    #[test]
+    fn invalid_filter_falls_back_to_info() {
+        // "bogus" is not a valid level, so this directive must fail to parse.
+        assert_eq!(resolve_filter("server=bogus").to_string(), "info");
+    }
 }

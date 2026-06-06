@@ -117,6 +117,7 @@ mod tests {
     ///     a tile → read `[env u16][clientId u16][0xFF]`, place it, then read the
     ///     trailing `[count][0xFF]` marker and set `skip = count`;
     ///   - when `skip > 0`, the position is empty → decrement.
+    ///
     /// Validating the encoder against THIS decoder proves it matches the real
     /// client, not an invented scheme.
     fn decode_stream(bytes: &[u8], center: Center) -> HashMap<(i32, i32, i32), u16> {
