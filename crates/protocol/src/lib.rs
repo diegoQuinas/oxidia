@@ -15,6 +15,7 @@ pub mod charlist;
 pub mod frame;
 pub mod game_login;
 pub mod login;
+pub mod map_description;
 pub mod message;
 pub mod rsa;
 pub mod xtea;
