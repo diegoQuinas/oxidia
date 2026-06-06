@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M4 🚧 **core walk code-complete, all tests green — live acceptance pending** (run the real OTClient to confirm the knight is visible and walks). Floor changes / underground (z≥8) and auto-walk are deferred; multiplayer presence is M5.
+- **Milestone:** M4 ✅ **core walk complete and accepted live** → next is **M5 (multiplayer presence)**. Floor changes / underground (z≥8) and auto-walk are deferred; multiplayer presence is M5.
 - **Build:** `cargo build` clean, `cargo test` green (77 tests), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -30,7 +30,7 @@ performance-critical or stable stays native Rust.
 | M2 | Formats: `.otb` + `.otbm` parsers, `mapinfo` example | ✅ done |
 | M3 | Enter game: game handshake (challenge), player load, initial packet sequence, render map | ✅ done |
 | **A** | **Living World → pre-alpha #1** | |
-| M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | 🚧 code-complete, live pending |
+| M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | ✅ done |
 | M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ⬜ |
 | M6 | Chat: say / whisper / yell + default channel | ⬜ |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
@@ -141,7 +141,7 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m4-walk-design.md`, `docs/supe
 5. ✅ `protocol::map_description` — render creatures in the `0x64` (spliced after the ground item); refactor into a shared `get_map_description`; `encode_slice` for the directional row/column strips.
 6. ✅ `protocol::walk` — `creature_move 0x6D`, `cancel_walk 0xB5`, `creature_turn 0x6B`, and `walk_update` (0x6D + slices; independent y/x blocks so a diagonal emits both).
 7. ✅ `server::game_service` — render the player in the enter-world burst; `run_session` now decrypts each frame and dispatches walk (`0x65-0x68`, `0x6A-0x6D`) / turn (`0x6F-0x72`); `Moved`→`walk_update`, `Blocked`→`cancel_walk`. Integration replay walks east and asserts a `0x6D` comes back.
-8. ⬜ **Live acceptance pending** — run the real OTClient and confirm the Test Knight is visible with its outfit on the Thais temple and walks with collision.
+8. ✅ **Accepted live** — real OTClient renders the Test Knight with its outfit on the Thais temple ground and walks it around with arrow keys; walls stop it. Fixed during review: a bad-checksum frame now drops instead of killing the session.
 
 **Deferred (later slice):** floor changes / stairs / underground (z≥8) walk; auto-walk / click-to-move pathfinding; diagonal corner-cut blocking; real player persistence; walkthrough byte fidelity (self currently `0x00`).
 
