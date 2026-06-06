@@ -12,6 +12,7 @@
 pub mod adler;
 pub mod challenge;
 pub mod charlist;
+pub mod creature;
 pub mod enter_world;
 pub mod frame;
 pub mod game_login;
@@ -19,6 +20,7 @@ pub mod login;
 pub mod map_description;
 pub mod message;
 pub mod rsa;
+pub mod walk;
 pub mod xtea;
 
 pub use adler::adler32;

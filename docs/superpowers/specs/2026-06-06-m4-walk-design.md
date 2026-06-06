@@ -121,7 +121,7 @@ The 10 s keep-alive ping (`0x1D` on idle) is preserved exactly as in M3.
   - South step → `0x67` + a `18 × 1` description of the new bottom row.
   - East step → `0x66` + a `1 × 14` description of the new right column.
   - West step → `0x68` + a `1 × 14` description of the new left column.
-  - Diagonal step → send a full `0x64` map description (TFS sends the full description for diagonals rather than two slices).
+  - Diagonal step → TFS does **not** send a full `0x64`. The Y and X slice checks in `sendMoveCreature` are independent `if` blocks, so a diagonal emits `0x6D` then **both** the applicable Y-slice and X-slice (e.g. NE → `0x65` north-slice + `0x66` east-slice).
   - The slice encoders reuse the same skip-encoding + creature serialization as the full `0x64`; the only difference is the rectangle bounds. The exact edge offsets are ported byte-for-byte from `protocolgame.cpp` and validated against an OTClient-faithful slice decoder.
 - **`sendCancelWalk`** — `[0xB5][u8 direction]` (verify the exact opcode against `protocolgame.cpp`). Sent on a `Blocked` result so the client cancels its predicted walk and faces the attempted direction.
 
