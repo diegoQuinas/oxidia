@@ -1,8 +1,9 @@
-# The Crustacean Server 🦀
+# Oxidia 🦀
 
 ![coverage](https://img.shields.io/badge/coverage-90%25-brightgreen)
 ![protocol](https://img.shields.io/badge/protocol-10.98-blue)
 ![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
+![license](https://img.shields.io/badge/license-MIT-blue)
 
 An Open Tibia server written in Rust — protocol **10.98**, targeting the **OTClient Redemption** client.
 
@@ -38,3 +39,7 @@ Combat, Lua scripting, and creatures come after M4.
 ---
 
 Built with strict TDD. See `PROGRESS.md` for the full milestone log and protocol notes.
+
+## License
+
+[MIT](LICENSE) © Diego Perez Giordán

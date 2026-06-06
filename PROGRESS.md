@@ -1,10 +1,10 @@
-# PROGRESS — The Crustacean Server
+# PROGRESS — Oxidia
 
 Open Tibia server in Rust, protocol **10.98**, client target **OTClient Redemption** (mehah/otclient).
 Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, never port line-by-line).
 
 > Read this file first in every session.
-> Repo layout: the OTClient test client lives in `../client/`; this Rust workspace **is** the server. Run every command below from inside `server/`. The server binary is `crustacean-server`.
+> Repo layout: the OTClient test client lives in `../client/`; this Rust workspace **is** the server. Run every command below from inside `server/`. The server binary is `oxidia`.
 
 ## Current status
 
@@ -31,7 +31,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ```
 ../client/             OTClient Redemption test client (C++) + downloads — NOT the server
-server/                this Rust workspace (The Crustacean Server)
+server/                this Rust workspace (Oxidia)
 crates/
   net/         tokio listener + connection lifecycle      (M0: accept+log; M1: framing)
   protocol/    NetworkMessage, RSA, XTEA, Adler-32, packets (zero game logic)
@@ -50,7 +50,7 @@ Re-clone reference if absent:
 
 ```bash
 cargo build && cargo test
-RUST_LOG=info cargo run -p server -- config/server.toml   # binary name: crustacean-server
+RUST_LOG=info cargo run -p server -- config/server.toml   # binary name: oxidia
 ```
 
 ## M1 plan

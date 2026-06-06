@@ -1,6 +1,6 @@
 # M3 — Enter Game (design)
 
-The Crustacean Server · Open Tibia · protocol 10.98 · client target OTClient Redemption (1098).
+Oxidia · Open Tibia · protocol 10.98 · client target OTClient Redemption (1098).
 Reference oracle: TFS 1.4.2 at `reference/tfs/` (read-only).
 
 ## Goal & acceptance

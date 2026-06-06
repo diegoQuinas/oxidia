@@ -1,10 +1,10 @@
 # Tibia server configuration (protocol 10.98)
 
 [server]
-world_name = "The Crustacean Server"
+world_name = "Oxidia"
 # Address advertised to the client in the character list.
 host = "127.0.0.1"
-motd = "Welcome to The Crustacean Server"
+motd = "Welcome to Oxidia"
 
 [network]
 # Login protocol (7171) and game protocol (7172).
@@ -14,7 +14,7 @@ game_port = 7172
 bind = "0.0.0.0"
 
 [database]
-path = "crustacean.db"
+path = "oxidia.db"
 
 [log]
 # tracing EnvFilter directive; RUST_LOG overrides this if set.
