@@ -14,7 +14,7 @@ game_port = 7172
 bind = "0.0.0.0"
 
 [database]
-path = "tibia.db"
+path = "crustacean.db"
 
 [log]
 # tracing EnvFilter directive; RUST_LOG overrides this if set.
