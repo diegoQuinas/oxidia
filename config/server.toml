@@ -1,0 +1,21 @@
+# Tibia server configuration (protocol 10.98)
+
+[server]
+world_name = "The Crustacean Server"
+# Address advertised to the client in the character list.
+host = "127.0.0.1"
+motd = "Welcome to The Crustacean Server"
+
+[network]
+# Login protocol (7171) and game protocol (7172).
+login_port = 7171
+game_port = 7172
+# Interface the listeners bind to.
+bind = "0.0.0.0"
+
+[database]
+path = "tibia.db"
+
+[log]
+# tracing EnvFilter directive; RUST_LOG overrides this if set.
+filter = "info"
