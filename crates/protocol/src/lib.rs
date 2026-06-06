@@ -20,6 +20,7 @@ pub mod login;
 pub mod map_description;
 pub mod message;
 pub mod rsa;
+pub mod walk;
 pub mod xtea;
 
 pub use adler::adler32;
