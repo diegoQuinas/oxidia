@@ -70,6 +70,7 @@ mod tests {
         [server]
         world_name = "Rusted"
         host = "127.0.0.1"
+        motd = "Welcome to Rusted"
 
         [network]
         login_port = 7171
@@ -91,6 +92,7 @@ mod tests {
         assert_eq!(cfg.network.game_port, 7172);
         assert_eq!(cfg.login_addr().to_string(), "0.0.0.0:7171");
         assert_eq!(cfg.game_addr().to_string(), "0.0.0.0:7172");
+        assert_eq!(cfg.server.motd, "Welcome to Rusted")
     }
 
     #[test]
