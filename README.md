@@ -1,5 +1,9 @@
 # The Crustacean Server 🦀
 
+![coverage](https://img.shields.io/badge/coverage-90%25-brightgreen)
+![protocol](https://img.shields.io/badge/protocol-10.98-blue)
+![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
+
 An Open Tibia server written in Rust — protocol **10.98**, targeting the **OTClient Redemption** client.
 
 ![Test Knight standing on the Thais temple ground in OTClient](docs/assets/ingame.png)
