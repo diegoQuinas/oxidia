@@ -78,9 +78,9 @@ where
     let inner = frame::checksummed(&message);
     net::frame::write_frame(stream, &inner).await?;
 
-    // 2. Read the client's first packet.
+    // 2. Read the client's first packet (the game-login).
     let Some(raw) = net::frame::read_frame(stream).await? else {
-        return Ok(());
+        return Ok(()); // client closed before sending the login
     };
     let payload = frame::verify(&raw)?;
     let req = game_login::parse(payload, rsa)?;
@@ -96,21 +96,54 @@ where
 
     // 4. OTClient extended-opcode init.
     if req.os >= OS_OTCLIENT_LINUX {
-        let ext = enter_world::extended_opcode_init();
-        send_encrypted(stream, &keys, &ext).await?;
+        send_encrypted(stream, &keys, &enter_world::extended_opcode_init()).await?;
     }
 
     // 5. "Player load": register in the world.
     let name = String::from_utf8_lossy(&req.character_name).to_string();
-    let Some(snapshot) = world.login(name).await else {
+    let Some(snapshot) = world.login(name.clone()).await else {
         return send_disconnect(stream, &keys, "Your character could not be loaded.").await;
     };
 
-    // 6. Build + send the burst as one encrypted frame.
+    // 6. Build + send the enter-world burst as one encrypted frame.
     let center =
         Center { x: snapshot.position.x, y: snapshot.position.y, z: snapshot.position.z };
     let burst = build_enter_world_burst(snapshot.id, center, world.map.as_ref());
     send_encrypted(stream, &keys, &burst).await?;
+    tracing::info!(character = %name, id = snapshot.id, ?center, "player entered game");
+
+    // 7. Hold the session open. The client times out if it receives nothing for a
+    // while, so keep the link warm: drain the client's packets, and whenever it
+    // goes quiet for PING_INTERVAL send a ping (`0x1D`). M4 will handle these
+    // packets for real (walk, ping/pong, logout); M3 just keeps the world visible.
+    run_session(stream, &keys).await
+}
+
+/// Game opcode `0x1D` — ping. TFS sends it to keep the connection alive.
+const PING_OPCODE: u8 = 0x1D;
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Keep a connected session alive until the client disconnects.
+async fn run_session<S>(stream: &mut S, keys: &xtea::RoundKeys) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        // Wait for a client packet, but no longer than PING_INTERVAL — when the
+        // client is idle the timeout fires and we ping it. The read future is only
+        // cancelled while idle (awaiting the first byte), so no partial frame is lost.
+        match tokio::time::timeout(PING_INTERVAL, net::frame::read_frame(stream)).await {
+            Ok(frame) => {
+                if frame?.is_none() {
+                    break; // client disconnected
+                }
+                // M3 ignores client packets (walk/ping/etc.) — drained, not parsed.
+            }
+            Err(_elapsed) => {
+                send_encrypted(stream, keys, &[PING_OPCODE]).await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -231,6 +264,9 @@ mod tests {
         assert_eq!(burst[self_len + 1], enter_world::OP_ENTER_WORLD);
         assert_eq!(burst[self_len + 2], map_description::OPCODE_MAP_DESCRIPTION);
 
+        // Closing the client makes `run_session` see EOF and return; without this
+        // the handler would hold the session open (pinging) until timeout.
+        drop(client);
         server_task.await.unwrap();
     }
 }
