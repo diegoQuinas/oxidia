@@ -2,20 +2,43 @@
 //! enableXTEA -> enter-world burst. Mirrors `login_service` but for ProtocolGame.
 
 use anyhow::Result;
-use protocol::map_description::{self, Center};
+use protocol::map_description::{self, Center, PlacedCreature};
 use protocol::rsa::RsaPrivateKey;
-use protocol::{enter_world, frame, game_login, xtea};
+use protocol::{creature, enter_world, frame, game_login, walk, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
-use world::game::WorldHandle;
+use world::game::{MoveOutcome, WorldHandle};
+use world::{Direction, Position};
 
 pub const CLIENT_VERSION_MIN: u16 = 1097;
 pub const CLIENT_VERSION_MAX: u16 = 1098;
 const OS_OTCLIENT_LINUX: u16 = 10;
 
+/// Fixed outfit for the M4 Test Knight (a visible male citizen look).
+fn knight_outfit() -> creature::Outfit {
+    creature::Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
+}
+
+/// Serialize the player as an (unknown) creature thing for the initial 0x64.
+fn player_creature_bytes(id: u32, name: &[u8], direction: u8) -> Vec<u8> {
+    let view = creature::CreatureView {
+        id,
+        name,
+        health_percent: 100,
+        direction,
+        outfit: knight_outfit(),
+        light_level: 0,
+        light_color: 0,
+        speed: 220,
+    };
+    creature::add_creature(&view, false, 0)
+}
+
 /// Build the full enter-world burst payload, in order, for a fresh login.
 pub fn build_enter_world_burst(
     snapshot_id: u32,
     center: Center,
+    direction: u8,
+    name: &[u8],
     map: &impl map_description::GroundSource,
 ) -> Vec<u8> {
     let stats = enter_world::Stats {
@@ -34,11 +57,18 @@ pub fn build_enter_world_burst(
         base_speed: 220,
     };
 
+    let placed = [PlacedCreature {
+        x: center.x,
+        y: center.y,
+        z: center.z,
+        bytes: player_creature_bytes(snapshot_id, name, direction),
+    }];
+
     let mut burst = Vec::new();
     burst.extend(enter_world::self_info(snapshot_id));
     burst.extend(enter_world::pending_state());
     burst.extend(enter_world::enter_world());
-    burst.extend(map_description::encode(center, map, &[]));
+    burst.extend(map_description::encode(center, map, &placed));
     burst.extend(enter_world::magic_effect(
         center.x,
         center.y,
@@ -108,39 +138,126 @@ where
     // 6. Build + send the enter-world burst as one encrypted frame.
     let center =
         Center { x: snapshot.position.x, y: snapshot.position.y, z: snapshot.position.z };
-    let burst = build_enter_world_burst(snapshot.id, center, world.map.as_ref());
+    let burst = build_enter_world_burst(
+        snapshot.id,
+        center,
+        snapshot.direction.to_byte(),
+        name.as_bytes(),
+        world.map.as_ref(),
+    );
     send_encrypted(stream, &keys, &burst).await?;
     tracing::info!(character = %name, id = snapshot.id, ?center, "player entered game");
 
-    // 7. Hold the session open. The client times out if it receives nothing for a
-    // while, so keep the link warm: drain the client's packets, and whenever it
-    // goes quiet for PING_INTERVAL send a ping (`0x1D`). M4 will handle these
-    // packets for real (walk, ping/pong, logout); M3 just keeps the world visible.
-    run_session(stream, &keys).await
+    let session = Session { id: snapshot.id, pos: snapshot.position, facing: snapshot.direction };
+    run_session(stream, &keys, world, session).await
 }
 
 /// Game opcode `0x1D` — ping. TFS sends it to keep the connection alive.
 const PING_OPCODE: u8 = 0x1D;
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Keep a connected session alive until the client disconnects.
-async fn run_session<S>(stream: &mut S, keys: &xtea::RoundKeys) -> Result<()>
+/// Per-connection mutable player state the dispatcher walks/turns.
+struct Session {
+    id: u32,
+    pos: Position,
+    facing: Direction,
+}
+
+/// Keep a connected session alive, dispatching client walk/turn packets.
+async fn run_session<S>(
+    stream: &mut S,
+    keys: &xtea::RoundKeys,
+    world: &WorldHandle,
+    mut session: Session,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        // Wait for a client packet, but no longer than PING_INTERVAL — when the
-        // client is idle the timeout fires and we ping it. The read future is only
-        // cancelled while idle (awaiting the first byte), so no partial frame is lost.
         match tokio::time::timeout(PING_INTERVAL, net::frame::read_frame(stream)).await {
             Ok(frame) => {
-                if frame?.is_none() {
+                let Some(raw) = frame? else {
                     break; // client disconnected
+                };
+                let body = frame::verify(&raw)?;
+                let payload = match xtea::decrypt_message(body, keys) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::debug!(?e, "dropping undecryptable frame");
+                        continue;
+                    }
+                };
+                if let Some(&opcode) = payload.first() {
+                    handle_client_packet(stream, keys, world, &mut session, opcode).await?;
                 }
-                // M3 ignores client packets (walk/ping/etc.) — drained, not parsed.
             }
             Err(_elapsed) => {
                 send_encrypted(stream, keys, &[PING_OPCODE]).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map an incoming opcode to a (direction, is_turn) action, or `None` to drain.
+fn opcode_action(opcode: u8) -> Option<(Direction, bool)> {
+    match opcode {
+        0x65 => Some((Direction::North, false)),
+        0x66 => Some((Direction::East, false)),
+        0x67 => Some((Direction::South, false)),
+        0x68 => Some((Direction::West, false)),
+        0x6A => Some((Direction::NorthEast, false)),
+        0x6B => Some((Direction::SouthEast, false)),
+        0x6C => Some((Direction::SouthWest, false)),
+        0x6D => Some((Direction::NorthWest, false)),
+        0x6F => Some((Direction::North, true)),
+        0x70 => Some((Direction::East, true)),
+        0x71 => Some((Direction::South, true)),
+        0x72 => Some((Direction::West, true)),
+        _ => None, // pong (0x1E), unknown -> drain; logout handled by EOF
+    }
+}
+
+async fn handle_client_packet<S>(
+    stream: &mut S,
+    keys: &xtea::RoundKeys,
+    world: &WorldHandle,
+    session: &mut Session,
+    opcode: u8,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some((direction, is_turn)) = opcode_action(opcode) else {
+        return Ok(());
+    };
+
+    if is_turn {
+        if let Some(facing) = world.turn_player(session.id, direction).await {
+            session.facing = facing;
+            let pos = (session.pos.x, session.pos.y, session.pos.z);
+            let pkt = walk::creature_turn(pos, 1, session.id, facing.to_byte());
+            send_encrypted(stream, keys, &pkt).await?;
+        }
+        return Ok(());
+    }
+
+    if let Some(res) = world.move_player(session.id, direction).await {
+        session.facing = res.facing;
+        match res.outcome {
+            MoveOutcome::Moved { from, to } => {
+                session.pos = to;
+                let pkt = walk::walk_update(
+                    (from.x, from.y, from.z),
+                    (to.x, to.y, to.z),
+                    world.map.as_ref(),
+                    &[],
+                );
+                send_encrypted(stream, keys, &pkt).await?;
+            }
+            MoveOutcome::Blocked => {
+                let pkt = walk::cancel_walk(res.facing.to_byte());
+                send_encrypted(stream, keys, &pkt).await?;
             }
         }
     }
@@ -194,14 +311,24 @@ mod tests {
             description: String::new(),
             spawn_file: None,
             house_file: None,
-            tiles: vec![MapTile {
-                x: 95,
-                y: 117,
-                z: 7,
-                flags: 0,
-                house_id: None,
-                items: vec![MapItem { id: 100, contents: vec![] }],
-            }],
+            tiles: vec![
+                MapTile {
+                    x: 95,
+                    y: 117,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem { id: 100, contents: vec![] }],
+                },
+                MapTile {
+                    x: 96,
+                    y: 117,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem { id: 100, contents: vec![] }],
+                },
+            ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
             waypoints: vec![],
         };
@@ -263,6 +390,17 @@ mod tests {
         assert_eq!(burst[self_len], enter_world::OP_PENDING_STATE);
         assert_eq!(burst[self_len + 1], enter_world::OP_ENTER_WORLD);
         assert_eq!(burst[self_len + 2], map_description::OPCODE_MAP_DESCRIPTION);
+
+        // Send a walk-east (0x66) and expect a 0x6D creature move back.
+        let mut walk_pkt = protocol::message::MessageWriter::new();
+        walk_pkt.write_u8(0x66);
+        let body = xtea::encrypt_message(&walk_pkt.into_bytes(), &keys);
+        let inner = frame::checksummed(&body);
+        net::frame::write_frame(&mut client, &inner).await.unwrap();
+
+        let move_raw = net::frame::read_frame(&mut client).await.unwrap().unwrap();
+        let move_pkt = xtea::decrypt_message(frame::verify(&move_raw).unwrap(), &keys).unwrap();
+        assert_eq!(move_pkt[0], walk::OP_CREATURE_MOVE);
 
         // Closing the client makes `run_session` see EOF and return; without this
         // the handler would hold the session open (pinging) until timeout.
