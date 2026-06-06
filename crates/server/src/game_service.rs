@@ -179,7 +179,15 @@ where
                 let Some(raw) = frame? else {
                     break; // client disconnected
                 };
-                let body = frame::verify(&raw)?;
+                // A single corrupt frame must not tear down a healthy session:
+                // a bad checksum or undecryptable body is logged and dropped.
+                let body = match frame::verify(&raw) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::debug!(?e, "dropping frame with bad checksum");
+                        continue;
+                    }
+                };
                 let payload = match xtea::decrypt_message(body, keys) {
                     Ok(p) => p,
                     Err(e) => {
