@@ -8,8 +8,8 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M3 ✅ **enter game complete and accepted live** → next is **M4 (walk)**.
-- **Build:** `cargo build` clean, `cargo test` green (74 tests), `cargo clippy --all-targets -- -D warnings` clean.
+- **Milestone:** M4 🚧 **core walk code-complete, all tests green — live acceptance pending** (run the real OTClient to confirm the knight is visible and walks). Floor changes / underground (z≥8) and auto-walk are deferred; multiplayer presence is M5.
+- **Build:** `cargo build` clean, `cargo test` green (77 tests), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
 - **Accepted (M2):** `cargo run -p formats --example mapinfo` parses the real `items.otb` (v3.57, 26 282 items) and `forgotten.otbm` (2048×2048, 340 594 tiles, 429 031 items, 5 towns) — full tree walk, no unknown nodes/attrs.
@@ -17,15 +17,53 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Milestones
 
+Full roadmap (ROI-ordered, with rationale and ship gates):
+`docs/superpowers/specs/2026-06-06-roadmap-to-production.md`.
+Architecture is locked: **Rust core + embedded Lua (mlua)** for mutable content
+(spells, monster behaviors, NPC dialogue, quests); static data in TOML/RON; everything
+performance-critical or stable stays native Rust.
+
 | # | Goal | State |
 |---|------|-------|
 | M0 | Skeleton: workspace compiles, tests green, server listens on 7171/7172, logs connections | ✅ done |
 | M1 | Login server: framing, Adler-32, RSA, XTEA, NetworkMessage, login parse, char list, sniff tool | ✅ done |
 | M2 | Formats: `.otb` + `.otbm` parsers, `mapinfo` example | ✅ done |
 | M3 | Enter game: game handshake (challenge), player load, initial packet sequence, render map | ✅ done |
-| M4 | Walk: movement packets, tile updates, floor changes, collision | ⬜ |
+| **A** | **Living World → pre-alpha #1** | |
+| M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | 🚧 code-complete, live pending |
+| M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ⬜ |
+| M6 | Chat: say / whisper / yell + default channel | ⬜ |
+| M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
+| M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
+| **B** | **Items & Inventory** | |
+| M9 | Ground items, stacks, look-at | ⬜ |
+| M10 | Inventory & equipment: move, equip, containers, use | ⬜ |
+| **C** | **Scripting** | |
+| M11 | Lua runtime (mlua): hot-reloadable content hooks (onUse/onStepIn/onSay/…) | ⬜ |
+| **D** | **PvE → pre-alpha #2** | |
+| M12 | Creatures & monsters: spawns, AI, A* pathfinding | ⬜ |
+| M13 | Loot & corpses | ⬜ |
+| M14 | Skills, XP, levels, vocations | ⬜ |
+| M15 | Spells, runes, conditions | ⬜ |
+| **E** | **Social & Economy** | |
+| M16 | NPCs: dialogue (Lua) + buy/sell | ⬜ |
+| M17 | Depot, bank, money | ⬜ |
+| M18 | Parties: shared XP | ⬜ |
+| M19 | Guilds + guild channel | ⬜ |
+| **F** | **World Systems** | |
+| M20 | Houses | ⬜ |
+| M21 | Quests | ⬜ |
+| M22 | Market | ⬜ |
+| M23 | PvP systems: skulls, frags, war/PZ rules | ⬜ |
+| **G** | **Production Hardening** 🏁 | |
+| M24 | GM/admin tools | ⬜ |
+| M25 | Persistence robustness | ⬜ |
+| M26 | Account management (in-protocol creation, security) | ⬜ |
+| M27 | Ops & stability: metrics, logging, rate-limit, reconnection, load test | ⬜ |
+| M28 | Configurability & deploy | ⬜ |
 
-(Combat / Lua scripting / creatures are planned *after* M4.)
+**Ship gates:** pre-alpha #1 after M8 (walk + chat + PvP, persisted) · pre-alpha #2
+after M15 (full PvE loop) · production after M28.
 
 ## Workspace layout
 
@@ -91,6 +129,30 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m3-enter-game-design.md`, `doc
 Burst order (one XTEA frame): `0x17, 0x0A, 0x0F, 0x64 map, 0x83, 0x79×11, 0xA0, 0xA1, 0x82, 0x8D, 0x9F, 0xA2`.
 
 **Deferred to M4:** per-connection random challenge (M3 uses a fixed `ts/rnd` — functionally fine since the client echoes it back, but no replay protection); items/creatures on tiles; underground floor walk (z≥8); real player persistence (M3 spawns every char at the temple).
+
+## M4 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-06-m4-walk-design.md`, `docs/superpowers/plans/2026-06-06-m4-walk.md`. Scope: **core walk on one floor + visible creature**. Pure request/response over the world actor (no broadcast — single player; presence is M5).
+
+1. ✅ `world::Direction` (wire bytes N0 E1 S2 W3 SW4 SE5 NW6 NE7, `delta`) + `Position::offset`.
+2. ✅ `world::map::StaticMap` walkability — a `blocked` set derived at load from the `items.otb` `FLAG_BLOCK_SOLID` (bit 0); `is_walkable(pos)` = has ground AND not blocked.
+3. ✅ `world::game` — `Move`/`Turn` actor commands, `MoveResult { outcome: Moved{from,to}|Blocked, facing }`; `PlayerState` gains a mutable `direction` (spawn faces South).
+4. ✅ `protocol::creature` — byte-faithful `AddCreature`/`AddOutfit` port (1098). `0x0061` unknown / `0x0062` known forms; outfit, light, `speed/2`, shields, guild-emblem (unknown only), mark, helpers, walkthrough.
+5. ✅ `protocol::map_description` — render creatures in the `0x64` (spliced after the ground item); refactor into a shared `get_map_description`; `encode_slice` for the directional row/column strips.
+6. ✅ `protocol::walk` — `creature_move 0x6D`, `cancel_walk 0xB5`, `creature_turn 0x6B`, and `walk_update` (0x6D + slices; independent y/x blocks so a diagonal emits both).
+7. ✅ `server::game_service` — render the player in the enter-world burst; `run_session` now decrypts each frame and dispatches walk (`0x65-0x68`, `0x6A-0x6D`) / turn (`0x6F-0x72`); `Moved`→`walk_update`, `Blocked`→`cancel_walk`. Integration replay walks east and asserts a `0x6D` comes back.
+8. ⬜ **Live acceptance pending** — run the real OTClient and confirm the Test Knight is visible with its outfit on the Thais temple and walks with collision.
+
+**Deferred (later slice):** floor changes / stairs / underground (z≥8) walk; auto-walk / click-to-move pathfinding; diagonal corner-cut blocking; real player persistence; walkthrough byte fidelity (self currently `0x00`).
+
+## Protocol gotchas (M4 walk)
+
+- **Every item is `[u16 clientId][u8 0xFF MARK_UNMARKED]`** at 1098 (`networkmessage.cpp:86`). The `0xFF` is part of the item, not a tile terminator.
+- **Tile thing order** (`GetTileDescription:583`): env `u16 0x0000`, ground item, top items, **creatures (reverse) via `AddCreature`**, down items. The tile ends at the next `[skip][0xFF]` flush — there is no per-tile terminator. Creature markers `0x0061`/`0x0062` are `< 0xFF00`, so the client reads them as things, not skip markers.
+- **Diagonal steps send two slices, not a full `0x64`.** `sendMoveCreature`'s y and x checks are independent `if` blocks; a diagonal emits the applicable Y-slice and X-slice both.
+- **Slice anchors** (`sendMoveCreature:2616-2630`, viewport 8×6): north/south anchor on `oldPos.x-8` and `newPos.y∓`; east/west anchor on `newPos.x±` and `newPos.y-6`. The slice still runs all 8 floors (`GetMapDescription`).
+- **A lone creature on a ground-only tile has stackpos = 1** (ground = 0). `0x6D` / `0x6B` use the stackpos < 10 form.
+- **Incoming vs outgoing opcode overlap is fine:** `0x6D` inbound = walk-NW, outbound = creature-move; `0x6B` inbound = walk-SE, outbound = creature-turn. Tibia opcodes are namespaced by direction.
 
 ## Protocol gotchas (M3 game-enter)
 
