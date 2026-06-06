@@ -66,9 +66,16 @@ pub async fn handle_game<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // 1. Send the challenge (checksummed, NOT XTEA).
+    // 1. Send the challenge (checksummed, NOT XTEA). Every TFS message carries an
+    // inner `[u16 payload length]` (TFS `onConnect`, protocolgame.cpp:429 writes
+    // 0x0006). For XTEA packets `xtea::encrypt_message` adds it; the plaintext
+    // challenge must prepend it by hand, or OTClient's first-packet size check
+    // fails and it never sends the game-login. The checksum covers length+payload.
     let challenge = protocol::challenge::encode(challenge_timestamp, challenge_random);
-    let inner = frame::checksummed(&challenge);
+    let mut message = Vec::with_capacity(2 + challenge.len());
+    message.extend_from_slice(&(challenge.len() as u16).to_le_bytes());
+    message.extend_from_slice(&challenge);
+    let inner = frame::checksummed(&message);
     net::frame::write_frame(stream, &inner).await?;
 
     // 2. Read the client's first packet.
@@ -184,12 +191,14 @@ mod tests {
             })
         };
 
-        // 1. Read the challenge frame.
+        // 1. Read the challenge frame. After the checksum, the message carries an
+        // inner `[u16 length]` (= 6) before the 0x1F opcode, matching TFS onConnect.
         let chal_raw = net::frame::read_frame(&mut client).await.unwrap().unwrap();
         let chal = frame::verify(&chal_raw).unwrap();
-        assert_eq!(chal[0], protocol::challenge::OPCODE_CHALLENGE);
-        let echoed_ts = u32::from_le_bytes([chal[1], chal[2], chal[3], chal[4]]);
-        let echoed_rnd = chal[5];
+        assert_eq!(u16::from_le_bytes([chal[0], chal[1]]), 6); // inner payload length
+        assert_eq!(chal[2], protocol::challenge::OPCODE_CHALLENGE);
+        let echoed_ts = u32::from_le_bytes([chal[3], chal[4], chal[5], chal[6]]);
+        let echoed_rnd = chal[7];
 
         // 2. Send a game-login packet echoing the challenge.
         let key = [1u32, 2, 3, 4];
