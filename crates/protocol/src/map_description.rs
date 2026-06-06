@@ -176,8 +176,9 @@ fn get_map_description<S: TileSource>(
     }
 }
 
-/// Minimal item serialization for a ground tile: `[u16 clientId][u8 0xFF]`.
-/// (Stackable count / animation phase are not needed for M3 ground.)
+/// Serialize one tile item: `[u16 clientId][u8 0xFF]`. Used for every item in a
+/// tile stack (ground, top, and down items). Stackable counts and animation
+/// phases are not encoded yet — only plain items are sent.
 fn add_item(w: &mut MessageWriter, client_id: u16) {
     w.write_u16(client_id);
     w.write_u8(MARK_UNMARKED);
@@ -311,6 +312,7 @@ mod tests {
                             break;
                         }
                         // plain item: [clientId u16][0xFF mark]
+                        assert_eq!(bytes[p + 2], MARK_UNMARKED, "item mark at {}", p + 2);
                         ids.push(v);
                         p += 3;
                     }
