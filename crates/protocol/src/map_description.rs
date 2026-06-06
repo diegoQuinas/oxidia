@@ -44,12 +44,14 @@ fn write_tiles<S: GroundSource>(w: &mut MessageWriter, center: Center, src: &S) 
     let anchor_x = center.x as i32 - ANCHOR_DX;
     let anchor_y = center.y as i32 - ANCHOR_DY;
 
-    // Overground: floors 7 down to 0.
-    // `skip` counts empties since the last tile (or stream start).
-    // Encoding: [skip][0xFF] before each tile, [0xFF][0xFF] every 255 empties.
-    // The decoder advances its position by `skip` before placing the tile, so
-    // skip == number_of_empties_since_last_event (0 = adjacent tiles).
-    let mut skip: i32 = 0;
+    // Exact port of TFS `GetMapDescription` + `GetFloorDescription`
+    // (reference/tfs/src/protocolgame.cpp:633-680). `skip` persists across ALL
+    // overground floors and starts at -1, so a stream that opens on a real tile
+    // emits no leading skip pair. On an empty tile: flush `[0xFF][0xFF]` when the
+    // run reaches 0xFE, otherwise increment. On a real tile: flush `[skip][0xFF]`
+    // if a run is open, then write the tile. A final `[skip][0xFF]` closes the
+    // last open run. The OTClient decoder is the exact mirror of this.
+    let mut skip: i32 = -1;
     for nz in (0..=7i32).rev() {
         let offset = center.z as i32 - nz;
         for nx in 0..VIEWPORT_WIDTH {
@@ -58,26 +60,31 @@ fn write_tiles<S: GroundSource>(w: &mut MessageWriter, center: Center, src: &S) 
                 let wy = anchor_y + ny + offset;
                 match src.ground(wx, wy, nz) {
                     Some(client_id) => {
-                        w.write_u8(skip as u8);
-                        w.write_u8(0xFF);
+                        if skip >= 0 {
+                            w.write_u8(skip as u8);
+                            w.write_u8(0xFF);
+                        }
                         skip = 0;
                         w.write_u16(0x0000); // environmental effects placeholder
                         add_item(w, client_id);
                     }
                     None => {
-                        skip += 1;
-                        if skip == 0xFF {
+                        if skip == 0xFE {
                             w.write_u8(0xFF);
                             w.write_u8(0xFF);
-                            skip = 0;
+                            skip = -1;
+                        } else {
+                            skip += 1;
                         }
                     }
                 }
             }
         }
     }
-    w.write_u8(skip as u8);
-    w.write_u8(0xFF);
+    if skip >= 0 {
+        w.write_u8(skip as u8);
+        w.write_u8(0xFF);
+    }
 }
 
 /// Minimal item serialization for a ground tile: `[u16 clientId][u8 0xFF]`.
@@ -99,61 +106,58 @@ mod tests {
         }
     }
 
-    /// Decode the tile stream back into a {(wx,wy,nz)->client_id} map so we can
-    /// assert correctness without hand-computing 1900+ skip bytes.
+    /// Decode the tile stream back into a {(wx,wy,nz)->client_id} map.
     ///
-    /// The encoder produces a single flat stream across all 8 overground floors
-    /// (matching TFS's `GetMapDescription`): the skip counter is NOT reset between
-    /// floors. Total tiles = 8 * W * H = 2016. A global index g_idx maps to
-    /// floor/nx/ny as: floor_idx = g_idx / (W*H), nz = 7 - floor_idx,
-    /// t = g_idx % (W*H), nx = t / H, ny = t % H.
+    /// This is a faithful port of OTClient's `setFloorDescription`
+    /// (`protocolgameparse.cpp`) — the exact inverse of the TFS encoder. It walks
+    /// the same flat sequence of 8*W*H = 2016 positions (floors 7->0, then nx, ny)
+    /// carrying a `skip` counter that persists across floors:
+    ///   - when `skip == 0`, peek a u16: if its value is >= 0xFF00 (high byte
+    ///     0xFF) it's a `[count][0xFF]` marker → set `skip = count`; otherwise it's
+    ///     a tile → read `[env u16][clientId u16][0xFF]`, place it, then read the
+    ///     trailing `[count][0xFF]` marker and set `skip = count`;
+    ///   - when `skip > 0`, the position is empty → decrement.
+    /// Validating the encoder against THIS decoder proves it matches the real
+    /// client, not an invented scheme.
     fn decode_stream(bytes: &[u8], center: Center) -> HashMap<(i32, i32, i32), u16> {
         assert_eq!(bytes[0], OPCODE_MAP_DESCRIPTION);
         let mut p = 6usize; // skip opcode + u16 x + u16 y + u8 z
         let anchor_x = center.x as i32 - ANCHOR_DX;
         let anchor_y = center.y as i32 - ANCHOR_DY;
-        let mut found = HashMap::new();
-        let total = 8 * VIEWPORT_WIDTH * VIEWPORT_HEIGHT; // 2016
         let floor_size = VIEWPORT_WIDTH * VIEWPORT_HEIGHT; // 252
-        let mut g_idx = 0i32; // global tile index across all floors
-        while g_idx < total && p < bytes.len() {
-            let b0 = bytes[p];
-            let b1 = bytes[p + 1];
-            if b1 == 0xFF {
-                let run = if b0 == 0xFF { 255 } else { b0 as i32 };
-                g_idx += run;
-                p += 2;
-                if g_idx >= total || p >= bytes.len() {
-                    break;
+        let total = 8 * floor_size; // 2016
+        let mut found = HashMap::new();
+        let mut skip = 0i32;
+        let mut g_idx = 0i32;
+        while g_idx < total {
+            if skip == 0 {
+                let peek = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
+                if peek >= 0xFF00 {
+                    // [count][0xFF] marker — current position is empty.
+                    skip = i32::from(peek & 0x00FF);
+                    p += 2;
+                } else {
+                    // Tile at this position: [env u16][clientId u16][0xFF].
+                    assert_eq!(peek, 0x0000, "tile env effects at {p}");
+                    let client_id = u16::from_le_bytes([bytes[p + 2], bytes[p + 3]]);
+                    assert_eq!(bytes[p + 4], MARK_UNMARKED);
+                    p += 5;
+                    let fi = g_idx / floor_size; // 0 => floor 7, 7 => floor 0
+                    let nz = 7 - fi;
+                    let offset = center.z as i32 - nz;
+                    let t = g_idx % floor_size;
+                    let nx = t / VIEWPORT_HEIGHT;
+                    let ny = t % VIEWPORT_HEIGHT;
+                    found.insert((anchor_x + nx + offset, anchor_y + ny + offset, nz), client_id);
+                    // Trailing run marker that follows every tile.
+                    assert_eq!(bytes[p + 1], 0xFF, "trailing run marker at {}", p + 1);
+                    skip = i32::from(u16::from_le_bytes([bytes[p], bytes[p + 1]]) & 0x00FF);
+                    p += 2;
                 }
-                // After accumulating skips, check if the next bytes are another
-                // skip flush ([0xFF][0xFF] or [n][0xFF]) or a tile.
-                // A tile starts with [env_lo][env_hi] where env = 0x0000 so b1 != 0xFF.
-                // Keep consuming skips until we reach a tile or end of stream.
-                // (The [0xFF][0xFF] flush from the overflow guard doesn't precede a tile.)
-                // Peek: if next two bytes are a skip pair, loop back.
-                // A skip pair: bytes[p+1] == 0xFF. A tile: bytes[p+1] != 0xFF (env hi byte is 0x00).
-                if bytes.get(p + 1).copied() == Some(0xFF) {
-                    // Another skip flush — loop back to accumulate
-                    continue;
-                }
-                // Now we're at a tile: [env_u16][clientId_u16][0xFF]
-                let fi = g_idx / floor_size;  // floor index (0=floor7, 7=floor0)
-                let nz = 7 - fi;
-                let offset = center.z as i32 - nz;
-                let t = g_idx % floor_size;
-                let nx = t / VIEWPORT_HEIGHT;
-                let ny = t % VIEWPORT_HEIGHT;
-                let env = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
-                assert_eq!(env, 0x0000);
-                let client_id = u16::from_le_bytes([bytes[p + 2], bytes[p + 3]]);
-                assert_eq!(bytes[p + 4], MARK_UNMARKED);
-                found.insert((anchor_x + nx + offset, anchor_y + ny + offset, nz), client_id);
-                p += 5;
-                g_idx += 1;
             } else {
-                panic!("unexpected stream byte at {p}: {b0:#04x} {b1:#04x}");
+                skip -= 1;
             }
+            g_idx += 1;
         }
         found
     }
