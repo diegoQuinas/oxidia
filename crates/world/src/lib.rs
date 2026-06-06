@@ -8,6 +8,9 @@
 //!
 //! M3/M4 fill in the grid, creatures, and the loop.
 
+pub mod game;
+pub mod map;
+
 /// A position in the game world. `z` is the floor (7 = ground level).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Position {

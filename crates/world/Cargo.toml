@@ -9,3 +9,5 @@ license.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
+protocol.workspace = true
+formats.workspace = true
