@@ -124,7 +124,6 @@ pub fn spawn(map: Arc<StaticMap>) -> WorldHandle {
 mod tests {
     use super::*;
     use crate::map::StaticMap;
-    use crate::Direction;
     use formats::otb::{ItemType, ItemsOtb};
     use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
 
