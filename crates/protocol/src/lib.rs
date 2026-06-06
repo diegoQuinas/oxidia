@@ -10,6 +10,7 @@
 //! M1 fills in: framing, Adler-32, RSA, XTEA, NetworkMessage, login parse.
 
 pub mod adler;
+pub mod challenge;
 pub mod charlist;
 pub mod frame;
 pub mod login;
