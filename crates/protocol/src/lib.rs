@@ -12,6 +12,7 @@
 pub mod adler;
 pub mod challenge;
 pub mod charlist;
+pub mod enter_world;
 pub mod frame;
 pub mod game_login;
 pub mod login;
