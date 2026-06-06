@@ -38,7 +38,7 @@ pub fn build_enter_world_burst(
     burst.extend(enter_world::self_info(snapshot_id));
     burst.extend(enter_world::pending_state());
     burst.extend(enter_world::enter_world());
-    burst.extend(map_description::encode(center, map));
+    burst.extend(map_description::encode(center, map, &[]));
     burst.extend(enter_world::magic_effect(
         center.x,
         center.y,
