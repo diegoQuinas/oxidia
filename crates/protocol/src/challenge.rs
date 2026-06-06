@@ -2,7 +2,6 @@
 //! Checksummed (Adler-32) but NOT XTEA-encrypted — XTEA is enabled only after
 //! the client's first packet is parsed. See `reference/tfs/src/protocolgame.cpp`
 //! (`ProtocolGame::onConnect`).
-#![allow(clippy::module_name_repetitions)]
 
 use crate::message::MessageWriter;
 
