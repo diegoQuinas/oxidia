@@ -15,6 +15,8 @@ pub struct GameLoginRequest {
     pub os: u16,
     pub version: u16,
     pub xtea_key: [u32; 4],
+    /// Untrusted client-reported flag. The server must NEVER grant privileges
+    /// based on this value alone — TFS deliberately ignores it.
     pub gamemaster: bool,
     pub account: Vec<u8>,
     pub password: Vec<u8>,
@@ -29,6 +31,8 @@ pub enum GameLoginError {
     UnexpectedProtocolId(u8),
     #[error("rsa padding byte was {0}, expected 0")]
     RsaPadding(u8),
+    #[error("session key had {0} parts, expected 4 (account\\npassword\\ntoken\\ntokenTime)")]
+    MalformedSessionKey(usize),
     #[error(transparent)]
     Truncated(#[from] ProtocolError),
     #[error(transparent)]
@@ -68,7 +72,7 @@ pub fn parse(payload: &[u8], rsa: &RsaPrivateKey) -> Result<GameLoginRequest, Ga
     let challenge_timestamp = inner.read_u32()?;
     let challenge_random = inner.read_u8()?;
 
-    let (account, password) = split_session_key(&session_key);
+    let (account, password) = split_session_key(&session_key)?;
 
     Ok(GameLoginRequest {
         os,
@@ -83,12 +87,13 @@ pub fn parse(payload: &[u8], rsa: &RsaPrivateKey) -> Result<GameLoginRequest, Ga
     })
 }
 
-/// `sessionKey` is `account\npassword\ntoken\ntokenTime`; take the first two parts.
-fn split_session_key(session_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut parts = session_key.split(|&b| b == b'\n');
-    let account = parts.next().unwrap_or(&[]).to_vec();
-    let password = parts.next().unwrap_or(&[]).to_vec();
-    (account, password)
+/// `sessionKey` is `account\npassword\ntoken\ntokenTime` (TFS uses exactly 4 parts).
+fn split_session_key(session_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), GameLoginError> {
+    let parts: Vec<&[u8]> = session_key.split(|&b| b == b'\n').collect();
+    if parts.len() != 4 {
+        return Err(GameLoginError::MalformedSessionKey(parts.len()));
+    }
+    Ok((parts[0].to_vec(), parts[1].to_vec()))
 }
 
 /// Build a client-side game-login payload (RSA-public-encrypted) for tests/tooling.
@@ -166,5 +171,32 @@ mod tests {
         let rsa = RsaPrivateKey::open_tibia();
         let err = parse(&[0x01, 0, 0], &rsa).unwrap_err();
         assert!(matches!(err, GameLoginError::UnexpectedProtocolId(0x01)));
+    }
+
+    #[test]
+    fn rejects_malformed_session_key() {
+        assert!(matches!(
+            split_session_key(b"no-newlines-here"),
+            Err(GameLoginError::MalformedSessionKey(1))
+        ));
+        assert!(split_session_key(b"a\nb\nc\nd").is_ok());
+    }
+
+    #[test]
+    fn rejects_nonzero_rsa_padding() {
+        let mut w = MessageWriter::new();
+        w.write_u8(GAME_PROTOCOL_ID);
+        w.write_u16(10);
+        w.write_u16(1098);
+        w.write_bytes(&[0u8; 7]);
+        let mut block = vec![0u8; RSA_BLOCK_SIZE];
+        block[0] = 1; // non-zero padding sentinel
+        rsa::encrypt_open_tibia_public(&mut block).unwrap();
+        w.write_bytes(&block);
+        let payload = w.into_bytes();
+
+        let rsa_key = RsaPrivateKey::open_tibia();
+        let err = parse(&payload, &rsa_key).unwrap_err();
+        assert!(matches!(err, GameLoginError::RsaPadding(1)));
     }
 }
