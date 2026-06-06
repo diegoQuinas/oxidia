@@ -8,11 +8,12 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M3 🟡 **code-complete, pending live OTClient acceptance** → then **M4 (walk)**.
+- **Milestone:** M3 ✅ **enter game complete and accepted live** → next is **M4 (walk)**.
 - **Build:** `cargo build` clean, `cargo test` green (74 tests), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
 - **Accepted (M2):** `cargo run -p formats --example mapinfo` parses the real `items.otb` (v3.57, 26 282 items) and `forgotten.otbm` (2048×2048, 340 594 tiles, 429 031 items, 5 towns) — full tree walk, no unknown nodes/attrs.
+- **Accepted (M3):** real **OTClient Redemption** enters the game on port 7172 and renders **Test Knight** standing on the real Thais temple ground (`forgotten.otbm`), with stats (HP 150, Soul 100, Cap 400, Level 1) shown. A keep-alive ping holds the session — no more 30 s timeout.
 
 ## Milestones
 
@@ -21,7 +22,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 | M0 | Skeleton: workspace compiles, tests green, server listens on 7171/7172, logs connections | ✅ done |
 | M1 | Login server: framing, Adler-32, RSA, XTEA, NetworkMessage, login parse, char list, sniff tool | ✅ done |
 | M2 | Formats: `.otb` + `.otbm` parsers, `mapinfo` example | ✅ done |
-| M3 | Enter game: game handshake (challenge), player load, initial packet sequence, render map | 🟡 code-complete, live acceptance pending |
+| M3 | Enter game: game handshake (challenge), player load, initial packet sequence, render map | ✅ done |
 | M4 | Walk: movement packets, tile updates, floor changes, collision | ⬜ |
 
 (Combat / Lua scripting / creatures are planned *after* M4.)
@@ -85,7 +86,7 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m3-enter-game-design.md`, `doc
 4. ✅ `protocol::enter_world` — burst encoders: `self_info 0x17` (29 B), `pending 0x0A`, `enter_world 0x0F`, `stats 0xA0` (53 B), `skills 0xA1`, `world_light 0x82`, `creature_light 0x8D`, `empty_inventory 0x79×11`, `basic_data 0x9F`, `icons 0xA2`, `magic_effect 0x83`, `extended 0x32`.
 5. ✅ `world::map::StaticMap` (immutable ground lookup `server_id→client_id` + town-temple spawn, impl `GroundSource`) + `world::game::GameWorld` (tokio actor over mpsc/oneshot, owns the player registry; map shared via `Arc`).
 6. ✅ `server::game_service` — `handle_game`: challenge → parse → echo+version validate → enableXTEA → `0x32` (OTClient) → `world.login` → burst. `main.rs` loads `items.otb`+`forgotten.otbm`, spawns the world, serves 7172 via `serve_with`. Integration replay test over `tokio::io::duplex`.
-7. 🟡 **Live acceptance pending** — point the real OTClient at 7172 and confirm the player renders on the Thais temple ground.
+7. ✅ **Accepted live** — real OTClient renders the player on the Thais temple ground. Two bugs fixed during acceptance: the challenge frame needed the inner `[u16 length]` (TFS `onConnect:429`); and the session must stay open with a keep-alive ping (`0x1D` every 10 s of silence) or the client times out after 30 s.
 
 Burst order (one XTEA frame): `0x17, 0x0A, 0x0F, 0x64 map, 0x83, 0x79×11, 0xA0, 0xA1, 0x82, 0x8D, 0x9F, 0xA2`.
 
