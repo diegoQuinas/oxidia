@@ -265,6 +265,40 @@ mod tests {
         };
         let sm = StaticMap::from_formats(&map, &items);
         let slices = sm.tile(95, 117, 7).expect("tile present");
-        assert_eq!(slices.pre_creature.len() + slices.post_creature.len(), 10);
+        // Ground stays in pre_creature; the first 9 down items survive (10 total).
+        assert_eq!(slices.pre_creature, &[5000]);
+        assert_eq!(slices.post_creature.len(), 9);
+        assert_eq!(slices.post_creature, &[6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
+        assert_eq!(sm.creature_stackpos(95, 117, 7), 1);
+    }
+
+    #[test]
+    fn more_than_ten_top_items_cap_pre_creature_at_ten() {
+        use protocol::map_description::TileSource;
+        let mut item_defs = vec![ItemType {
+            group: 1, flags: 0, server_id: 1, client_id: 5000, always_on_top: false, top_order: 0,
+        }];
+        let mut tile_items = vec![MapItem { id: 1, contents: vec![] }];
+        for sid in 2..=12u16 {
+            item_defs.push(ItemType {
+                group: 5, flags: 1 << 13, server_id: sid, client_id: 6000 + sid,
+                always_on_top: true, top_order: 0,
+            });
+            tile_items.push(MapItem { id: sid, contents: vec![] });
+        }
+        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_defs };
+        let map = OtbmMap {
+            width: 100, height: 100, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![MapTile { x: 95, y: 117, z: 7, flags: 0, house_id: None, items: tile_items }],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+            waypoints: vec![],
+        };
+        let sm = StaticMap::from_formats(&map, &items);
+        let slices = sm.tile(95, 117, 7).expect("tile present");
+        assert_eq!(slices.pre_creature.len(), 10); // ground + 9 top items
+        assert_eq!(slices.pre_creature, &[5000, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
+        assert!(slices.post_creature.is_empty());
+        assert_eq!(sm.creature_stackpos(95, 117, 7), 10);
     }
 }
