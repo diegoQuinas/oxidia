@@ -1,11 +1,11 @@
-//! Immutable world map for M3: a ground-tile lookup + a spawn point.
-//! Ground client ids are resolved once from items.otb (server_id -> client_id).
+//! Immutable world map: a per-tile item stack + a spawn point.
+//! Client ids are resolved once from items.otb (server_id -> client_id).
 
 use std::collections::{HashMap, HashSet};
 
 use formats::otb::ItemsOtb;
 use formats::otbm::OtbmMap;
-use protocol::map_description::GroundSource;
+use protocol::map_description::{TileSlices, TileSource};
 
 use crate::Position;
 
@@ -15,32 +15,61 @@ const FALLBACK_SPAWN: Position = Position::new(1000, 1000, 7);
 /// `items.otb` `FLAG_BLOCK_SOLID` (bit 0 of the per-item flags word).
 const FLAG_BLOCK_SOLID: u32 = 1 << 0;
 
+/// Maximum things (items + creature) the client renders per tile.
+const MAX_TILE_THINGS: usize = 10;
+
+/// Wire-ordered client ids for one tile, split around the creature slot.
+struct TileStack {
+    /// `[ground, ...top items (by top_order), ...down items]`, capped at 10.
+    items: Vec<u16>,
+    /// `items[..pre_creature_len]` render below a creature (ground + top items).
+    pre_creature_len: usize,
+}
+
 pub struct StaticMap {
-    ground: HashMap<(u16, u16, u8), u16>,
+    tiles: HashMap<(u16, u16, u8), TileStack>,
     blocked: HashSet<(u16, u16, u8)>,
     spawn: Position,
 }
 
 impl StaticMap {
-    /// Build from a parsed map + item dictionary. The ground client id of a tile
-    /// is its first item's id mapped through items.otb (server_id -> client_id).
+    /// Build from a parsed map + item dictionary. Each tile becomes a wire-ordered
+    /// stack: ground (`items[0]`), then always-on-top items sorted by `top_order`,
+    /// then the remaining "down" items, capped at 10 things (TFS stackpos cap).
     pub fn from_formats(map: &OtbmMap, items: &ItemsOtb) -> Self {
-        let server_to_client: HashMap<u16, u16> =
-            items.items.iter().map(|it| (it.server_id, it.client_id)).collect();
+        let by_id: HashMap<u16, &formats::otb::ItemType> =
+            items.items.iter().map(|it| (it.server_id, it)).collect();
 
-        let server_to_flags: HashMap<u16, u32> =
-            items.items.iter().map(|it| (it.server_id, it.flags)).collect();
-
-        let mut ground = HashMap::new();
+        let mut tiles = HashMap::new();
         let mut blocked = HashSet::new();
         for tile in &map.tiles {
-            if let Some(first) = tile.items.first() {
-                if let Some(&client_id) = server_to_client.get(&first.id) {
-                    ground.insert((tile.x, tile.y, tile.z), client_id);
+            let mut ground: Option<u16> = None;
+            let mut top: Vec<(u8, u16)> = Vec::new(); // (top_order, client_id)
+            let mut down: Vec<u16> = Vec::new();
+            for (i, mi) in tile.items.iter().enumerate() {
+                let Some(it) = by_id.get(&mi.id) else { continue };
+                if i == 0 {
+                    ground = Some(it.client_id);
+                } else if it.always_on_top {
+                    top.push((it.top_order, it.client_id));
+                } else {
+                    down.push(it.client_id);
                 }
             }
-            let solid = tile.items.iter().any(|it| {
-                server_to_flags.get(&it.id).is_some_and(|f| f & FLAG_BLOCK_SOLID != 0)
+
+            if let Some(ground_cid) = ground {
+                top.sort_by_key(|(order, _)| *order); // stable: file order on ties
+                let mut stack: Vec<u16> = Vec::with_capacity(1 + top.len() + down.len());
+                stack.push(ground_cid);
+                stack.extend(top.iter().map(|(_, cid)| *cid));
+                let pre_creature_len = stack.len().min(MAX_TILE_THINGS);
+                stack.extend(down);
+                stack.truncate(MAX_TILE_THINGS);
+                tiles.insert((tile.x, tile.y, tile.z), TileStack { items: stack, pre_creature_len });
+            }
+
+            let solid = tile.items.iter().any(|mi| {
+                by_id.get(&mi.id).is_some_and(|it| it.flags & FLAG_BLOCK_SOLID != 0)
             });
             if solid {
                 blocked.insert((tile.x, tile.y, tile.z));
@@ -53,29 +82,47 @@ impl StaticMap {
             .map(|t| Position::new(t.x, t.y, t.z))
             .unwrap_or(FALLBACK_SPAWN);
 
-        Self { ground, blocked, spawn }
+        Self { tiles, blocked, spawn }
     }
 
     pub fn spawn(&self) -> Position {
         self.spawn
     }
 
-    /// A tile is walkable if it has ground and no block-solid item.
+    /// A tile is walkable if it has a ground stack and no block-solid item.
     pub fn is_walkable(&self, pos: Position) -> bool {
-        self.ground.contains_key(&(pos.x, pos.y, pos.z))
+        self.tiles.contains_key(&(pos.x, pos.y, pos.z))
             && !self.blocked.contains(&(pos.x, pos.y, pos.z))
     }
 }
 
-impl GroundSource for StaticMap {
-    fn ground(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+impl StaticMap {
+    /// Bounds-check a world coordinate down to a `(u16, u16, u8)` tile key.
+    fn key(x: i32, y: i32, z: i32) -> Option<(u16, u16, u8)> {
         if !(0..=i32::from(u16::MAX)).contains(&x)
             || !(0..=i32::from(u16::MAX)).contains(&y)
             || !(0..=i32::from(u8::MAX)).contains(&z)
         {
             return None;
         }
-        self.ground.get(&(x as u16, y as u16, z as u8)).copied()
+        Some((x as u16, y as u16, z as u8))
+    }
+}
+
+impl TileSource for StaticMap {
+    fn tile(&self, x: i32, y: i32, z: i32) -> Option<TileSlices<'_>> {
+        let key = Self::key(x, y, z)?;
+        let st = self.tiles.get(&key)?;
+        Some(TileSlices {
+            pre_creature: &st.items[..st.pre_creature_len],
+            post_creature: &st.items[st.pre_creature_len..],
+        })
+    }
+
+    fn creature_stackpos(&self, x: i32, y: i32, z: i32) -> u8 {
+        Self::key(x, y, z)
+            .and_then(|k| self.tiles.get(&k))
+            .map_or(1, |st| st.pre_creature_len as u8)
     }
 }
 
@@ -90,7 +137,7 @@ mod tests {
             major_version: 3,
             minor_version: 57,
             build_number: 0,
-            items: vec![ItemType { group: 0, flags: 0, server_id: 100, client_id: 4526 }],
+            items: vec![ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0 }],
         };
         let map = OtbmMap {
             width: 100,
@@ -116,12 +163,13 @@ mod tests {
 
     #[test]
     fn resolves_ground_client_id_and_spawn() {
+        use protocol::map_description::TileSource;
         let (map, items) = tiny_map();
         let sm = StaticMap::from_formats(&map, &items);
         assert_eq!(sm.spawn(), Position::new(95, 117, 7));
-        assert_eq!(sm.ground(95, 117, 7), Some(4526));
-        assert_eq!(sm.ground(0, 0, 7), None);
-        assert_eq!(sm.ground(-1, 0, 7), None);
+        assert_eq!(sm.tile(95, 117, 7).unwrap().pre_creature, &[4526]);
+        assert!(sm.tile(0, 0, 7).is_none());
+        assert!(sm.tile(-1, 0, 7).is_none());
     }
 
     #[test]
@@ -132,8 +180,8 @@ mod tests {
             minor_version: 57,
             build_number: 0,
             items: vec![
-                ItemType { group: 0, flags: 0, server_id: 100, client_id: 4526 },
-                ItemType { group: 0, flags: 0x0000_0001, server_id: 200, client_id: 1059 },
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0 },
+                ItemType { group: 5, flags: 0x0000_0001, server_id: 200, client_id: 1059, always_on_top: false, top_order: 0 },
             ],
         };
         let map = OtbmMap {
@@ -154,5 +202,103 @@ mod tests {
         assert!(sm.is_walkable(Position::new(95, 117, 7)), "plain ground walkable");
         assert!(!sm.is_walkable(Position::new(96, 117, 7)), "block-solid wall not walkable");
         assert!(!sm.is_walkable(Position::new(1, 1, 7)), "no ground not walkable");
+    }
+
+    #[test]
+    fn builds_ordered_stack_with_pre_creature_split() {
+        use protocol::map_description::TileSource;
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0 },
+                ItemType { group: 5, flags: 1 << 13, server_id: 200, client_id: 1000, always_on_top: true, top_order: 2 },
+                ItemType { group: 5, flags: 1 << 13, server_id: 201, client_id: 1001, always_on_top: true, top_order: 1 },
+                ItemType { group: 5, flags: 0, server_id: 300, client_id: 2000, always_on_top: false, top_order: 0 },
+            ],
+        };
+        let map = OtbmMap {
+            width: 100, height: 100, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![MapTile {
+                x: 95, y: 117, z: 7, flags: 0, house_id: None,
+                items: vec![
+                    MapItem { id: 100, contents: vec![] },
+                    MapItem { id: 200, contents: vec![] },
+                    MapItem { id: 201, contents: vec![] },
+                    MapItem { id: 300, contents: vec![] },
+                ],
+            }],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+            waypoints: vec![],
+        };
+        let sm = StaticMap::from_formats(&map, &items);
+        let slices = sm.tile(95, 117, 7).expect("tile present");
+        assert_eq!(slices.pre_creature, &[4526, 1001, 1000]);
+        assert_eq!(slices.post_creature, &[2000]);
+        assert_eq!(sm.creature_stackpos(95, 117, 7), 3);
+        assert_eq!(sm.creature_stackpos(1, 1, 7), 1);
+    }
+
+    #[test]
+    fn stack_truncates_to_ten_things() {
+        use protocol::map_description::TileSource;
+        let mut item_defs = vec![ItemType {
+            group: 1, flags: 0, server_id: 1, client_id: 5000, always_on_top: false, top_order: 0,
+        }];
+        let mut tile_items = vec![MapItem { id: 1, contents: vec![] }];
+        for sid in 2..=12u16 {
+            item_defs.push(ItemType {
+                group: 5, flags: 0, server_id: sid, client_id: 6000 + sid,
+                always_on_top: false, top_order: 0,
+            });
+            tile_items.push(MapItem { id: sid, contents: vec![] });
+        }
+        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_defs };
+        let map = OtbmMap {
+            width: 100, height: 100, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![MapTile { x: 95, y: 117, z: 7, flags: 0, house_id: None, items: tile_items }],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+            waypoints: vec![],
+        };
+        let sm = StaticMap::from_formats(&map, &items);
+        let slices = sm.tile(95, 117, 7).expect("tile present");
+        // Ground stays in pre_creature; the first 9 down items survive (10 total).
+        assert_eq!(slices.pre_creature, &[5000]);
+        assert_eq!(slices.post_creature.len(), 9);
+        assert_eq!(slices.post_creature, &[6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
+        assert_eq!(sm.creature_stackpos(95, 117, 7), 1);
+    }
+
+    #[test]
+    fn more_than_ten_top_items_cap_pre_creature_at_ten() {
+        use protocol::map_description::TileSource;
+        let mut item_defs = vec![ItemType {
+            group: 1, flags: 0, server_id: 1, client_id: 5000, always_on_top: false, top_order: 0,
+        }];
+        let mut tile_items = vec![MapItem { id: 1, contents: vec![] }];
+        for sid in 2..=12u16 {
+            item_defs.push(ItemType {
+                group: 5, flags: 1 << 13, server_id: sid, client_id: 6000 + sid,
+                always_on_top: true, top_order: 0,
+            });
+            tile_items.push(MapItem { id: sid, contents: vec![] });
+        }
+        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_defs };
+        let map = OtbmMap {
+            width: 100, height: 100, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![MapTile { x: 95, y: 117, z: 7, flags: 0, house_id: None, items: tile_items }],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+            waypoints: vec![],
+        };
+        let sm = StaticMap::from_formats(&map, &items);
+        let slices = sm.tile(95, 117, 7).expect("tile present");
+        assert_eq!(slices.pre_creature.len(), 10); // ground + 9 top items
+        assert_eq!(slices.pre_creature, &[5000, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
+        assert!(slices.post_creature.is_empty());
+        assert_eq!(sm.creature_stackpos(95, 117, 7), 10);
     }
 }

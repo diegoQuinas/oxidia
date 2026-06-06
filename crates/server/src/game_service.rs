@@ -2,7 +2,7 @@
 //! enableXTEA -> enter-world burst. Mirrors `login_service` but for ProtocolGame.
 
 use anyhow::Result;
-use protocol::map_description::{self, Center, PlacedCreature};
+use protocol::map_description::{self, Center, PlacedCreature, TileSource};
 use protocol::rsa::RsaPrivateKey;
 use protocol::{creature, enter_world, frame, game_login, walk, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -39,7 +39,7 @@ pub fn build_enter_world_burst(
     center: Center,
     direction: u8,
     name: &[u8],
-    map: &impl map_description::GroundSource,
+    map: &impl map_description::TileSource,
 ) -> Vec<u8> {
     let stats = enter_world::Stats {
         health: 150,
@@ -242,12 +242,17 @@ where
 
     if is_turn {
         // `None` means the world rejected the turn (unknown id) — no packet, no
-        // state change. Stackpos is 1: the player is the only creature on its
-        // ground tile in single-player M4 (revisit when tiles hold many creatures).
+        // state change. Stackpos is derived from the tile's item stack (ground +
+        // always-on-top items), matching the walk path.
         if let Some(facing) = world.turn_player(session.id, direction).await {
             session.facing = facing;
             let pos = (session.pos.x, session.pos.y, session.pos.z);
-            let pkt = walk::creature_turn(pos, 1, session.id, facing.to_byte());
+            let stackpos = world.map.creature_stackpos(
+                i32::from(pos.0),
+                i32::from(pos.1),
+                i32::from(pos.2),
+            );
+            let pkt = walk::creature_turn(pos, stackpos, session.id, facing.to_byte());
             send_encrypted(stream, keys, &pkt).await?;
         }
         return Ok(());
@@ -312,7 +317,7 @@ mod tests {
             major_version: 3,
             minor_version: 57,
             build_number: 0,
-            items: vec![ItemType { group: 0, flags: 0, server_id: 100, client_id: 4526 }],
+            items: vec![ItemType { group: 0, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0 }],
         };
         let map = OtbmMap {
             width: 200,

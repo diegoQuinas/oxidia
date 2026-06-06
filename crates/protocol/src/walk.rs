@@ -2,7 +2,7 @@
 //! Ports `sendMoveCreature` (0x6D + directional slices), `sendCancelWalk` (0xB5),
 //! and `sendCreatureTurn` (0x6B) from `reference/tfs/src/protocolgame.cpp`.
 
-use crate::map_description::{self, GroundSource, PlacedCreature};
+use crate::map_description::{self, PlacedCreature, TileSource};
 use crate::message::MessageWriter;
 
 pub const OP_CREATURE_MOVE: u8 = 0x6D;
@@ -51,14 +51,14 @@ pub fn creature_turn(pos: (u16, u16, u8), stackpos: u8, id: u32, direction: u8) 
 /// Assemble the full server->client response for a same-floor step: the `0x6D`
 /// move, then the newly-revealed row/column slice(s). Ports the independent y/x
 /// `if` blocks of TFS `sendMoveCreature` (2616-2630) — a diagonal emits both.
-/// Stackpos is fixed at 1 (a lone player creature on a ground-only tile).
-pub fn walk_update<S: GroundSource>(
+pub fn walk_update<S: TileSource>(
     old: (u16, u16, u8),
     new: (u16, u16, u8),
     src: &S,
     creatures: &[PlacedCreature],
 ) -> Vec<u8> {
-    let mut out = creature_move(old, 1, new);
+    let stackpos = src.creature_stackpos(i32::from(old.0), i32::from(old.1), i32::from(old.2));
+    let mut out = creature_move(old, stackpos, new);
     let (ox, oy) = (i32::from(old.0), i32::from(old.1));
     let (nx, ny) = (i32::from(new.0), i32::from(new.1));
     let nz = i32::from(new.2);
@@ -95,10 +95,18 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use crate::map_description::TileSlices;
+
     struct MapStub(HashMap<(i32, i32, i32), u16>);
-    impl GroundSource for MapStub {
-        fn ground(&self, x: i32, y: i32, z: i32) -> Option<u16> {
-            self.0.get(&(x, y, z)).copied()
+    impl TileSource for MapStub {
+        fn tile(&self, x: i32, y: i32, z: i32) -> Option<TileSlices<'_>> {
+            self.0.get(&(x, y, z)).map(|cid| TileSlices {
+                pre_creature: std::slice::from_ref(cid),
+                post_creature: &[],
+            })
+        }
+        fn creature_stackpos(&self, _x: i32, _y: i32, _z: i32) -> u8 {
+            1
         }
     }
 
