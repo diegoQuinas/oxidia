@@ -13,6 +13,7 @@ pub mod adler;
 pub mod challenge;
 pub mod charlist;
 pub mod frame;
+pub mod game_login;
 pub mod login;
 pub mod message;
 pub mod rsa;
