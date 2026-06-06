@@ -233,6 +233,9 @@ where
     };
 
     if is_turn {
+        // `None` means the world rejected the turn (unknown id) — no packet, no
+        // state change. Stackpos is 1: the player is the only creature on its
+        // ground tile in single-player M4 (revisit when tiles hold many creatures).
         if let Some(facing) = world.turn_player(session.id, direction).await {
             session.facing = facing;
             let pos = (session.pos.x, session.pos.y, session.pos.z);
