@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use formats::otb::ItemsOtb;
 use formats::otbm::OtbmMap;
-use protocol::map_description::{TileSlices, TileSource};
+use protocol::map_description::{TileSlices, TileSource, WireItem};
 
 use crate::Position;
 
@@ -18,12 +18,27 @@ const FLAG_BLOCK_SOLID: u32 = 1 << 0;
 /// Maximum things (items + creature) the client renders per tile.
 const MAX_TILE_THINGS: usize = 10;
 
-/// Wire-ordered client ids for one tile, split around the creature slot.
+/// Wire-ordered items for one tile, split around the creature slot.
 struct TileStack {
     /// `[ground, ...top items (by top_order), ...down items]`, capped at 10.
-    items: Vec<u16>,
+    items: Vec<WireItem>,
     /// `items[..pre_creature_len]` render below a creature (ground + top items).
     pre_creature_len: usize,
+}
+
+/// Resolve an `items.otb` entry into its wire form, mirroring TFS
+/// `NetworkMessage::addItem`: stackable items carry a count byte, splash/fluid a
+/// fluid-type byte, animated items a phase byte. Static map items have no OTBM
+/// subtype parsed yet, so count/fluid default to 1/0 (byte-correct on the wire).
+fn wire_item(it: &formats::otb::ItemType) -> WireItem {
+    let subtype = if it.is_stackable() {
+        Some(1)
+    } else if it.is_fluid_or_splash() {
+        Some(0)
+    } else {
+        None
+    };
+    WireItem { client_id: it.client_id, subtype, animated: it.is_animated() }
 }
 
 pub struct StaticMap {
@@ -43,25 +58,26 @@ impl StaticMap {
         let mut tiles = HashMap::new();
         let mut blocked = HashSet::new();
         for tile in &map.tiles {
-            let mut ground: Option<u16> = None;
-            let mut top: Vec<(u8, u16)> = Vec::new(); // (top_order, client_id)
-            let mut down: Vec<u16> = Vec::new();
+            let mut ground: Option<WireItem> = None;
+            let mut top: Vec<(u8, WireItem)> = Vec::new(); // (top_order, item)
+            let mut down: Vec<WireItem> = Vec::new();
             for (i, mi) in tile.items.iter().enumerate() {
                 let Some(it) = by_id.get(&mi.id) else { continue };
+                let wi = wire_item(it);
                 if i == 0 {
-                    ground = Some(it.client_id);
+                    ground = Some(wi);
                 } else if it.always_on_top {
-                    top.push((it.top_order, it.client_id));
+                    top.push((it.top_order, wi));
                 } else {
-                    down.push(it.client_id);
+                    down.push(wi);
                 }
             }
 
-            if let Some(ground_cid) = ground {
+            if let Some(ground_item) = ground {
                 top.sort_by_key(|(order, _)| *order); // stable: file order on ties
-                let mut stack: Vec<u16> = Vec::with_capacity(1 + top.len() + down.len());
-                stack.push(ground_cid);
-                stack.extend(top.iter().map(|(_, cid)| *cid));
+                let mut stack: Vec<WireItem> = Vec::with_capacity(1 + top.len() + down.len());
+                stack.push(ground_item);
+                stack.extend(top.iter().map(|(_, wi)| *wi));
                 let pre_creature_len = stack.len().min(MAX_TILE_THINGS);
                 stack.extend(down);
                 stack.truncate(MAX_TILE_THINGS);
@@ -94,6 +110,7 @@ impl StaticMap {
         self.tiles.contains_key(&(pos.x, pos.y, pos.z))
             && !self.blocked.contains(&(pos.x, pos.y, pos.z))
     }
+
 }
 
 impl StaticMap {
@@ -132,6 +149,11 @@ mod tests {
     use formats::otb::ItemType;
     use formats::otbm::{MapItem, MapTile, Town};
 
+    /// Client ids of a wire-item slice, for terse stack-order assertions.
+    fn cids(items: &[WireItem]) -> Vec<u16> {
+        items.iter().map(|w| w.client_id).collect()
+    }
+
     fn tiny_map() -> (OtbmMap, ItemsOtb) {
         let items = ItemsOtb {
             major_version: 3,
@@ -167,7 +189,7 @@ mod tests {
         let (map, items) = tiny_map();
         let sm = StaticMap::from_formats(&map, &items);
         assert_eq!(sm.spawn(), Position::new(95, 117, 7));
-        assert_eq!(sm.tile(95, 117, 7).unwrap().pre_creature, &[4526]);
+        assert_eq!(cids(sm.tile(95, 117, 7).unwrap().pre_creature), vec![4526]);
         assert!(sm.tile(0, 0, 7).is_none());
         assert!(sm.tile(-1, 0, 7).is_none());
     }
@@ -235,8 +257,8 @@ mod tests {
         };
         let sm = StaticMap::from_formats(&map, &items);
         let slices = sm.tile(95, 117, 7).expect("tile present");
-        assert_eq!(slices.pre_creature, &[4526, 1001, 1000]);
-        assert_eq!(slices.post_creature, &[2000]);
+        assert_eq!(cids(slices.pre_creature), vec![4526, 1001, 1000]);
+        assert_eq!(cids(slices.post_creature), vec![2000]);
         assert_eq!(sm.creature_stackpos(95, 117, 7), 3);
         assert_eq!(sm.creature_stackpos(1, 1, 7), 1);
     }
@@ -266,9 +288,9 @@ mod tests {
         let sm = StaticMap::from_formats(&map, &items);
         let slices = sm.tile(95, 117, 7).expect("tile present");
         // Ground stays in pre_creature; the first 9 down items survive (10 total).
-        assert_eq!(slices.pre_creature, &[5000]);
+        assert_eq!(cids(slices.pre_creature), vec![5000]);
         assert_eq!(slices.post_creature.len(), 9);
-        assert_eq!(slices.post_creature, &[6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
+        assert_eq!(cids(slices.post_creature), vec![6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
         assert_eq!(sm.creature_stackpos(95, 117, 7), 1);
     }
 
@@ -297,7 +319,7 @@ mod tests {
         let sm = StaticMap::from_formats(&map, &items);
         let slices = sm.tile(95, 117, 7).expect("tile present");
         assert_eq!(slices.pre_creature.len(), 10); // ground + 9 top items
-        assert_eq!(slices.pre_creature, &[5000, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
+        assert_eq!(cids(slices.pre_creature), vec![5000, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
         assert!(slices.post_creature.is_empty());
         assert_eq!(sm.creature_stackpos(95, 117, 7), 10);
     }

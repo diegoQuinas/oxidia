@@ -19,12 +19,23 @@ const VIEW_Y: i32 = 6; // Map::maxClientViewportY
 const SLICE_W: i32 = (VIEW_X * 2) + 2; // 18
 const SLICE_H: i32 = (VIEW_Y * 2) + 2; // 14
 
-/// `0x6D` creature move (stackpos < 10 form): `[0x6D][oldPos][stackpos][newPos]`.
-pub fn creature_move(old: (u16, u16, u8), old_stackpos: u8, new: (u16, u16, u8)) -> Vec<u8> {
+/// `0x6D` creature move, **creature-id form**: `[0x6D][0xFFFF][creatureId u32][newPos]`.
+///
+/// The client locates the creature via `getCreatureById` (OTClient
+/// `getMappedThing`, `x == 0xFFFF` branch) instead of by `(oldPos, stackPos)`.
+/// This is deliberate: the server derives a tile's stackpos from `items.otb`
+/// (`FLAG_ALWAYSONTOP`), but OTClient re-inserts a moved creature by its `.dat`
+/// `getStackPriority`. When those two data sources disagree about whether a tile
+/// item sits above or below the creature, the `(oldPos, stackPos)` form points the
+/// client at the wrong thing and the move is silently dropped (observed live as
+/// "no creature found to move" / "no thing at pos:…,stackpos:2"). The id form is
+/// immune to that divergence. TFS itself uses it whenever stackpos >= 10
+/// (`protocolgame.cpp:2603`), so it is protocol-legal for every move.
+pub fn creature_move(id: u32, new: (u16, u16, u8)) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u8(OP_CREATURE_MOVE);
-    add_position(&mut w, old);
-    w.write_u8(old_stackpos);
+    w.write_u16(0xFFFF);
+    w.write_u32(id);
     add_position(&mut w, new);
     w.into_bytes()
 }
@@ -34,13 +45,19 @@ pub fn cancel_walk(direction: u8) -> Vec<u8> {
     vec![OP_CANCEL_WALK, direction]
 }
 
-/// `0x6B` creature turn (stackpos < 10 form):
-/// `[0x6B][pos][stackpos][0x0063][id][direction][walkthrough]`.
-pub fn creature_turn(pos: (u16, u16, u8), stackpos: u8, id: u32, direction: u8) -> Vec<u8> {
+/// `0x6B` creature turn (`GameServerChangeOnMap` -> `parseTileTransformThing`),
+/// **creature-id form**: `[0x6B][0xFFFF][id u32][0x0063][id u32][direction][walkthrough]`.
+///
+/// Like [`creature_move`], the leading `0xFFFF` makes the client locate the
+/// existing creature via `getCreatureById` instead of `(pos, stackpos)`, so a
+/// turn on a decorated tile is immune to the same items.otb-vs-`.dat` stackpos
+/// divergence. The trailing `0x0063` block is the replacement creature thing the
+/// client adds back, carrying the new facing.
+pub fn creature_turn(id: u32, direction: u8) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u8(OP_CREATURE_TURN);
-    add_position(&mut w, pos);
-    w.write_u8(stackpos);
+    w.write_u16(0xFFFF);
+    w.write_u32(id);
     w.write_u16(0x0063);
     w.write_u32(id);
     w.write_u8(direction);
@@ -52,13 +69,13 @@ pub fn creature_turn(pos: (u16, u16, u8), stackpos: u8, id: u32, direction: u8) 
 /// move, then the newly-revealed row/column slice(s). Ports the independent y/x
 /// `if` blocks of TFS `sendMoveCreature` (2616-2630) — a diagonal emits both.
 pub fn walk_update<S: TileSource>(
+    id: u32,
     old: (u16, u16, u8),
     new: (u16, u16, u8),
     src: &S,
     creatures: &[PlacedCreature],
 ) -> Vec<u8> {
-    let stackpos = src.creature_stackpos(i32::from(old.0), i32::from(old.1), i32::from(old.2));
-    let mut out = creature_move(old, stackpos, new);
+    let mut out = creature_move(id, new);
     let (ox, oy) = (i32::from(old.0), i32::from(old.1));
     let (nx, ny) = (i32::from(new.0), i32::from(new.1));
     let nz = i32::from(new.2);
@@ -95,13 +112,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use crate::map_description::TileSlices;
+    use crate::map_description::{TileSlices, WireItem};
 
-    struct MapStub(HashMap<(i32, i32, i32), u16>);
+    struct MapStub(HashMap<(i32, i32, i32), WireItem>);
     impl TileSource for MapStub {
         fn tile(&self, x: i32, y: i32, z: i32) -> Option<TileSlices<'_>> {
-            self.0.get(&(x, y, z)).map(|cid| TileSlices {
-                pre_creature: std::slice::from_ref(cid),
+            self.0.get(&(x, y, z)).map(|item| TileSlices {
+                pre_creature: std::slice::from_ref(item),
                 post_creature: &[],
             })
         }
@@ -111,14 +128,14 @@ mod tests {
     }
 
     #[test]
-    fn creature_move_layout() {
-        let p = creature_move((100, 100, 7), 1, (101, 100, 7));
+    fn creature_move_uses_id_form() {
+        let p = creature_move(0x1000_0000, (101, 100, 7));
         assert_eq!(p[0], OP_CREATURE_MOVE);
-        assert_eq!(u16::from_le_bytes([p[1], p[2]]), 100); // old x
-        assert_eq!(u16::from_le_bytes([p[3], p[4]]), 100); // old y
-        assert_eq!(p[5], 7); // old z
-        assert_eq!(p[6], 1); // stackpos
+        assert_eq!(u16::from_le_bytes([p[1], p[2]]), 0xFFFF); // id-form marker
+        assert_eq!(u32::from_le_bytes([p[3], p[4], p[5], p[6]]), 0x1000_0000); // creature id
         assert_eq!(u16::from_le_bytes([p[7], p[8]]), 101); // new x
+        assert_eq!(u16::from_le_bytes([p[9], p[10]]), 100); // new y
+        assert_eq!(p[11], 7); // new z
         assert_eq!(p.len(), 12);
     }
 
@@ -128,13 +145,13 @@ mod tests {
     }
 
     #[test]
-    fn creature_turn_layout() {
-        let p = creature_turn((100, 100, 7), 1, 0x1000_0000, 1);
+    fn creature_turn_uses_id_form() {
+        let p = creature_turn(0x1000_0000, 1);
         assert_eq!(p[0], OP_CREATURE_TURN);
-        assert_eq!(u16::from_le_bytes([p[1], p[2]]), 100);
-        assert_eq!(p[6], 1); // stackpos
-        assert_eq!(u16::from_le_bytes([p[7], p[8]]), 0x0063);
-        assert_eq!(u32::from_le_bytes([p[9], p[10], p[11], p[12]]), 0x1000_0000);
+        assert_eq!(u16::from_le_bytes([p[1], p[2]]), 0xFFFF); // id-form marker
+        assert_eq!(u32::from_le_bytes([p[3], p[4], p[5], p[6]]), 0x1000_0000); // lookup id
+        assert_eq!(u16::from_le_bytes([p[7], p[8]]), 0x0063); // replacement thing marker
+        assert_eq!(u32::from_le_bytes([p[9], p[10], p[11], p[12]]), 0x1000_0000); // creature id
         assert_eq!(p[13], 1); // direction
         assert_eq!(p[14], 0); // walkthrough
         assert_eq!(p.len(), 15);
@@ -143,7 +160,7 @@ mod tests {
     #[test]
     fn east_step_emits_move_then_east_slice() {
         let stub = MapStub(HashMap::new());
-        let out = walk_update((100, 100, 7), (101, 100, 7), &stub, &[]);
+        let out = walk_update(0x1000_0000, (100, 100, 7), (101, 100, 7), &stub, &[]);
         assert_eq!(out[0], OP_CREATURE_MOVE);
         assert_eq!(out[12], SLICE_EAST);
     }
@@ -151,7 +168,7 @@ mod tests {
     #[test]
     fn northeast_step_emits_both_slices() {
         let stub = MapStub(HashMap::new());
-        let out = walk_update((100, 100, 7), (101, 99, 7), &stub, &[]);
+        let out = walk_update(0x1000_0000, (100, 100, 7), (101, 99, 7), &stub, &[]);
         assert_eq!(out[0], OP_CREATURE_MOVE);
         assert!(out.contains(&SLICE_NORTH));
         assert!(out.contains(&SLICE_EAST));

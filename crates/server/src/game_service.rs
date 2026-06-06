@@ -2,7 +2,7 @@
 //! enableXTEA -> enter-world burst. Mirrors `login_service` but for ProtocolGame.
 
 use anyhow::Result;
-use protocol::map_description::{self, Center, PlacedCreature, TileSource};
+use protocol::map_description::{self, Center, PlacedCreature};
 use protocol::rsa::RsaPrivateKey;
 use protocol::{creature, enter_world, frame, game_login, walk, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -241,18 +241,11 @@ where
     };
 
     if is_turn {
-        // `None` means the world rejected the turn (unknown id) — no packet, no
-        // state change. Stackpos is derived from the tile's item stack (ground +
-        // always-on-top items), matching the walk path.
+        // `None` means the world rejected the turn (unknown id) — no packet sent.
+        // The turn is addressed by creature id, so no stackpos is needed.
         if let Some(facing) = world.turn_player(session.id, direction).await {
             session.facing = facing;
-            let pos = (session.pos.x, session.pos.y, session.pos.z);
-            let stackpos = world.map.creature_stackpos(
-                i32::from(pos.0),
-                i32::from(pos.1),
-                i32::from(pos.2),
-            );
-            let pkt = walk::creature_turn(pos, stackpos, session.id, facing.to_byte());
+            let pkt = walk::creature_turn(session.id, facing.to_byte());
             send_encrypted(stream, keys, &pkt).await?;
         }
         return Ok(());
@@ -264,6 +257,7 @@ where
             MoveOutcome::Moved { from, to } => {
                 session.pos = to;
                 let pkt = walk::walk_update(
+                    session.id,
                     (from.x, from.y, from.z),
                     (to.x, to.y, to.z),
                     world.map.as_ref(),

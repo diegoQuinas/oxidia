@@ -22,9 +22,16 @@ const ITEM_ATTR_TOP_ORDER: u8 = 0x2B;
 
 /// `FLAG_ALWAYSONTOP` bit of the per-item flags word (`itemflags_t`).
 const FLAG_ALWAYS_ON_TOP: u32 = 1 << 13;
+/// `FLAG_STACKABLE` — the wire carries a u8 count after the item's mark byte.
+const FLAG_STACKABLE: u32 = 1 << 7;
+/// `FLAG_ANIMATION` — the wire carries a u8 animation-phase byte after the item.
+const FLAG_ANIMATION: u32 = 1 << 24;
 
 /// `ITEM_GROUP_GROUND` (`itemgroup_t`) — a ground-tile item.
 const ITEM_GROUP_GROUND: u8 = 1;
+/// `ITEM_GROUP_SPLASH` / `ITEM_GROUP_FLUID` — carry a u8 fluid-type byte on the wire.
+const ITEM_GROUP_SPLASH: u8 = 11;
+const ITEM_GROUP_FLUID: u8 = 12;
 
 /// A parsed `items.otb`: version metadata plus the item table in file order.
 #[derive(Debug, Clone)]
@@ -60,6 +67,21 @@ impl ItemType {
     /// True if this item is a ground tile (`itemgroup_t == ITEM_GROUP_GROUND`).
     pub fn is_ground(&self) -> bool {
         self.group == ITEM_GROUP_GROUND
+    }
+
+    /// `FLAG_STACKABLE` — the wire form carries a u8 count byte for this item.
+    pub fn is_stackable(&self) -> bool {
+        self.flags & FLAG_STACKABLE != 0
+    }
+
+    /// `FLAG_ANIMATION` — the wire form carries a u8 animation-phase byte.
+    pub fn is_animated(&self) -> bool {
+        self.flags & FLAG_ANIMATION != 0
+    }
+
+    /// Splash or fluid container — the wire form carries a u8 fluid-type byte.
+    pub fn is_fluid_or_splash(&self) -> bool {
+        self.group == ITEM_GROUP_SPLASH || self.group == ITEM_GROUP_FLUID
     }
 }
 

@@ -108,11 +108,15 @@ fn static_map_stack_round_trips_through_encoder() {
 }
 
 #[test]
-fn walk_update_sends_real_stackpos_for_decorated_tile() {
+fn walk_update_uses_id_form_for_creature_move() {
     let (map, items) = decorated_map();
     let sm = StaticMap::from_formats(&map, &items);
-    // Step east off the decorated tile (ground + 1 top item => stackpos 2).
-    let out = walk::walk_update((1000, 1000, 7), (1001, 1000, 7), &sm, &[]);
+    let id = 0x1000_0000u32;
+    // The move must locate the creature by id, not by (oldPos, stackpos): the
+    // server's items.otb stackpos can disagree with OTClient's .dat placement.
+    let out = walk::walk_update(id, (1000, 1000, 7), (1001, 1000, 7), &sm, &[]);
     assert_eq!(out[0], 0x6D); // creature move opcode
-    assert_eq!(out[6], 2, "old stackpos = ground + 1 always-on-top item");
+    assert_eq!(u16::from_le_bytes([out[1], out[2]]), 0xFFFF); // id-form marker
+    assert_eq!(u32::from_le_bytes([out[3], out[4], out[5], out[6]]), id);
+    assert_eq!(u16::from_le_bytes([out[7], out[8]]), 1001); // new x
 }

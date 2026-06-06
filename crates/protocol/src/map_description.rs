@@ -14,12 +14,33 @@ pub const VIEWPORT_HEIGHT: i32 = 14;
 const ANCHOR_DX: i32 = 8; // (VIEWPORT_WIDTH / 2) - 1
 const ANCHOR_DY: i32 = 6; // (VIEWPORT_HEIGHT / 2) - 1
 
+/// One tile item ready for the wire, mirroring TFS `NetworkMessage::addItem`
+/// (`networkmessage.cpp:82`). After the client id and the `0xFF` mark byte, the
+/// protocol carries optional per-item bytes that OTClient `getItem` reads back:
+/// a `subtype` byte for stackable (count) or splash/fluid items, then a phase
+/// byte for animated items. Omitting these desynchronizes the client's parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireItem {
+    pub client_id: u16,
+    /// Stackable count or splash/fluid type. `None` for plain items.
+    pub subtype: Option<u8>,
+    /// Whether the item is animated (writes a `0xFE` random-phase byte).
+    pub animated: bool,
+}
+
+impl WireItem {
+    /// A plain item: just a client id, no count/fluid/animation bytes.
+    pub fn plain(client_id: u16) -> Self {
+        Self { client_id, subtype: None, animated: false }
+    }
+}
+
 /// Wire-ordered tile contents, split around the creature slot. `pre_creature`
 /// is the ground + always-on-top items (rendered below a creature);
 /// `post_creature` is the remaining "down" items (rendered above).
 pub struct TileSlices<'a> {
-    pub pre_creature: &'a [u16],
-    pub post_creature: &'a [u16],
+    pub pre_creature: &'a [WireItem],
+    pub post_creature: &'a [WireItem],
 }
 
 /// Provides the full item stack at a world coordinate. `tile` returns `None`
@@ -131,11 +152,11 @@ fn get_map_description<S: TileSource>(
                         skip = 0;
                         w.write_u16(0x0000); // environmental effects placeholder
                         let mut things: u8 = 0;
-                        for &client_id in slices.pre_creature {
+                        for item in slices.pre_creature {
                             if things == 10 {
                                 break;
                             }
-                            add_item(w, client_id);
+                            add_item(w, item);
                             things += 1;
                         }
                         for c in creatures {
@@ -148,11 +169,11 @@ fn get_map_description<S: TileSource>(
                             }
                         }
                         if things < 10 {
-                            for &client_id in slices.post_creature {
+                            for item in slices.post_creature {
                                 if things == 10 {
                                     break;
                                 }
-                                add_item(w, client_id);
+                                add_item(w, item);
                                 things += 1;
                             }
                         }
@@ -176,12 +197,20 @@ fn get_map_description<S: TileSource>(
     }
 }
 
-/// Serialize one tile item: `[u16 clientId][u8 0xFF]`. Used for every item in a
-/// tile stack (ground, top, and down items). Stackable counts and animation
-/// phases are not encoded yet — only plain items are sent.
-fn add_item(w: &mut MessageWriter, client_id: u16) {
-    w.write_u16(client_id);
+/// Serialize one tile item, mirroring TFS `NetworkMessage::addItem`
+/// (`networkmessage.cpp:82`): `[u16 clientId][u8 0xFF mark]`, then a `subtype`
+/// byte for stackable (count) or splash/fluid items, then a `0xFE` phase byte
+/// for animated items. OTClient `getItem` reads these same conditional bytes, so
+/// omitting them shifts the rest of the tile stream and corrupts the parse.
+fn add_item(w: &mut MessageWriter, item: &WireItem) {
+    w.write_u16(item.client_id);
     w.write_u8(MARK_UNMARKED);
+    if let Some(subtype) = item.subtype {
+        w.write_u8(subtype);
+    }
+    if item.animated {
+        w.write_u8(0xFE); // random animation phase
+    }
 }
 
 #[cfg(test)]
@@ -191,16 +220,22 @@ mod tests {
 
     /// Maps a coordinate to its full wire-ordered stack (pre_creature first).
     struct MapStub {
-        stacks: HashMap<(i32, i32, i32), (Vec<u16>, usize)>,
+        stacks: HashMap<(i32, i32, i32), (Vec<WireItem>, usize)>,
     }
     impl MapStub {
         fn ground_only(m: HashMap<(i32, i32, i32), u16>) -> Self {
             let stacks = m
                 .into_iter()
-                .map(|(k, cid)| (k, (vec![cid], 1usize)))
+                .map(|(k, cid)| (k, (vec![WireItem::plain(cid)], 1usize)))
                 .collect();
             Self { stacks }
         }
+    }
+
+    /// Build a stack of plain items (no count/animation bytes) with the given
+    /// `pre_creature` split — the common shape for the round-trip tests.
+    fn plain_stack(ids: &[u16], pre: usize) -> (Vec<WireItem>, usize) {
+        (ids.iter().copied().map(WireItem::plain).collect(), pre)
     }
     impl TileSource for MapStub {
         fn tile(&self, x: i32, y: i32, z: i32) -> Option<TileSlices<'_>> {
@@ -402,7 +437,7 @@ mod tests {
     fn multi_item_tile_round_trips_in_wire_order() {
         let center = Center { x: 1000, y: 1000, z: 7 };
         let mut stacks = HashMap::new();
-        stacks.insert((1000, 1000, 7), (vec![4526u16, 1000u16, 1001u16, 2000u16], 3usize));
+        stacks.insert((1000, 1000, 7), plain_stack(&[4526, 1000, 1001, 2000], 3));
         let stub = MapStub { stacks };
         let bytes = encode(center, &stub, &[]);
         let found = decode_stream(&bytes, center);
@@ -415,7 +450,7 @@ mod tests {
         let center = Center { x: 1000, y: 1000, z: 7 };
         let ids: Vec<u16> = (1..=12u16).collect();
         let mut stacks = HashMap::new();
-        stacks.insert((1000, 1000, 7), (ids, 12usize));
+        stacks.insert((1000, 1000, 7), plain_stack(&ids, 12));
         let stub = MapStub { stacks };
         let bytes = encode(center, &stub, &[]);
         let found = decode_stream(&bytes, center);
@@ -426,7 +461,7 @@ mod tests {
     fn creature_splices_between_top_and_down_items() {
         let center = Center { x: 1000, y: 1000, z: 7 };
         let mut stacks = HashMap::new();
-        stacks.insert((1000, 1000, 7), (vec![4526u16, 1059u16, 2000u16], 2usize));
+        stacks.insert((1000, 1000, 7), plain_stack(&[4526, 1059, 2000], 2));
         let stub = MapStub { stacks };
         let creature = PlacedCreature { x: 1000, y: 1000, z: 7, bytes: vec![0x61, 0x00, 0xAA, 0xBB] };
         let bytes = encode(center, &stub, std::slice::from_ref(&creature));
@@ -437,5 +472,30 @@ mod tests {
         let di = find_subsequence(&bytes, &down).expect("down item present");
         assert!(ti < ci, "creature after top item");
         assert!(ci < di, "creature before down item");
+    }
+
+    #[test]
+    fn add_item_emits_count_and_animation_bytes() {
+        // A tile whose items exercise the conditional per-item bytes:
+        // ground (plain), a stackable item (count byte), an animated item (0xFE).
+        let center = Center { x: 1000, y: 1000, z: 7 };
+        let stack = vec![
+            WireItem::plain(4526),
+            WireItem { client_id: 0x0ABC, subtype: Some(5), animated: false },
+            WireItem { client_id: 0x0B73, subtype: None, animated: true },
+        ];
+        let mut stacks = HashMap::new();
+        stacks.insert((1000, 1000, 7), (stack, 2usize));
+        let stub = MapStub { stacks };
+        let bytes = encode(center, &stub, &[]);
+        // stackable: [BC 0A][FF mark][05 count]; animated: [73 0B][FF mark][FE phase].
+        assert!(
+            find_subsequence(&bytes, &[0xBC, 0x0A, 0xFF, 0x05]).is_some(),
+            "stackable count byte present"
+        );
+        assert!(
+            find_subsequence(&bytes, &[0x73, 0x0B, 0xFF, 0xFE]).is_some(),
+            "animated phase byte present"
+        );
     }
 }
