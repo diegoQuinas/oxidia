@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local runtime artifacts
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Reference clone is pulled on demand; keep it out of history
+/reference/
+
+# Large binaries (client assets / downloads)
+*.zip
+
+# Agent tooling state
+.atl/
