@@ -8,8 +8,8 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M2 ✅ format parsers complete end-to-end → next is **M3 (enter game)**.
-- **Build:** `cargo build` clean, `cargo test` green (55 tests), `cargo clippy` clean.
+- **Milestone:** M3 🟡 **code-complete, pending live OTClient acceptance** → then **M4 (walk)**.
+- **Build:** `cargo build` clean, `cargo test` green (74 tests), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
 - **Accepted (M2):** `cargo run -p formats --example mapinfo` parses the real `items.otb` (v3.57, 26 282 items) and `forgotten.otbm` (2048×2048, 340 594 tiles, 429 031 items, 5 towns) — full tree walk, no unknown nodes/attrs.
@@ -21,7 +21,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 | M0 | Skeleton: workspace compiles, tests green, server listens on 7171/7172, logs connections | ✅ done |
 | M1 | Login server: framing, Adler-32, RSA, XTEA, NetworkMessage, login parse, char list, sniff tool | ✅ done |
 | M2 | Formats: `.otb` + `.otbm` parsers, `mapinfo` example | ✅ done |
-| M3 | Enter game: game handshake (challenge), player load, initial packet sequence, render map | ⬜ |
+| M3 | Enter game: game handshake (challenge), player load, initial packet sequence, render map | 🟡 code-complete, live acceptance pending |
 | M4 | Walk: movement packets, tile updates, floor changes, collision | ⬜ |
 
 (Combat / Lua scripting / creatures are planned *after* M4.)
@@ -74,6 +74,30 @@ Acceptance: protocol proven correct against the `probe` client (MOTD + char list
 5. ✅ `mapinfo` example (`crates/formats/examples/mapinfo.rs`): loads both, prints versions/dims/file-refs/tile+item counts/per-floor distribution/town list. **M2 acceptance criterion.**
 
 Run: `cargo run -p formats --example mapinfo [items.otb] [map.otbm]` (defaults to the bundled reference files).
+
+## M3 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-06-m3-enter-game-design.md`, `docs/superpowers/plans/2026-06-06-m3-enter-game.md`.
+
+1. ✅ `protocol::challenge` — encode `0x1F` `[u32 ts][u8 random]` (checksummed, NOT XTEA — first server→client packet).
+2. ✅ `protocol::game_login` — `parse(payload, &RsaPrivateKey) -> GameLoginRequest`. Game packet = `[u8 0x0A id][u16 os][u16 version][skip 7][128-byte RSA block]`; block = `[u8 0][u32x4 xtea][u8 gamemaster][string sessionKey][string charName][u32 ts][u8 rnd]`. `sessionKey` = `account\npassword\ntoken\ntokenTime` (strict 4-part). `build_request` test helper.
+3. ✅ `protocol::map_description` — `0x64` viewport (18×14, floors 7→0). **Exact port of TFS `GetMapDescription`/`GetFloorDescription`** skip-encoding; `GroundSource` trait keeps it map-agnostic. Round-trip tested against an OTClient-faithful decoder.
+4. ✅ `protocol::enter_world` — burst encoders: `self_info 0x17` (29 B), `pending 0x0A`, `enter_world 0x0F`, `stats 0xA0` (53 B), `skills 0xA1`, `world_light 0x82`, `creature_light 0x8D`, `empty_inventory 0x79×11`, `basic_data 0x9F`, `icons 0xA2`, `magic_effect 0x83`, `extended 0x32`.
+5. ✅ `world::map::StaticMap` (immutable ground lookup `server_id→client_id` + town-temple spawn, impl `GroundSource`) + `world::game::GameWorld` (tokio actor over mpsc/oneshot, owns the player registry; map shared via `Arc`).
+6. ✅ `server::game_service` — `handle_game`: challenge → parse → echo+version validate → enableXTEA → `0x32` (OTClient) → `world.login` → burst. `main.rs` loads `items.otb`+`forgotten.otbm`, spawns the world, serves 7172 via `serve_with`. Integration replay test over `tokio::io::duplex`.
+7. 🟡 **Live acceptance pending** — point the real OTClient at 7172 and confirm the player renders on the Thais temple ground.
+
+Burst order (one XTEA frame): `0x17, 0x0A, 0x0F, 0x64 map, 0x83, 0x79×11, 0xA0, 0xA1, 0x82, 0x8D, 0x9F, 0xA2`.
+
+**Deferred to M4:** per-connection random challenge (M3 uses a fixed `ts/rnd` — functionally fine since the client echoes it back, but no replay protection); items/creatures on tiles; underground floor walk (z≥8); real player persistence (M3 spawns every char at the temple).
+
+## Protocol gotchas (M3 game-enter)
+
+- **`ProtocolGame` id byte is `0x0A`** (vs `0x01` for login). Our frame payload keeps the protocol-id byte; `game_login::parse` reads it first. The game port skips only **7** bytes after version (`u32 clientVersion + u8 type + u16 datRevision`), unlike the login server's 17.
+- **Skip-encoding must be a byte-faithful TFS port** (`protocolgame.cpp:633-680`): `skip` starts `-1` and persists across all 8 floors; on empty tile check `skip == 0xFE` **before** incrementing (`[0xFF][0xFF]` flush + reset `-1`); on a real tile flush `[skip][0xFF]` if `skip>=0`, then `skip=0`, write `[env 0x0000][item]`; final `[skip][0xFF]` flush. OTClient's `setFloorDescription` is the exact mirror — do NOT invent a self-consistent scheme.
+- **Byte layouts are version-gated.** At 1098: `self_info 0x17` = 29 B; `stats 0xA0` = 53 B with health/mana as **u16** (u32 only from `GameDoubleHealth` ≥ 1300). Verify field sets against the OTClient parse, not just TFS send code.
+- After parsing the game-login packet, **enable XTEA** for all subsequent traffic (the `0x32` ext-opcode and the whole burst are XTEA-encrypted + checksummed; the `0x1F` challenge is checksummed only).
+- OTClient OS values ≥ 10 (`CLIENTOS_OTCLIENT_LINUX`) trigger a `0x32` extended-opcode init packet right after the key exchange.
 
 ## Format gotchas (.otb / .otbm)
 
