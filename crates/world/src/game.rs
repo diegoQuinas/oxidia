@@ -328,6 +328,28 @@ impl Game {
         origin
     }
 
+    /// Like `free_spawn` but anchored at `origin` and excluding `exclude`. Finds
+    /// the nearest walkable, unoccupied tile near `origin`, returning `origin` if
+    /// free. Used by `login` so a returning player never lands on an occupied tile.
+    fn free_spawn_near(&self, origin: Position, exclude: u32) -> Position {
+        if self.map.is_walkable(origin) && !self.tile_occupied(origin, exclude) {
+            return origin;
+        }
+        for r in 1..=5i32 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs() != r && dy.abs() != r { continue; }
+                    if let Some(p) = origin.offset(dx, dy) {
+                        if self.map.is_walkable(p) && !self.tile_occupied(p, exclude) {
+                            return p;
+                        }
+                    }
+                }
+            }
+        }
+        origin
+    }
+
     fn login(&mut self, name: String, initial: InitialState, push_tx: mpsc::Sender<Vec<u8>>) -> LoginAck {
         let id = self.next_id;
         self.next_id += 1;
