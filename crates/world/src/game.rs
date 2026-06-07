@@ -336,6 +336,23 @@ impl Game {
             }
         }
 
+        // Creatures that scrolled out of the mover's OWN viewport must be
+        // forgotten, mirroring the spectator prune above (335) and logout (226).
+        // The client drops them when it recenters; if the server keeps them in
+        // the mover's known-set, a later return is sent as the short 0x62 form
+        // for a creature the client already discarded, leaving it invisible and
+        // tripping "parseCreatureMove: unable to remove creature" on its moves.
+        let left_view: Vec<u32> = self
+            .spectators(from, id)
+            .into_iter()
+            .filter(|oid| {
+                self.players.get(oid).is_some_and(|p| !Self::can_see(to, p.position))
+            })
+            .collect();
+        for oid in left_view {
+            if let Some(mover) = self.players.get_mut(&id) { mover.known.remove(&oid); }
+        }
+
         // The mover's own view: 0x6D + revealed slices, carrying every other
         // player now in range so they render in the newly exposed tiles.
         let others_in_range: Vec<PlacedCreature> = self
@@ -498,6 +515,31 @@ mod tests {
         assert_eq!(u16::from_le_bytes([first[0], first[1]]), 0x0061, "first sighting is full form");
         let second = g.introduce(viewer, target).unwrap();
         assert_eq!(u16::from_le_bytes([second[0], second[1]]), 0x0062, "second is short form");
+    }
+
+    #[test]
+    fn mover_forgets_creatures_that_leave_its_own_viewport() {
+        // Repro: A sees B, A walks away until B scrolls off A's own view, A
+        // returns. B must be re-introduced in FULL form on return, so it has to
+        // be dropped from A's known-set when it leaves A's viewport. Without the
+        // prune, A's known-set keeps a stale B, introduce() later emits the short
+        // 0x62 form for a creature A's client already dropped, and every 0x6D for
+        // B trips OTClient's "parseCreatureMove: unable to remove creature".
+        let mut g = Game::new(walk_map());
+        // A one tile east of the wall at 94,117 so it can step west to 95,117.
+        let (a, _ra) = add_player(&mut g, Position::new(96, 117, 7));
+        // B sits at the +8x edge of A@96: visible from 96 (|104-96|=8) but not
+        // from 95 (|104-95|=9). A's westward step drops B out of view.
+        let (b, _rb) = add_player(&mut g, Position::new(104, 117, 7));
+        g.introduce(a, b).unwrap();
+        assert!(g.players[&a].known.contains(&b), "A knows B after introduce");
+
+        g.do_move(a, Direction::West); // 96,117 -> 95,117; B leaves A's view
+
+        assert!(
+            !g.players[&a].known.contains(&b),
+            "B left A's viewport, so A must forget it for a full re-introduce on return"
+        );
     }
 
     #[tokio::test]
