@@ -44,6 +44,10 @@ const MSG_STATUS_SMALL: u8 = 21;
 /// TFS `MESSAGE_INFO_DESCR = 22`: green look-description message (`const.h:191`).
 const MSG_INFO_DESCR: u8 = 22;
 
+/// TFS `MESSAGE_STATUS_CONSOLE_BLUE = 4` (`const.h:182`): blue console text.
+/// Used for GM command output (`/help`).
+const MSG_CONSOLE_BLUE: u8 = 4;
+
 /// Client viewport extents from the player's tile, matching the 18x14 map
 /// description anchored at center-8 / center-6 (TFS `Map::maxClientViewportX/Y`).
 /// Asymmetric: one extra column east and one extra row south.
@@ -1012,10 +1016,14 @@ impl Game {
                 let Some(p) = self.players.get(&id) else { return };
                 let player_pos = p.position;
                 let Some(it) = p.inventory[(slot - 1) as usize] else { return };
-                let near = (i32::from(player_pos.x) - i32::from(to.x)).abs() <= 1
-                    && (i32::from(player_pos.y) - i32::from(to.y)).abs() <= 1
-                    && player_pos.z == to.z;
-                if !near { self.push_cannot_move(id, "You are too far away."); return; }
+                // Unequip THROWS the item from the body to the ground. The source
+                // is on the player, so (matching TFS playerMoveItem: mapFromPos is
+                // the player's own tile when fromCylinder is the inventory) the only
+                // distance constraint is throw range + line of sight to the dest —
+                // NOT adjacency. You can toss an unequipped item across the screen.
+                if player_pos.z != to.z || !self.map.can_throw_object_to(player_pos, to) {
+                    self.push_cannot_move(id, "You cannot throw there."); return;
+                }
                 if self.map.tile_pre_creature_len(to) == 0 && self.map.tile_stack_clone(to).is_none() {
                     self.push_cannot_move(id, "You cannot put that there."); return;
                 }
@@ -1204,6 +1212,19 @@ impl Game {
         self.push(id, w.into_bytes());
     }
 
+    /// Push a `0xB4 MESSAGE_STATUS_CONSOLE_BLUE` line to a single player — blue,
+    /// scrollable console text, private to the session. Used for `/help`. Keep the
+    /// payload ASCII: the 10.98 client renders text as Latin-1, so multi-byte
+    /// UTF-8 (e.g. an em dash) shows as mojibake.
+    fn push_console_blue(&mut self, id: u32, text: &str) {
+        let bytes = text.as_bytes();
+        let mut w = protocol::message::MessageWriter::new();
+        w.write_u8(0xB4);
+        w.write_u8(MSG_CONSOLE_BLUE);
+        w.write_string(&bytes[..bytes.len().min(255)]);
+        self.push(id, w.into_bytes());
+    }
+
     /// Handle `0xA1` — set or clear the attacker's melee target.
     ///
     /// - `target_id == 0` clears the fight.
@@ -1279,9 +1300,9 @@ impl Game {
     /// which is what `/help` needs. Iterates [`GmVerb::ALL`], so newly added
     /// commands appear automatically.
     fn gm_help(&mut self, id: u32) {
-        self.push_info_descr(id, "Gamemaster commands:");
+        self.push_console_blue(id, "Gamemaster commands:");
         for &cmd in GmVerb::ALL {
-            self.push_info_descr(id, &format!("{} — {}", cmd.usage(), cmd.description()));
+            self.push_console_blue(id, &format!("{} - {}", cmd.usage(), cmd.description()));
         }
     }
 
