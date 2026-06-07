@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use protocol::creature::{self, CreatureView, Outfit};
 use protocol::map_description::{PlacedCreature, TileSource};
-use protocol::{tile_creature, walk};
+use protocol::{enter_world, tile_creature, walk};
 
 use crate::map::StaticMap;
 use crate::{Direction, Position};
@@ -183,6 +183,12 @@ impl Game {
                     i32::from(position.x), i32::from(position.y), i32::from(position.z));
                 self.push(other, tile_creature::add_tile_creature(
                     (position.x, position.y, position.z), stackpos, &bytes));
+                // Spectators also see the teleport puff on login (TFS
+                // sendAddCreature isLogin -> sendMagicEffect CONST_ME_TELEPORT).
+                // The spawning client gets it from its own enter-world burst;
+                // without this, other players see the creature appear with no effect.
+                self.push(other, enter_world::magic_effect(
+                    position.x, position.y, position.z, enter_world::EFFECT_TELEPORT));
             }
         }
 
@@ -429,6 +435,9 @@ mod tests {
         let _ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
         let pkt = rx_a.recv().await.unwrap();
         assert_eq!(pkt[0], protocol::tile_creature::OP_ADD_TILE_CREATURE);
+        // ...followed by the teleport puff, so spectators see the spawn effect too.
+        let effect = rx_a.recv().await.unwrap();
+        assert_eq!(effect[0], protocol::enter_world::OP_MAGIC_EFFECT);
         assert_ne!(ack_a.snapshot.id, 0);
     }
 
@@ -466,7 +475,9 @@ mod tests {
         world.login("A".into(), knight(), tx_a).await.unwrap();
         let (tx_b, _rx_b) = push_channel();
         let ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
-        let _ = rx_a.recv().await.unwrap(); // appear
+        let _ = rx_a.recv().await.unwrap(); // appear (0x6A)
+        let effect = rx_a.recv().await.unwrap(); // teleport puff (0x83)
+        assert_eq!(effect[0], protocol::enter_world::OP_MAGIC_EFFECT);
         world.logout(ack_b.snapshot.id).await;
         let pkt = rx_a.recv().await.unwrap();
         assert_eq!(pkt[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
