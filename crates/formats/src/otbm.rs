@@ -254,8 +254,11 @@ fn parse_item(node: &Node) -> Result<MapItem, FormatError> {
         let attr = r.read_u8()?;
         match attr {
             OTBM_ATTR_COUNT => count = Some(r.read_u8()?),
+            // RUNE_CHARGES is a u8 (TFS `item.cpp:366-367` reads it like COUNT),
+            // not a u16 — read one byte and discard (not a stack count).
+            OTBM_ATTR_RUNE_CHARGES => { r.read_u8()?; }
             OTBM_ATTR_ACTION_ID | OTBM_ATTR_UNIQUE_ID | OTBM_ATTR_DEPOT_ID
-            | OTBM_ATTR_RUNE_CHARGES | OTBM_ATTR_CHARGES => { r.read_u16()?; }
+            | OTBM_ATTR_CHARGES => { r.read_u16()?; }
             OTBM_ATTR_TELE_DEST => { r.skip(5)?; } // x u16, y u16, z u8
             OTBM_ATTR_DURATION | OTBM_ATTR_WRITTENDATE => { r.read_u32()?; }
             OTBM_ATTR_DECAYING_STATE => { r.read_u8()?; }

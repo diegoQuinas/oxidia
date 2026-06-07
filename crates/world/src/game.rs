@@ -655,8 +655,13 @@ impl Game {
         }
     }
 
-    /// Ids of creatures standing on `pos`, deterministic order. Mirrors the
-    /// stackpos ordering used by `creature_stackpos_on`.
+    /// Ids of creatures standing on `pos`, in deterministic id order. Under the
+    /// ≤1-creature-per-tile invariant the vec is length 0 or 1, so the order is
+    /// unambiguous. KNOWN LIMITATION: when 2+ creatures co-occupy a tile (only on
+    /// stair/height landings via `FLAG_IGNOREBLOCKCREATURE`), id order can differ
+    /// from the wire arrival order, so a look at the top creature may resolve to
+    /// the other co-occupant. Both render identically (Level 1, no vocation), so
+    /// only the displayed name can swap; deferred until it matters.
     fn creatures_on(&self, pos: Position) -> Vec<u32> {
         let mut ids: Vec<u32> = self
             .players

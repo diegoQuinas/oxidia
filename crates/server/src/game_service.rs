@@ -157,7 +157,7 @@ pub fn build_enter_world_burst(
     burst.extend(enter_world::empty_inventory());
     burst.extend(enter_world::stats(&stats));
     burst.extend(enter_world::skills());
-    burst.extend(enter_world::world_light(250, 215));
+    burst.extend(enter_world::world_light(215, 215));
     burst.extend(enter_world::creature_light(snapshot_id, 0, 0));
     burst.extend(enter_world::basic_data());
     let icon_mask = if map.is_protection_zone(Position::new(center.x, center.y, center.z)) {
