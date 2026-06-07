@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M6 (chat) **code-complete — live acceptance pending** (two OTClients: say/whisper/yell). M5 ✅ multiplayer presence accepted live. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) and auto-walk remain deferred.
+- **Milestone:** M6 ✅ **chat complete and accepted live** (say/whisper/yell; off-screen yell is chat-only — correct, the speech bubble only renders when the speaker is on your screen) → next is **M7 (combat core + PvP melee)**, the pre-alpha #1 gate. M5 ✅ presence, M4 ✅ walk. Floor changes / underground (z≥8) and auto-walk remain deferred.
 - **Build:** `cargo build` clean, `cargo test` green (121 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -32,7 +32,7 @@ performance-critical or stable stays native Rust.
 | **A** | **Living World → pre-alpha #1** | |
 | M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | ✅ done |
 | M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ✅ done |
-| M6 | Chat: say / whisper / yell + default channel | 🚧 code-complete, live pending |
+| M6 | Chat: say / whisper / yell + default channel | ✅ done |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
 | **B** | **Items & Inventory** | |
@@ -165,7 +165,7 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m6-chat-design.md`, `docs/supe
 1. ✅ `protocol::chat` — `parse_say(body) -> Option<(SpeakType, String)>` (inbound `0x96` = `[type u8][msg str]`; rejects unsupported types / empty / malformed) and `creature_say` (outbound `0xAA` = `[stmt u32][name str][level u16][type u8][x u16][y u16][z u8][msg str]`). `SpeakType { Say=1, Whisper=2, Yell=3 }`.
 2. ✅ `world::game` — `Command::Say` + `do_say`. The actor (single packet builder) reads the speaker's current pos+name, allocates a statement id, and broadcasts `0xAA`. `spectators` generalized to `spectators_in_range(pos, exclude, rx, ry)`. Ranges: say ±8/±6, yell ±18/±14 + UPPERCASE, whisper ±8/±6 with full text to Chebyshev ≤1 and `"pspsps"` to in-view-but-far. Speaker always hears own (pushed explicitly, since `spectators` excludes self).
 3. ✅ `server::game_service` — `reader_loop` intercepts `0x96` before the walk/turn dispatch, `chat::parse_say(&payload[1..])` → `world.say(...)`; unsupported/malformed dropped.
-4. 🚧 **Live acceptance pending** — two OTClients: say heard nearby (not when far); whisper full only to the adjacent client (far-in-view sees `pspsps`); yell heard far away in UPPERCASE.
+4. ✅ **Accepted live** — two OTClients: say heard nearby (not when far); whisper full only to the adjacent client (far-in-view sees `pspsps`); yell heard far in UPPERCASE. Off-screen yell appears in the chat console but shows no floating bubble — correct: `addStaticText` is positional, so a bubble only renders when the speaker is on the recipient's screen (matches TFS/OTClient).
 
 **Key seam (confirmed clean in final holistic review):** chat depends on **no** M5 presence state. `0xAA` carries the speaker NAME (string) + POSITION, not a creature id — so a yell reaching a player who never had the speaker introduced (off their viewport, not in their known-set) still renders. `do_say` only READS positions; it never touches stackpos, the known-set, or the ≤1-creature-per-tile invariant.
 

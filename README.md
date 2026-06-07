@@ -60,7 +60,7 @@ embedded Lua (mlua)** for mutable content. Full plan in
 | **Phase A — Living World → pre-alpha #1** | | |
 | M4 | Walk: movement, tile updates, floor changes, collision | ✅ |
 | M5 | Multiplayer presence: spectators, see others walk | ✅ |
-| M6 | Chat: say / whisper / yell + default channel | ⬜ |
+| M6 | Chat: say / whisper / yell + default channel | ✅ |
 | M7 | Combat core + PvP melee: damage, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved progress | ⬜ |
 | **Phase B — Items & Inventory** | | |
