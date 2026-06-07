@@ -1,8 +1,9 @@
 //! `0x64` map description for protocol 10.98.
 //! Mirrors `reference/tfs/src/protocolgame.cpp` (`GetMapDescription`/`GetFloorDescription`).
-//! Viewport is 18 wide x 14 tall; overground walks floors 7->0. Empty tiles are
-//! run-length "skip"-encoded: `[u8 skip][u8 0xFF]` flushes a run; `[0xFF][0xFF]`
-//! flushes a full run of 255.
+//! Viewport is 18 wide x 14 tall; overground (z<=7) walks floors 7->0,
+//! underground (z>7) walks the `z-2 ..= z+2` band (clamped to floor 15). Empty
+//! tiles are run-length "skip"-encoded: `[u8 skip][u8 0xFF]` flushes a run;
+//! `[0xFF][0xFF]` flushes a full run of 255.
 
 use crate::message::MessageWriter;
 
@@ -74,7 +75,8 @@ pub struct PlacedCreature {
 
 /// Encode a full `0x64` map description centered on `center`, with `creatures`
 /// rendered on their tiles. Writes the full tile stack (ground + top items, then
-/// creatures, then down items) capped at 10 things. Overground centers (z <= 7) only.
+/// creatures, then down items) capped at 10 things. Handles both overground
+/// (floors 7->0) and underground (z>7, the `z-2 ..= z+2` band) centers.
 pub fn encode<S: TileSource>(center: Center, src: &S, creatures: &[PlacedCreature]) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u8(OPCODE_MAP_DESCRIPTION);
@@ -113,17 +115,17 @@ pub fn encode_slice<S: TileSource>(
     w.into_bytes()
 }
 
-/// Exact port of TFS `GetMapDescription` + `GetFloorDescription`
-/// (protocolgame.cpp:633-680). Floors 7->0, `skip` persists across them and
-/// starts at -1. After a tile's pre_creature items, any creature on that tile is
-/// spliced in, then post_creature (down) items follow. The full tile stack
-/// (ground + top items, creatures, down items) is capped at 10 things total.
+/// Exact port of TFS `GetMapDescription` (protocolgame.cpp:633-680). Delegates
+/// per-floor work to `floor_description`, which carries a persistent `skip`
+/// across all floors. Overground centers (z <= 7) walk floors 7->0; underground
+/// centers (z > 7) walk the +-2 band (clamped to floor 15). After the last
+/// floor the final open run is flushed.
 ///
-/// Skip-encoding: `skip` persists across ALL overground floors and starts at -1,
-/// so a stream that opens on a real tile emits no leading skip pair. On an empty
-/// tile: flush `[0xFF][0xFF]` when the run reaches 0xFE, otherwise increment. On
-/// a real tile: flush `[skip][0xFF]` if a run is open, then write the tile. A
-/// final `[skip][0xFF]` closes the last open run. The OTClient decoder is the
+/// Skip-encoding: `skip` persists across ALL floors and starts at -1, so a
+/// stream that opens on a real tile emits no leading skip pair. On an empty
+/// tile: flush `[0xFF][0xFF]` when the run reaches 0xFE, otherwise increment.
+/// On a real tile: flush `[skip][0xFF]` if a run is open, then write the tile.
+/// A final `[skip][0xFF]` closes the last open run. The OTClient decoder is the
 /// exact mirror of this.
 #[allow(clippy::too_many_arguments)]
 fn get_map_description<S: TileSource>(
@@ -137,63 +139,91 @@ fn get_map_description<S: TileSource>(
     creatures: &[PlacedCreature],
 ) {
     let mut skip: i32 = -1;
-    for nz in (0..=7i32).rev() {
-        let offset = center_z - nz;
-        for nx in 0..width {
-            for ny in 0..height {
-                let wx = anchor_x + nx + offset;
-                let wy = anchor_y + ny + offset;
-                match src.tile(wx, wy, nz) {
-                    Some(slices) => {
-                        if skip >= 0 {
-                            w.write_u8(skip as u8);
-                            w.write_u8(0xFF);
-                        }
-                        skip = 0;
-                        w.write_u16(0x0000); // environmental effects placeholder
-                        let mut things: u8 = 0;
-                        for item in slices.pre_creature {
-                            if things == 10 {
-                                break;
-                            }
-                            add_item(w, item);
-                            things += 1;
-                        }
-                        for c in creatures {
-                            if i32::from(c.x) == wx
-                                && i32::from(c.y) == wy
-                                && i32::from(c.z) == nz
-                            {
-                                w.write_bytes(&c.bytes);
-                                things = things.saturating_add(1);
-                            }
-                        }
-                        if things < 10 {
-                            for item in slices.post_creature {
-                                if things == 10 {
-                                    break;
-                                }
-                                add_item(w, item);
-                                things += 1;
-                            }
-                        }
-                    }
-                    None => {
-                        if skip == 0xFE {
-                            w.write_u8(0xFF);
-                            w.write_u8(0xFF);
-                            skip = -1;
-                        } else {
-                            skip += 1;
-                        }
-                    }
-                }
-            }
+    let (startz, endz, zstep) = floor_range(center_z);
+    let mut nz = startz;
+    loop {
+        floor_description(w, anchor_x, anchor_y, nz, center_z - nz, width, height, &mut skip, src, creatures);
+        if nz == endz {
+            break;
         }
+        nz += zstep;
     }
     if skip >= 0 {
         w.write_u8(skip as u8);
         w.write_u8(0xFF);
+    }
+}
+
+/// TFS `GetMapDescription` band rule (`protocolgame.cpp:638-646`): overground
+/// (`z <= 7`) streams floors 7->0; underground (`z > 7`) streams `z-2 ..= z+2`
+/// (clamped to floor 15).
+fn floor_range(center_z: i32) -> (i32, i32, i32) {
+    if center_z > 7 {
+        (center_z - 2, (center_z + 2).min(15), 1)
+    } else {
+        (7, 0, -1)
+    }
+}
+
+/// One floor's tile stream, carrying a persistent `skip` across floors. Port of
+/// TFS `GetFloorDescription` (`protocolgame.cpp:658-680`). `offset` shifts the
+/// sample point per floor (`center_z - nz`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn floor_description<S: TileSource>(
+    w: &mut MessageWriter,
+    anchor_x: i32,
+    anchor_y: i32,
+    nz: i32,
+    offset: i32,
+    width: i32,
+    height: i32,
+    skip: &mut i32,
+    src: &S,
+    creatures: &[PlacedCreature],
+) {
+    for nx in 0..width {
+        for ny in 0..height {
+            let wx = anchor_x + nx + offset;
+            let wy = anchor_y + ny + offset;
+            match src.tile(wx, wy, nz) {
+                Some(slices) => {
+                    if *skip >= 0 {
+                        w.write_u8(*skip as u8);
+                        w.write_u8(0xFF);
+                    }
+                    *skip = 0;
+                    w.write_u16(0x0000);
+                    let mut things: u8 = 0;
+                    for item in slices.pre_creature {
+                        if things == 10 { break; }
+                        add_item(w, item);
+                        things += 1;
+                    }
+                    for c in creatures {
+                        if i32::from(c.x) == wx && i32::from(c.y) == wy && i32::from(c.z) == nz {
+                            w.write_bytes(&c.bytes);
+                            things = things.saturating_add(1);
+                        }
+                    }
+                    if things < 10 {
+                        for item in slices.post_creature {
+                            if things == 10 { break; }
+                            add_item(w, item);
+                            things += 1;
+                        }
+                    }
+                }
+                None => {
+                    if *skip == 0xFE {
+                        w.write_u8(0xFF);
+                        w.write_u8(0xFF);
+                        *skip = -1;
+                    } else {
+                        *skip += 1;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -472,6 +502,75 @@ mod tests {
         let di = find_subsequence(&bytes, &down).expect("down item present");
         assert!(ti < ci, "creature after top item");
         assert!(ci < di, "creature before down item");
+    }
+
+    /// The floor set the encoder walks for a given center z (TFS band rule).
+    fn floor_set(center_z: i32) -> Vec<i32> {
+        if center_z > 7 {
+            let start = center_z - 2;
+            let end = (center_z + 2).min(15);
+            (start..=end).collect() // ascending
+        } else {
+            (0..=7).rev().collect() // 7..0
+        }
+    }
+
+    fn decode_band(bytes: &[u8], center: Center) -> HashMap<(i32, i32, i32), Vec<u16>> {
+        assert_eq!(bytes[0], OPCODE_MAP_DESCRIPTION);
+        let floors = floor_set(center.z as i32);
+        let mut p = 6usize;
+        let anchor_x = center.x as i32 - ANCHOR_DX;
+        let anchor_y = center.y as i32 - ANCHOR_DY;
+        let floor_size = VIEWPORT_WIDTH * VIEWPORT_HEIGHT;
+        let total = floors.len() as i32 * floor_size;
+        let mut found = HashMap::new();
+        let mut skip = 0i32;
+        let mut g_idx = 0i32;
+        while g_idx < total {
+            if skip == 0 {
+                let peek = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
+                if peek >= 0xFF00 {
+                    skip = i32::from(peek & 0x00FF);
+                    p += 2;
+                } else {
+                    assert_eq!(peek, 0x0000);
+                    p += 2;
+                    let mut ids = Vec::new();
+                    loop {
+                        let v = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
+                        if v >= 0xFF00 { skip = i32::from(v & 0x00FF); p += 2; break; }
+                        assert_eq!(bytes[p + 2], MARK_UNMARKED);
+                        ids.push(v);
+                        p += 3;
+                    }
+                    let fi = (g_idx / floor_size) as usize;
+                    let nz = floors[fi];
+                    let offset = center.z as i32 - nz;
+                    let t = g_idx % floor_size;
+                    let nx = t / VIEWPORT_HEIGHT;
+                    let ny = t % VIEWPORT_HEIGHT;
+                    found.insert((anchor_x + nx + offset, anchor_y + ny + offset, nz), ids);
+                }
+            } else {
+                skip -= 1;
+            }
+            g_idx += 1;
+        }
+        found
+    }
+
+    #[test]
+    fn underground_center_uses_pm2_band() {
+        // A tile on floor 9 with the player centered at z=9 must be encoded.
+        let center = Center { x: 1000, y: 1000, z: 9 };
+        let mut m = HashMap::new();
+        m.insert((1000, 1000, 9), 4526u16);
+        let stub = MapStub::ground_only(m);
+        let bytes = encode(center, &stub, &[]);
+        let found = decode_band(&bytes, center);
+        assert_eq!(found.get(&(1000, 1000, 9)), Some(&vec![4526u16]));
+        // floors outside [7,11] are never emitted
+        assert!(found.keys().all(|&(_, _, z)| (7..=11).contains(&z)));
     }
 
     #[test]
