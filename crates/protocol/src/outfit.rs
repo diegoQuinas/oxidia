@@ -24,6 +24,10 @@ use crate::message::MessageWriter;
 // Opcode constants
 // ---------------------------------------------------------------------------
 
+/// Inbound: client requests the outfit-selection window
+/// (`playerRequestOutfit`, TFS `parseRecv` case 0xD2, `protocolgame.cpp:553`).
+pub const OP_REQUEST_OUTFIT: u8 = 0xD2;
+
 /// Inbound: client commits a new outfit (`parseSetOutfit`, TFS line 829).
 pub const OP_SET_OUTFIT: u8 = 0xD3;
 
@@ -124,6 +128,11 @@ mod tests {
 
     fn knight() -> Outfit {
         Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
+    }
+
+    #[test]
+    fn op_request_outfit_is_0xd2() {
+        assert_eq!(OP_REQUEST_OUTFIT, 0xD2);
     }
 
     #[test]

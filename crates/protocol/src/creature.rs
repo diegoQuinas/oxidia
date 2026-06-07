@@ -9,7 +9,7 @@ pub const CREATURETYPE_PLAYER: u8 = 0;
 pub const MARK_UNMARKED: u8 = 0xFF;
 
 /// A creature look. `look_type == 0` means a non-creature look (an item id).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Outfit {
     pub look_type: u16,
     pub head: u8,
