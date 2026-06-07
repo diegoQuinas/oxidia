@@ -321,6 +321,9 @@ impl Game {
             Command::LookBattle { id, target_id } => self.do_look_battle(id, target_id),
             Command::MoveThing { id, from, from_stackpos, to, count } =>
                 self.do_move_thing(id, from, from_stackpos, to, count),
+            // Intercepted in the actor loop (it must break the loop + ack);
+            // never reaches `handle`. Arm kept for match exhaustiveness.
+            Command::Shutdown { .. } => {}
         }
     }
 
@@ -479,6 +482,25 @@ impl Game {
             // The departed creature must be re-introduced (full form) if it ever
             // returns: drop it from each spectator's known-set.
             if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
+        }
+    }
+
+    /// Emit a `SaveRecord` for every online player **without** removing them or
+    /// broadcasting. Called on graceful shutdown so in-memory outfit/position
+    /// changes are persisted even when the sessions never logged out cleanly —
+    /// otherwise killing the server reverts everyone to their last clean save.
+    fn save_all(&mut self) {
+        let Some(tx) = &self.save_tx else { return };
+        for p in self.players.values() {
+            let _ = tx.send(SaveRecord {
+                name: p.name.clone(),
+                position: p.position,
+                direction: p.direction,
+                outfit: p.outfit,
+                health: p.health,
+                max_health: p.max_health,
+                sex: p.sex,
+            });
         }
     }
 
@@ -1444,6 +1466,10 @@ enum Command {
     /// Client `0x78`: move a thing from one map position to another (M10.1: ground
     /// items only). `count` is the stackable split amount (ignored for non-stackables).
     MoveThing { id: u32, from: Position, from_stackpos: u8, to: Position, count: u8 },
+    /// Graceful shutdown: persist every online player, ack, then stop the actor.
+    /// Dropping the actor drops `save_tx`, closing the save channel so the DB
+    /// drain task can finish. Handled in the actor loop, not in `handle`.
+    Shutdown { ack: oneshot::Sender<()> },
 }
 
 /// Cloneable handle to the running world.
@@ -1522,6 +1548,17 @@ impl WorldHandle {
     pub async fn move_thing(&self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
         let _ = self.tx.send(Command::MoveThing { id, from, from_stackpos, to, count }).await;
     }
+
+    /// Persist every online player, then stop the world actor. Resolves once all
+    /// save records are queued on the save channel and the actor has begun
+    /// shutting down; the caller must then await the save-drain task so the DB
+    /// writes flush before the process exits. Used by graceful shutdown.
+    pub async fn shutdown_and_save(&self) {
+        let (ack, rx) = oneshot::channel();
+        if self.tx.send(Command::Shutdown { ack }).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
 }
 
 /// The outbound channel a session hands the world at login.
@@ -1564,6 +1601,11 @@ pub fn spawn(map: Arc<StaticMap>) -> (WorldHandle, mpsc::UnboundedReceiver<SaveR
         let mut game = Game::new(map);
         game.save_tx = Some(save_tx);
         while let Some(cmd) = rx.recv().await {
+            if let Command::Shutdown { ack } = cmd {
+                game.save_all();
+                let _ = ack.send(());
+                break; // drop `game` → drop save_tx → save channel closes
+            }
             game.handle(cmd);
         }
     });
@@ -1981,6 +2023,33 @@ mod tests {
         assert_eq!(poof[0], protocol::enter_world::OP_MAGIC_EFFECT);
         let pkt = rx_a.recv().await.unwrap();
         assert_eq!(pkt[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
+    }
+
+    #[tokio::test]
+    async fn shutdown_and_save_persists_online_players_then_stops_actor() {
+        // Graceful shutdown through the live actor: shutdown_and_save resolves
+        // once the save record is queued, and the actor stops afterwards.
+        let (world, mut save_rx) = spawn(walk_map());
+        let (tx_a, _rx_a) = push_channel();
+        let ack = world.login("Diego".into(), default_initial(wizard_outfit()), tx_a)
+            .await.unwrap();
+
+        world.shutdown_and_save().await;
+
+        // The logged-in player's state was persisted.
+        let rec = save_rx.recv().await.expect("shutdown must emit a SaveRecord");
+        assert_eq!(rec.name, "Diego");
+        assert_eq!(rec.position, ack.snapshot.position);
+        assert_eq!(rec.outfit, wizard_outfit());
+
+        // The actor has stopped: the save channel is closed (no more records)
+        // and further logins fail because the command channel is gone.
+        assert!(save_rx.recv().await.is_none(), "save channel must close after shutdown");
+        let (tx_b, _rx_b) = push_channel();
+        assert!(
+            world.login("B".into(), default_initial(knight()), tx_b).await.is_none(),
+            "logins must fail once the actor has shut down"
+        );
     }
 
     #[test]
@@ -3491,6 +3560,76 @@ mod tests {
     }
 
     #[test]
+    fn save_all_emits_one_record_per_player_without_removing_them() {
+        // Graceful shutdown: save_all must emit a SaveRecord for EVERY online
+        // player (carrying their live outfit/position) and leave them in the map
+        // — it persists without logging anyone out.
+        let mut g = Game::new(walk_map());
+        let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
+        g.save_tx = Some(save_tx);
+
+        let (tx_a, _rx_a) = mpsc::channel(PUSH_CAPACITY);
+        let id_a = g.next_id; g.next_id += 1;
+        let pos_a = Position::new(96, 117, 7);
+        g.players.insert(id_a, PlayerState {
+            name: "Diego".into(), position: pos_a, direction: Direction::North,
+            outfit: wizard_outfit(), push_tx: tx_a, known: HashSet::new(),
+            health: 90, max_health: 150, fist_skill: 10,
+            attacking: None, last_attack_ms: 0, sex: 1, gamemaster: true,
+        });
+
+        let (tx_b, _rx_b) = mpsc::channel(PUSH_CAPACITY);
+        let id_b = g.next_id; g.next_id += 1;
+        let pos_b = Position::new(100, 120, 7);
+        g.players.insert(id_b, PlayerState {
+            name: "Grissda".into(), position: pos_b, direction: Direction::South,
+            outfit: knight(), push_tx: tx_b, known: HashSet::new(),
+            health: 145, max_health: 145, fist_skill: 10,
+            attacking: None, last_attack_ms: 0, sex: 0, gamemaster: false,
+        });
+
+        g.save_all();
+
+        // Both players must still be in the world (save_all does not log out).
+        assert_eq!(g.players.len(), 2, "save_all must not remove players");
+        assert!(g.players.contains_key(&id_a) && g.players.contains_key(&id_b));
+
+        // Exactly two records, one per player, carrying live state.
+        let mut recs = Vec::new();
+        while let Ok(rec) = save_rx.try_recv() { recs.push(rec); }
+        assert_eq!(recs.len(), 2, "save_all must emit one record per online player");
+
+        let diego = recs.iter().find(|r| r.name == "Diego").expect("Diego record");
+        assert_eq!(diego.position, pos_a);
+        assert_eq!(diego.direction, Direction::North);
+        assert_eq!(diego.outfit, wizard_outfit());
+        assert_eq!(diego.health, 90);
+
+        let grissda = recs.iter().find(|r| r.name == "Grissda").expect("Grissda record");
+        assert_eq!(grissda.position, pos_b);
+        assert_eq!(grissda.outfit, knight());
+        assert_eq!(grissda.health, 145);
+    }
+
+    #[test]
+    fn save_all_with_no_save_tx_is_a_noop() {
+        // With no save channel wired, save_all must not panic (and there is
+        // nowhere for records to go).
+        let mut g = Game::new(walk_map());
+        let (tx, _rx) = mpsc::channel(PUSH_CAPACITY);
+        let id = g.next_id; g.next_id += 1;
+        g.players.insert(id, PlayerState {
+            name: "Lonely".into(), position: Position::new(96, 117, 7),
+            direction: Direction::West, outfit: knight(), push_tx: tx,
+            known: HashSet::new(), health: 100, max_health: 100, fist_skill: 10,
+            attacking: None, last_attack_ms: 0, sex: 1, gamemaster: false,
+        });
+
+        g.save_all(); // must not panic
+        assert_eq!(g.players.len(), 1, "players are untouched when there is no save_tx");
+    }
+
+    #[test]
     fn push_to_dead_channel_reap_also_emits_save_record() {
         // RED: The internal dead-session reap path (push() -> logout()) also emits
         // a SaveRecord when save_tx is set.
@@ -4017,6 +4156,49 @@ mod tests {
     /// Helper: assert a packet list contains at least one packet whose first byte is `op`.
     fn has_op(packets: &[Vec<u8>], op: u8) -> bool {
         packets.iter().any(|p| p.first() == Some(&op))
+    }
+
+    /// Count how many dynamic tiles currently hold an item with server id `sid`,
+    /// summed across every overlay stack (catches duplication into multiple tiles).
+    fn count_sid_in_overlays(g: &Game, sid: u16) -> usize {
+        g.dynamic.values()
+            .map(|st| st.server_ids.iter().filter(|&&s| s == sid).count())
+            .sum()
+    }
+
+    #[test]
+    fn do_move_thing_multi_hop_never_duplicates_including_on_tile() {
+        // Reproduction for the reported "moving an item duplicates it at every
+        // tile" bug. Drag the stone (sid 200, non-stackable, moveable) across a
+        // chain of tiles — including a hop where the destination is the player's
+        // OWN tile (creature present), which is the on-tile case the existing
+        // tests deliberately avoid. After every hop exactly ONE stone must exist.
+        let mut g = Game::new(move_map());
+        // Player stands on (102,100,7) the whole time; it can reach 101/102/103.
+        let (player, mut rx) = add_player(&mut g, Position::new(102, 100, 7));
+        drain(&mut rx);
+
+        // Hop 1: 101 -> 102 (onto the player's tile). Stone on 101 is at item
+        // index 1 (ground at 0), no creature on 101 -> wire stackpos 1.
+        g.do_move_thing(player, Position::new(101, 100, 7), 1, Position::new(102, 100, 7), 1);
+        assert_eq!(count_sid_in_overlays(&g, 200), 1,
+            "after hop 1 exactly one stone must exist; overlays: {:?}",
+            g.dynamic.iter().map(|(k, v)| (*k, v.server_ids.clone())).collect::<Vec<_>>());
+
+        // Hop 2: 102 -> 103. The stone is now a DOWN item on the player's tile:
+        // pre_creature_len=1 (ground), 1 creature, stone at down-index 0
+        // -> wire stackpos = 1 + 1 = 2.
+        g.do_move_thing(player, Position::new(102, 100, 7), 2, Position::new(103, 100, 7), 1);
+        assert_eq!(count_sid_in_overlays(&g, 200), 1,
+            "after hop 2 exactly one stone must exist; overlays: {:?}",
+            g.dynamic.iter().map(|(k, v)| (*k, v.server_ids.clone())).collect::<Vec<_>>());
+
+        // Hop 3: 103 -> 101. Stone on 103 sits above the deco (down-index 1):
+        // pre_creature_len=1, no creature on 103 -> wire stackpos 1.
+        g.do_move_thing(player, Position::new(103, 100, 7), 1, Position::new(101, 100, 7), 1);
+        assert_eq!(count_sid_in_overlays(&g, 200), 1,
+            "after hop 3 exactly one stone must exist; overlays: {:?}",
+            g.dynamic.iter().map(|(k, v)| (*k, v.server_ids.clone())).collect::<Vec<_>>());
     }
 
     #[test]

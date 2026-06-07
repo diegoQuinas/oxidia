@@ -37,8 +37,9 @@ performance-critical or stable stays native Rust.
 | M6.2 | Ladders & holes (use-driven) — **deferred to M11**: the behavior is script-driven (`teleport.lua` `onUse`), not data; ladders/grates carry no `items.xml` attribute. Belongs on the Lua runtime, not hardcoded in Rust. Research: `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⏸️ → M11 |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ✅ done |
 | M7.1 | Combat polish: death→logout flow (relog at temple, save-on-death), protection-zone client badge (ICON_PIGEON), blood-hit effect fix | ✅ done |
-| M7.2 | Combat polish 2 — **stop-attack bug + miss/blocked hit effects**: (a) handle `0xBE` cancelMove → `playerCancelAttackAndFollow` (clear `attacking` + follow + stop walk). ESC clears the client's red attack square *locally* and sends `0xBE`; the server never handled it (drained as an unknown opcode), so the combat tick kept swinging with no visible target. (b) TFS-faithful hit-feedback effects: `CONST_ME_POFF` (3) on a full miss (`BLOCK_DEFENSE` / 0-damage roll), `CONST_ME_BLOCKHIT` (10) on armor-absorbed hits (`BLOCK_ARMOR`), `CONST_ME_DRAWBLOOD` (1) only on real damage — today DRAWBLOOD fires even on a 0 roll. Cancel-bug + miss-puff are shippable now; the armor branch depends on M10.2 (real armor values). Research: TFS `protocolgame.cpp` `parseCancelMove`, `game.cpp` `Game::playerCancelAttackAndFollow`/`Game::combatBlockHit` | ⬜ |
+| M7.2 | Combat polish 2 — **stop-attack bug + miss/blocked hit effects**: (a) ✅ **accepted live** — handle inbound `0xBE` cancelMove → clear the fight. ESC clears the client's red attack square *locally* and sends `0xBE`; the server never handled it (drained as an unknown opcode), so the combat tick kept swinging with no visible target. Fix: `reader_loop` 0xBE arm → `set_target(id, 0)` (faithful subset of TFS `playerCancelAttackAndFollow`; no follow/auto-walk yet). `0xBE` is direction-overloaded — outbound it is the floor-change-up slice, so the inbound handler is namespaced by direction. (b) ⬜ TFS-faithful hit-feedback effects: `CONST_ME_POFF` (3) on a full miss (`BLOCK_DEFENSE` / 0-damage roll), `CONST_ME_BLOCKHIT` (10) on armor-absorbed hits (`BLOCK_ARMOR`), `CONST_ME_DRAWBLOOD` (1) only on real damage — today DRAWBLOOD fires even on a 0 roll. Miss-puff shippable now; armor branch depends on M10.2 (real armor values). Research: TFS `protocolgame.cpp` `parseCancelMove`, `game.cpp` `Game::playerCancelAttackAndFollow`/`Game::combatBlockHit` | 🔄 |
 | M8 | Persistence + accounts: per-account characters, saved position/stats/outfit (load on login, save on logout via unbounded save channel); outfit change + persist (`0xD2` request → `0xC8` window, `0xD3` set → apply + `0x8E` broadcast); login never stacks on an occupied tile (`free_spawn_near`) | ✅ done |
+| M8.0a | Graceful shutdown save (persistence robustness) — ✅ **accepted live**: before M8.0a, saves fired only on clean logout/death, so killing the server with players still online reverted them to their last clean save (default outfit + temple spawn) on next login. Fix: `Command::Shutdown` → `Game::save_all` emits a `SaveRecord` per online player (no logout/broadcast); `WorldHandle::shutdown_and_save` acks once records are queued; the actor then drops `save_tx`, closing the FIFO save channel so the DB drain task flushes before exit. `main` traps Ctrl+C **and** SIGTERM (`shutdown_signal`). No periodic autosave yet (optional next step) | ✅ done |
 | M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⏸️ deferred (non-priority) |
 | **B** | **Items & Inventory** | |
 | M9 | Ground items, stacks, look-at: examine (`0x8C`/`0x8D`) with TFS-faithful item text (name/article/plural/description/weight) + real OTBM stack counts + creature look; GM debug (item id + position). Static item rendering already shipped in M4/M6.1 | ✅ done |
@@ -280,16 +281,20 @@ PZ dove badge (clears on leaving); hits draw a visible blood animation.
 
 Two combat-feedback gaps found in live testing.
 
-**1. ESC does not stop the attack (server keeps swinging).** Alt-click a player,
-then press ESC: the red attack square disappears but damage keeps landing. The
-square is cleared *client-side* — the client sends `0xBE` (clientStop), which TFS
-maps to `parseCancelMove` → `Game::playerCancelAttackAndFollow` (clears the
-attacked creature, clears follow, `stopWalk`). Our `reader_loop`
-(`server::game_service`) has **no `0xBE` arm**, so the packet falls through to the
-opcode drain (`None => continue`) and `attacking` is never reset — the global
-combat tick keeps calling `apply_damage`. Fix: add a `0xBE` arm that calls
+**1. ESC does not stop the attack (server keeps swinging). ✅ DONE — accepted
+live.** Alt-click a player, then press ESC: the red attack square disappears but
+damage keeps landing. The square is cleared *client-side* — the client sends
+`0xBE` (clientStop), which TFS maps to `parseCancelMove` →
+`Game::playerCancelAttackAndFollow` (clears the attacked creature, clears follow,
+`stopWalk`). Our `reader_loop` (`server::game_service`) had **no `0xBE` arm**, so
+the packet fell through to the opcode drain (`None => continue`) and `attacking`
+was never reset — the global combat tick kept calling `apply_damage`. Fix:
+`combat_packets::OP_CANCEL_MOVE` (`0xBE`) + a `reader_loop` arm calling
 `world.set_target(id, 0)` (`do_set_target` already clears the fight on target 0).
-Follow/auto-walk are no-ops today, so clearing the attack alone is faithful enough.
+Follow/auto-walk are no-ops today, so clearing the attack alone is faithful. Note:
+`0xBE` is direction-overloaded — outbound it is `walk::OP_FLOOR_CHANGE_UP`; the
+reader only matches inbound opcodes, so there is no conflict. Tests:
+`cancel_move_opcode_constant`, `cancel_opcode_is_dispatched_without_error`.
 
 **2. Miss vs armor-blocked hits use the wrong effect.** In classic Tibia the
 on-hit animation depends on how the hit was stopped; TFS selects it by block

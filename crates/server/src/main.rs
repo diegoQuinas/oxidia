@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     // logout and persists them. Fields the world doesn't track (mana, level)
     // default to 0/0/1 — real progression lands in a later milestone.
     let save_store = Arc::clone(&store);
-    tokio::spawn(async move {
+    let save_task = tokio::spawn(async move {
         while let Some(rec) = save_rx.recv().await {
             let save = game_service::save_record_to_player_save(&rec);
             let _ = save_store.save_player(&save).await;
@@ -143,13 +143,51 @@ async fn main() -> Result<()> {
     ));
     let game = tokio::spawn(net::serve_with(net::Protocol::Game, game_addr, game_handler));
 
-    // If either listener exits (bind error), bring the whole process down.
+    // Run until a listener exits (bind error) or a shutdown signal arrives. On
+    // Ctrl+C / SIGTERM we persist every online player BEFORE exiting — otherwise
+    // sessions that never logged out cleanly revert to their last clean save
+    // (default outfit + temple spawn) on the next login.
     tokio::select! {
-        res = login => res.context("login listener task panicked")?.context("login listener failed")?,
-        res = game => res.context("game listener task panicked")?.context("game listener failed")?,
+        res = login => { res.context("login listener task panicked")?.context("login listener failed")?; }
+        res = game => { res.context("game listener task panicked")?.context("game listener failed")?; }
+        _ = shutdown_signal() => {
+            info!("shutdown signal received — saving online players");
+            world_handle.shutdown_and_save().await;
+            // The actor has dropped its save_tx; drain the remaining records to
+            // the DB before the process exits.
+            let _ = save_task.await;
+            info!("graceful shutdown complete — all online players saved");
+        }
     }
 
     Ok(())
+}
+
+/// Resolve when the process receives an interrupt (Ctrl+C) or, on Unix, a
+/// SIGTERM (e.g. `systemctl stop` / container stop). Either triggers the
+/// graceful save-and-exit path.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 /// Resolve a [`EnvFilter`] from a config string, falling back to a safe

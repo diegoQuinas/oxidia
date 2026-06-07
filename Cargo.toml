@@ -17,7 +17,7 @@ world = { path = "crates/world" }
 persistence = { path = "crates/persistence" }
 
 # External
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"

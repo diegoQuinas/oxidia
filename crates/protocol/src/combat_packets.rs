@@ -372,6 +372,13 @@ mod tests {
         assert_eq!(OP_FOLLOW, 0xA2);
     }
 
+    #[test]
+    fn cancel_move_opcode_constant() {
+        // Inbound cancel (ESC). Shares the byte with the OUTBOUND floor-change-up
+        // slice (walk::OP_FLOOR_CHANGE_UP); direction disambiguates.
+        assert_eq!(OP_CANCEL_MOVE, 0xBE);
+    }
+
     // -------------------------------------------------------------------------
     // damage_text (0xB4) — floating damage number encoder
     // -------------------------------------------------------------------------

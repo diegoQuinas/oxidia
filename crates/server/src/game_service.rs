@@ -688,6 +688,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_opcode_is_dispatched_without_error() {
+        // 0xBE (ESC / "Stop" — parseCancelMove) must be intercepted and routed to
+        // set_target(0), not fall through to the opcode drain. We confirm the
+        // reader loop consumes it without hanging or being misread as a walk; the
+        // fight-clearing semantics of set_target(0) are covered in world unit tests.
+        let world = test_world();
+        let keys = xtea::expand_key(&[1u32, 2, 3, 4]);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (mut rd, _wr) = tokio::io::split(server);
+
+        // 0xBE is body-less.
+        let mut pkt = protocol::message::MessageWriter::new();
+        pkt.write_u8(protocol::combat_packets::OP_CANCEL_MOVE);
+        let body = xtea::encrypt_message(&pkt.into_bytes(), &keys);
+        let inner = frame::checksummed(&body);
+        net::frame::write_frame(&mut client, &inner).await.unwrap();
+
+        drop(client);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader_loop(&mut rd, &keys, &world, 1),
+        )
+        .await;
+        assert!(res.is_ok(), "reader_loop must not hang on 0xBE");
+        res.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn logout_opcode_ends_reader_loop_without_eof() {
         // A client "safe logout" (window dialog or Ctrl+L safeLogout) sends the
         // 0x14 logout opcode and then WAITS for the server to close the socket —
