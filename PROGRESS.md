@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) code-complete; underground floor-change desync fixes (teleport sloped stairs/ladders + boundary mover re-add) landed and **live-accepted**. **M7 ✅ combat core + PvP melee** and **M7.1 ✅ combat polish** (death→logout, PZ badge, blood) — both **accepted live**. **M8 ✅ persistence + accounts + outfit change/persist, accepted live** (load on login, save on logout; login never stacks on an occupied tile). M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
+- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) ✅ **accepted live** — underground floor-change desync fixes (teleport sloped stairs/ladders + boundary mover re-add) landed and validated. **M7 ✅ combat core + PvP melee** and **M7.1 ✅ combat polish** (death→logout, PZ badge, blood) — both **accepted live**. **M8 ✅ persistence + accounts + outfit change/persist, accepted live** (load on login, save on logout; login never stacks on an occupied tile). M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
 - **Build:** `cargo build` clean, `cargo test` green (workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -33,12 +33,12 @@ performance-critical or stable stays native Rust.
 | M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | ✅ done |
 | M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ✅ done |
 | M6 | Chat: say / whisper / yell + default channel | ✅ done |
-| M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ✅ code / live pending |
+| M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ✅ done |
 | M6.2 | Ladders & holes (use-driven) — **deferred to M11**: the behavior is script-driven (`teleport.lua` `onUse`), not data; ladders/grates carry no `items.xml` attribute. Belongs on the Lua runtime, not hardcoded in Rust. Research: `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⏸️ → M11 |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ✅ done |
 | M7.1 | Combat polish: death→logout flow (relog at temple, save-on-death), protection-zone client badge (ICON_PIGEON), blood-hit effect fix | ✅ done |
 | M8 | Persistence + accounts: per-account characters, saved position/stats/outfit (load on login, save on logout via unbounded save channel); outfit change + persist (`0xD2` request → `0xC8` window, `0xD3` set → apply + `0x8E` broadcast); login never stacks on an occupied tile (`free_spawn_near`) | ✅ done |
-| M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⬜ |
+| M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⏸️ deferred (non-priority) |
 | **B** | **Items & Inventory** | |
 | M9 | Ground items, stacks, look-at | ⬜ |
 | M10 | Inventory & equipment: move, equip, containers, use | ⬜ |
@@ -295,12 +295,12 @@ Gate: `cargo test` **129 green**, `cargo clippy --all-targets -- -D warnings` cl
 
 **Final holistic review** caught two integration gaps the per-task reviews missed (both fixed): `can_see` lacked the floor `offsetz` (cross-floor spectator desync), and the spectator broadcast lacked the 7→8 remove+add. Solo mechanics + the mover's own camera were verified TFS-faithful throughout.
 
-**Live acceptance — PENDING (manual gate):** real OTClient descends the Thais
+**Live acceptance — ✅ ACCEPTED (2026-06-07):** real OTClient descends the Thais
 temple staircase into the underground and climbs back, rendering correctly; a
-second client one floor away sees the crossing — no desync. Flip M6.1 to ✅ once
-this passes. **Known untested-in-prod:** full underground map description
-(`encode` with z>7) has no live path yet (login always spawns at z=7); it's
-unit-tested but not exercised until relog/teleport-underground exists.
+second client one floor away sees the crossing — no desync. **Known
+untested-in-prod:** full underground map description (`encode` with z>7) has no
+live path yet (login always spawns at z=7); it's unit-tested but not exercised
+until relog/teleport-underground exists.
 
 ## M6 plan
 
