@@ -61,10 +61,10 @@ embedded Lua (mlua)** for mutable content. Full plan in
 | M4 | Walk: movement, tile updates, floor changes, collision | ✅ |
 | M5 | Multiplayer presence: spectators, see others walk | ✅ |
 | M6 | Chat: say / whisper / yell + default channel | ✅ |
-| M7 | Combat core + PvP melee: damage, death, respawn, protected zones | ⬜ |
-| M8 | Persistence + accounts: per-friend characters, saved progress | ⬜ |
+| M7 | Combat core + PvP melee: damage, death, respawn, protected zones | ✅ |
+| M8 | Persistence + accounts: per-friend characters, saved progress | ✅ |
 | **Phase B — Items & Inventory** | | |
-| M9 | Ground items, stacks, look-at | ⬜ |
+| M9 | Ground items, stacks, look-at | ✅ |
 | M10 | Inventory & equipment: move, equip, containers, use | ⬜ |
 | **Phase C — Scripting** | | |
 | M11 | Lua runtime (mlua): hot-reloadable content hooks | ⬜ |
