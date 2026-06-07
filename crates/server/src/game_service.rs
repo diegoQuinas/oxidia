@@ -262,7 +262,7 @@ where
     let mut initial = initial;
     // "God Diego" is always a gamemaster, regardless of the login packet flag.
     // Hardcoded by name (no DB schema for access levels yet — see the GM design spec).
-    initial.gamemaster = req.gamemaster || name.eq_ignore_ascii_case("diego");
+    initial.gamemaster = req.gamemaster || name.eq_ignore_ascii_case("God Diego");
     if initial.gamemaster {
         // Force the visible Gamemaster outfit (looktype 75). Colors are irrelevant
         // for this fixed-sprite outfit; only look_type matters on the wire.
