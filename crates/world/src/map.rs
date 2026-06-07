@@ -53,10 +53,25 @@ pub struct StaticMap {
 }
 
 impl StaticMap {
+    /// Build from a parsed map + item dictionary, picking the spawn from the first
+    /// town (or [`FALLBACK_SPAWN`]). See [`StaticMap::from_formats_with_spawn`] to
+    /// target a specific town by name.
+    pub fn from_formats(map: &OtbmMap, items: &ItemsOtb) -> Self {
+        Self::from_formats_with_spawn(map, items, None)
+    }
+
     /// Build from a parsed map + item dictionary. Each tile becomes a wire-ordered
     /// stack: ground (`items[0]`), then always-on-top items sorted by `top_order`,
     /// then the remaining "down" items, capped at 10 things (TFS stackpos cap).
-    pub fn from_formats(map: &OtbmMap, items: &ItemsOtb) -> Self {
+    ///
+    /// `spawn_town` names the town whose temple becomes the spawn point. When it is
+    /// `None`, unknown, or the map has no towns, the spawn falls back to the first
+    /// town and finally to [`FALLBACK_SPAWN`].
+    pub fn from_formats_with_spawn(
+        map: &OtbmMap,
+        items: &ItemsOtb,
+        spawn_town: Option<&str>,
+    ) -> Self {
         let by_id: HashMap<u16, &formats::otb::ItemType> =
             items.items.iter().map(|it| (it.server_id, it)).collect();
 
@@ -119,9 +134,15 @@ impl StaticMap {
             }
         }
 
-        let spawn = map
-            .towns
-            .first()
+        let named = spawn_town.and_then(|name| {
+            let found = map.towns.iter().find(|t| t.name == name);
+            if found.is_none() {
+                tracing::warn!(town = name, "spawn_town not found in map; using first town");
+            }
+            found
+        });
+        let spawn = named
+            .or_else(|| map.towns.first())
             .map(|t| Position::new(t.x, t.y, t.z))
             .unwrap_or(FALLBACK_SPAWN);
 
@@ -299,6 +320,27 @@ mod tests {
         assert_eq!(cids(sm.tile(95, 117, 7).unwrap().pre_creature), vec![4526]);
         assert!(sm.tile(0, 0, 7).is_none());
         assert!(sm.tile(-1, 0, 7).is_none());
+    }
+
+    #[test]
+    fn spawn_town_selects_named_temple_with_fallback() {
+        let (mut map, items) = tiny_map();
+        map.towns = vec![
+            Town { id: 1, name: "Venore".into(), x: 95, y: 117, z: 7 },
+            Town { id: 5, name: "Ab'Dendriel".into(), x: 200, y: 300, z: 7 },
+        ];
+
+        // Named town wins over the first town.
+        let sm = StaticMap::from_formats_with_spawn(&map, &items, Some("Ab'Dendriel"));
+        assert_eq!(sm.spawn(), Position::new(200, 300, 7));
+
+        // Unknown name falls back to the first town.
+        let sm = StaticMap::from_formats_with_spawn(&map, &items, Some("Nowhere"));
+        assert_eq!(sm.spawn(), Position::new(95, 117, 7));
+
+        // No preference falls back to the first town.
+        let sm = StaticMap::from_formats_with_spawn(&map, &items, None);
+        assert_eq!(sm.spawn(), Position::new(95, 117, 7));
     }
 
     #[test]

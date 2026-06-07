@@ -4,7 +4,7 @@
 use anyhow::Result;
 use protocol::map_description::{self, Center, PlacedCreature};
 use protocol::rsa::RsaPrivateKey;
-use protocol::{creature, enter_world, frame, game_login, xtea};
+use protocol::{chat, creature, enter_world, frame, game_login, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
 use world::game::WorldHandle;
 use world::Direction;
@@ -179,6 +179,8 @@ where
 const PING_OPCODE: u8 = 0x1D;
 /// Game opcode `0x14` — client logout request (Ctrl+L / window-close "Logout").
 const OPCODE_CLIENT_LOGOUT: u8 = 0x14;
+/// Game opcode `0x96` — client "say" (say/whisper/yell + channel/private).
+const OPCODE_CLIENT_SAY: u8 = 0x96;
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Map an incoming opcode to a (direction, is_turn) action, or `None` to drain.
@@ -234,6 +236,15 @@ where
             // and keep the session open.
             if opcode == OPCODE_CLIENT_LOGOUT {
                 break;
+            }
+            if opcode == OPCODE_CLIENT_SAY {
+                // 0x96 carries a body: [type u8][message str]. parse_say returns
+                // None for unsupported types (private/channel), empty, or malformed
+                // bodies — those are dropped.
+                if let Some((speak_type, text)) = chat::parse_say(&payload[1..]) {
+                    world.say(id, speak_type, text).await;
+                }
+                continue;
             }
             let Some((direction, is_turn)) = opcode_action(opcode) else { continue };
             if is_turn {
@@ -419,6 +430,20 @@ mod tests {
         let move_raw = net::frame::read_frame(&mut client).await.unwrap().unwrap();
         let move_pkt = xtea::decrypt_message(frame::verify(&move_raw).unwrap(), &keys).unwrap();
         assert_eq!(move_pkt[0], walk::OP_CREATURE_MOVE);
+
+        // Send a say (0x96) "hi" and expect a 0xAA creature-say back (a lone
+        // player hears their own speech — do_say pushes to the speaker too).
+        let mut say_pkt = protocol::message::MessageWriter::new();
+        say_pkt.write_u8(0x96);
+        say_pkt.write_u8(1); // TALKTYPE_SAY
+        say_pkt.write_string(b"hi");
+        let body = xtea::encrypt_message(&say_pkt.into_bytes(), &keys);
+        let inner = frame::checksummed(&body);
+        net::frame::write_frame(&mut client, &inner).await.unwrap();
+
+        let say_raw = net::frame::read_frame(&mut client).await.unwrap().unwrap();
+        let say_back = xtea::decrypt_message(frame::verify(&say_raw).unwrap(), &keys).unwrap();
+        assert_eq!(say_back[0], protocol::chat::OP_CREATURE_SAY);
 
         // Closing the client makes `reader_loop` see EOF and return; without this
         // the handler would hold the session open (pinging) until timeout.
