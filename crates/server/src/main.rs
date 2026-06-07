@@ -65,8 +65,13 @@ async fn main() -> Result<()> {
         std::fs::read("reference/tfs/data/items/items.otb").context("reading items.otb")?;
     let map_bytes =
         std::fs::read("reference/tfs/data/world/forgotten.otbm").context("reading forgotten.otbm")?;
-    let items = formats::otb::parse(&items_bytes).context("parsing items.otb")?;
+    let mut items = formats::otb::parse(&items_bytes).context("parsing items.otb")?;
     let map = formats::otbm::parse(&map_bytes).context("parsing forgotten.otbm")?;
+    let items_xml_bytes = std::fs::read_to_string("reference/tfs/data/items/items.xml")
+        .context("reading items.xml")?;
+    let items_xml = formats::items_xml::parse_items_xml(&items_xml_bytes)
+        .context("parsing items.xml")?;
+    formats::items_xml::merge_items_xml(&mut items, &items_xml);
     let static_map = std::sync::Arc::new(world::map::StaticMap::from_formats(&map, &items));
     let world_handle = world::game::spawn(static_map);
     info!(spawn = ?world_handle.map.spawn(), "world loaded");
