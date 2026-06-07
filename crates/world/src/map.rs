@@ -159,7 +159,7 @@ mod tests {
             major_version: 3,
             minor_version: 57,
             build_number: 0,
-            items: vec![ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0 }],
+            items: vec![ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE }],
         };
         let map = OtbmMap {
             width: 100,
@@ -202,8 +202,8 @@ mod tests {
             minor_version: 57,
             build_number: 0,
             items: vec![
-                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0 },
-                ItemType { group: 5, flags: 0x0000_0001, server_id: 200, client_id: 1059, always_on_top: false, top_order: 0 },
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
+                ItemType { group: 5, flags: 0x0000_0001, server_id: 200, client_id: 1059, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
             ],
         };
         let map = OtbmMap {
@@ -234,10 +234,10 @@ mod tests {
             minor_version: 57,
             build_number: 0,
             items: vec![
-                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0 },
-                ItemType { group: 5, flags: 1 << 13, server_id: 200, client_id: 1000, always_on_top: true, top_order: 2 },
-                ItemType { group: 5, flags: 1 << 13, server_id: 201, client_id: 1001, always_on_top: true, top_order: 1 },
-                ItemType { group: 5, flags: 0, server_id: 300, client_id: 2000, always_on_top: false, top_order: 0 },
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
+                ItemType { group: 5, flags: 1 << 13, server_id: 200, client_id: 1000, always_on_top: true, top_order: 2, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
+                ItemType { group: 5, flags: 1 << 13, server_id: 201, client_id: 1001, always_on_top: true, top_order: 1, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
+                ItemType { group: 5, flags: 0, server_id: 300, client_id: 2000, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
             ],
         };
         let map = OtbmMap {
@@ -268,12 +268,14 @@ mod tests {
         use protocol::map_description::TileSource;
         let mut item_defs = vec![ItemType {
             group: 1, flags: 0, server_id: 1, client_id: 5000, always_on_top: false, top_order: 0,
+            has_height: false, floor_change: formats::items_xml::FloorChange::NONE,
         }];
         let mut tile_items = vec![MapItem { id: 1, contents: vec![] }];
         for sid in 2..=12u16 {
             item_defs.push(ItemType {
                 group: 5, flags: 0, server_id: sid, client_id: 6000 + sid,
                 always_on_top: false, top_order: 0,
+                has_height: false, floor_change: formats::items_xml::FloorChange::NONE,
             });
             tile_items.push(MapItem { id: sid, contents: vec![] });
         }
@@ -299,12 +301,14 @@ mod tests {
         use protocol::map_description::TileSource;
         let mut item_defs = vec![ItemType {
             group: 1, flags: 0, server_id: 1, client_id: 5000, always_on_top: false, top_order: 0,
+            has_height: false, floor_change: formats::items_xml::FloorChange::NONE,
         }];
         let mut tile_items = vec![MapItem { id: 1, contents: vec![] }];
         for sid in 2..=12u16 {
             item_defs.push(ItemType {
                 group: 5, flags: 1 << 13, server_id: sid, client_id: 6000 + sid,
                 always_on_top: true, top_order: 0,
+                has_height: false, floor_change: formats::items_xml::FloorChange::NONE,
             });
             tile_items.push(MapItem { id: sid, contents: vec![] });
         }

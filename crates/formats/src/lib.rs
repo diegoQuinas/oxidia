@@ -9,6 +9,7 @@
 //!
 //! M2 fills in the actual parsers.
 
+pub mod items_xml;
 pub mod node;
 pub mod otb;
 pub mod otbm;

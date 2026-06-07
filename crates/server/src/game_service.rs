@@ -319,7 +319,7 @@ mod tests {
             major_version: 3,
             minor_version: 57,
             build_number: 0,
-            items: vec![ItemType { group: 0, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0 }],
+            items: vec![ItemType { group: 0, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE }],
         };
         let map = OtbmMap {
             width: 200,

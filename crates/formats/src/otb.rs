@@ -22,6 +22,9 @@ const ITEM_ATTR_TOP_ORDER: u8 = 0x2B;
 
 /// `FLAG_ALWAYSONTOP` bit of the per-item flags word (`itemflags_t`).
 const FLAG_ALWAYS_ON_TOP: u32 = 1 << 13;
+/// `FLAG_HAS_HEIGHT` (bit 3) — the item raises the tile; 3 stacked trigger a
+/// height-based floor change (TFS `itemloader.h:146`, `tile.cpp` `hasHeight`).
+const FLAG_HAS_HEIGHT: u32 = 1 << 3;
 /// `FLAG_STACKABLE` — the wire carries a u8 count after the item's mark byte.
 const FLAG_STACKABLE: u32 = 1 << 7;
 /// `FLAG_ANIMATION` — the wire carries a u8 animation-phase byte after the item.
@@ -61,6 +64,10 @@ pub struct ItemType {
     pub always_on_top: bool,
     /// `ITEM_ATTR_TOPORDER` — draw order among always-on-top items (0 if absent).
     pub top_order: u8,
+    /// `FLAG_HAS_HEIGHT` — contributes 1 to the tile's cumulative height.
+    pub has_height: bool,
+    /// `floorChange` directions from `items.xml` (empty until merged).
+    pub floor_change: crate::items_xml::FloorChange,
 }
 
 impl ItemType {
@@ -137,12 +144,15 @@ fn parse_item(node: &Node) -> Result<ItemType, FormatError> {
         client_id,
         always_on_top: flags & FLAG_ALWAYS_ON_TOP != 0,
         top_order,
+        has_height: flags & FLAG_HAS_HEIGHT != 0,
+        floor_change: crate::items_xml::FloorChange::NONE,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::items_xml::FloorChange;
 
     /// Build a minimal but well-formed `items.otb` with one ground item.
     fn synthetic_otb() -> Vec<u8> {
@@ -248,7 +258,33 @@ mod tests {
                 client_id: 4526,
                 always_on_top: false,
                 top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
             }
         );
+    }
+
+    #[test]
+    fn extracts_has_height_flag() {
+        let mut v = vec![0x00, 0x00, 0x00, 0x00];
+        v.push(0xFE);
+        v.push(0x00);
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.push(ROOT_ATTR_VERSION);
+        v.extend_from_slice(&140u16.to_le_bytes());
+        v.extend_from_slice(&3u32.to_le_bytes());
+        v.extend_from_slice(&57u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&[0u8; 128]);
+        v.push(0xFE);
+        v.push(0x05);
+        v.extend_from_slice(&(1u32 << 3).to_le_bytes()); // FLAG_HAS_HEIGHT
+        v.push(ITEM_ATTR_SERVER_ID);
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&500u16.to_le_bytes());
+        v.push(0xFF);
+        v.push(0xFF);
+        let otb = parse(&v).unwrap();
+        assert!(otb.items[0].has_height, "FLAG_HAS_HEIGHT set");
     }
 }
