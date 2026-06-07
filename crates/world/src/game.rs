@@ -226,8 +226,8 @@ impl Game {
     }
 
     fn do_move(&mut self, id: u32, direction: Direction) {
-        let from = match self.players.get(&id) {
-            Some(p) => p.position,
+        let (from, cur_dir) = match self.players.get(&id) {
+            Some(p) => (p.position, p.direction),
             None => return,
         };
         let (dx, dy) = direction.delta();
@@ -235,15 +235,16 @@ impl Game {
             .offset(dx, dy)
             .filter(|&d| self.map.is_walkable(d) && !self.tile_occupied(d, id));
 
-        // Always update facing.
-        if let Some(p) = self.players.get_mut(&id) { p.direction = direction; }
-
         let Some(to) = dest else {
-            // Blocked: snap the mover back; spectators see nothing.
-            self.push(id, walk::cancel_walk(direction.to_byte()));
+            // Blocked: keep the original facing and snap the mover back;
+            // spectators see nothing. Matches TFS: a failed walk never turns the
+            // player (only Ctrl+arrows / 0x6F-0x72 do). cancel_walk carries the
+            // unchanged direction so the client also keeps facing where it was.
+            self.push(id, walk::cancel_walk(cur_dir.to_byte()));
             return;
         };
-        if let Some(p) = self.players.get_mut(&id) { p.position = to; }
+        // Successful move: now commit the new facing and position.
+        if let Some(p) = self.players.get_mut(&id) { p.direction = direction; p.position = to; }
 
         // Spectators that can see either endpoint.
         let mut seen: HashSet<u32> = HashSet::new();
