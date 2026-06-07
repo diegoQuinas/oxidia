@@ -331,9 +331,15 @@ impl Game {
     fn login(&mut self, name: String, initial: InitialState, push_tx: mpsc::Sender<Vec<u8>>) -> LoginAck {
         let id = self.next_id;
         self.next_id += 1;
-        // Resolve position: use the saved value if provided, otherwise find a
-        // free tile at/near the map spawn.
-        let position = initial.position.unwrap_or_else(|| self.free_spawn());
+        // Resolve position. Either way the tile must be free: you never log in on
+        // top of another creature (unlike stair/height co-occupancy during
+        // movement). A returning player lands on their saved tile when it's free,
+        // otherwise the nearest free tile around it; a new player spawns at/near
+        // the map spawn.
+        let position = match initial.position {
+            Some(saved) => self.free_spawn_near(saved, id),
+            None => self.free_spawn(),
+        };
         let direction = initial.direction;
         let outfit = initial.outfit;
 
@@ -1636,6 +1642,31 @@ mod tests {
             ack_b.snapshot.position,
             "co-logins must not share a tile"
         );
+    }
+
+    #[test]
+    fn login_on_occupied_saved_position_gets_free_adjacent_tile() {
+        // A returning player carries a saved position. If someone is already
+        // standing on that tile, login must bump them to a free adjacent tile —
+        // you never log in on top of another creature. (Stair/height co-occupancy
+        // is allowed during movement, but NOT on login.)
+        let mut g = Game::new(walk_map());
+        let saved = Position::new(95, 117, 7);
+        let (_occupant, _ro) = add_player(&mut g, saved); // someone is already there
+        let (tx, _rx) = mpsc::channel(PUSH_CAPACITY);
+        let initial = InitialState {
+            position: Some(saved),
+            direction: Direction::South,
+            outfit: knight(),
+            health: 150,
+            max_health: 150,
+        };
+        let ack = g.login("Returning".into(), initial, tx);
+        let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
+        assert_ne!(ps.position, saved, "must not log in on top of the occupant");
+        assert!(g.map.is_walkable(ps.position), "bumped tile must be walkable");
+        let sharing = g.players.values().filter(|p| p.position == ps.position).count();
+        assert_eq!(sharing, 1, "bumped tile must hold only the returning player");
     }
 
     #[test]
