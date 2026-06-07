@@ -54,6 +54,12 @@ pub struct PlayerSnapshot {
     pub id: u32,
     pub position: Position,
     pub direction: Direction,
+    /// The outfit the player logged in with (restored or default).
+    pub outfit: Outfit,
+    /// Current hit points at login (restored or default 150).
+    pub health: u16,
+    /// Maximum hit points at login (restored or default 150).
+    pub max_health: u16,
 }
 
 /// Login result: the new player's snapshot plus the already-in-range players,
@@ -61,6 +67,35 @@ pub struct PlayerSnapshot {
 pub struct LoginAck {
     pub snapshot: PlayerSnapshot,
     pub others: Vec<PlacedCreature>,
+}
+
+/// Initial state supplied to `Game::login`. When a `PlayerSave` exists for the
+/// character, the server layer maps it into this struct; otherwise it provides
+/// defaults (position `None` → `free_spawn()`, default outfit/health).
+pub struct InitialState {
+    /// Saved position, or `None` to fall back to `free_spawn()`.
+    pub position: Option<Position>,
+    /// Facing direction at login.
+    pub direction: Direction,
+    /// Visual outfit at login.
+    pub outfit: Outfit,
+    /// Current hit points.
+    pub health: u16,
+    /// Maximum hit points.
+    pub max_health: u16,
+}
+
+/// Emitted on the save channel the instant a player leaves the game.
+/// The server worker maps this into `persistence::PlayerSave` and awaits
+/// `store.save_player`. The world crate does NOT depend on `persistence`.
+#[derive(Debug, Clone)]
+pub struct SaveRecord {
+    pub name: String,
+    pub position: Position,
+    pub direction: Direction,
+    pub outfit: Outfit,
+    pub health: u16,
+    pub max_health: u16,
 }
 
 struct PlayerState {
@@ -93,6 +128,9 @@ struct Game {
     /// RNG for combat damage rolls. A single actor-owned RNG keeps the loop
     /// lock-free (no shared state) and is seedable in tests for determinism.
     rng: StdRng,
+    /// Channel to the background save worker. `None` in unit tests and until
+    /// `spawn()` wires it in. Unbounded so `logout` never blocks the actor.
+    save_tx: Option<mpsc::UnboundedSender<SaveRecord>>,
 }
 
 impl Game {
@@ -103,6 +141,7 @@ impl Game {
             next_id: 0x1000_0000,
             next_statement_id: 1,
             rng: StdRng::from_entropy(),
+            save_tx: None,
         }
     }
 
@@ -116,6 +155,7 @@ impl Game {
             next_id: 0x1000_0000,
             next_statement_id: 1,
             rng: StdRng::seed_from_u64(seed),
+            save_tx: None,
         }
     }
 
@@ -226,8 +266,8 @@ impl Game {
 
     fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Login { name, outfit, push_tx, reply } => {
-                let ack = self.login(name, outfit, push_tx);
+            Command::Login { name, initial, push_tx, reply } => {
+                let ack = self.login(name, initial, push_tx);
                 let _ = reply.send(ack);
             }
             Command::Logout { id } => self.logout(id),
@@ -285,18 +325,21 @@ impl Game {
         origin
     }
 
-    fn login(&mut self, name: String, outfit: Outfit, push_tx: mpsc::Sender<Vec<u8>>) -> LoginAck {
+    fn login(&mut self, name: String, initial: InitialState, push_tx: mpsc::Sender<Vec<u8>>) -> LoginAck {
         let id = self.next_id;
         self.next_id += 1;
-        let position = self.free_spawn();
-        let direction = Direction::South;
+        // Resolve position: use the saved value if provided, otherwise find a
+        // free tile at/near the map spawn.
+        let position = initial.position.unwrap_or_else(|| self.free_spawn());
+        let direction = initial.direction;
+        let outfit = initial.outfit;
 
         // Existing in-range players, before inserting self.
         let others_ids = self.spectators(position, id);
 
         self.players.insert(id, PlayerState {
             name, position, direction, outfit, push_tx, known: HashSet::new(),
-            health: 150, max_health: 150, fist_skill: 10,
+            health: initial.health, max_health: initial.max_health, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
         });
 
@@ -321,11 +364,32 @@ impl Game {
             }
         }
 
-        LoginAck { snapshot: PlayerSnapshot { id, position, direction }, others }
+        LoginAck {
+            snapshot: PlayerSnapshot {
+                id, position, direction, outfit,
+                health: initial.health,
+                max_health: initial.max_health,
+            },
+            others,
+        }
     }
 
     fn logout(&mut self, id: u32) {
         let Some(p) = self.players.remove(&id) else { return };
+        // Emit save record BEFORE broadcasting the removal, while `p` is owned.
+        if let Some(tx) = &self.save_tx {
+            let rec = SaveRecord {
+                name: p.name.clone(),
+                position: p.position,
+                direction: p.direction,
+                outfit: p.outfit,
+                health: p.health,
+                max_health: p.max_health,
+            };
+            // Unbounded send never blocks; error only if the worker is gone
+            // (server shutting down) — silently drop in that case.
+            let _ = tx.send(rec);
+        }
         let pos = p.position;
         for spec in self.spectators(pos, id) {
             // A teleport puff on the departing creature's tile, then the remove.
@@ -946,7 +1010,7 @@ impl Game {
 }
 
 enum Command {
-    Login { name: String, outfit: Outfit, push_tx: mpsc::Sender<Vec<u8>>, reply: oneshot::Sender<LoginAck> },
+    Login { name: String, initial: InitialState, push_tx: mpsc::Sender<Vec<u8>>, reply: oneshot::Sender<LoginAck> },
     Logout { id: u32 },
     Move { id: u32, direction: Direction },
     Turn { id: u32, direction: Direction },
@@ -966,15 +1030,16 @@ pub struct WorldHandle {
 
 impl WorldHandle {
     /// Register a player. The caller supplies the session's outbound channel and
-    /// the player's outfit. Returns the snapshot + in-range players to render.
+    /// the initial state (restored from save or defaults). Returns the snapshot
+    /// + in-range players to render.
     pub async fn login(
         &self,
         name: String,
-        outfit: Outfit,
+        initial: InitialState,
         push_tx: mpsc::Sender<Vec<u8>>,
     ) -> Option<LoginAck> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(Command::Login { name, outfit, push_tx, reply }).await.ok()?;
+        self.tx.send(Command::Login { name, initial, push_tx, reply }).await.ok()?;
         rx.await.ok()
     }
 
@@ -1011,13 +1076,18 @@ pub fn push_channel() -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
     mpsc::channel(PUSH_CAPACITY)
 }
 
-/// Spawn the world actor task and return a handle. Also spawns the single
-/// global combat-tick task that sends `Command::CombatTick` every
-/// `COMBAT_TICK_MS` milliseconds. The tick is just another command on the
-/// actor's mpsc — no locks, no per-fight timers.
-pub fn spawn(map: Arc<StaticMap>) -> WorldHandle {
+/// Spawn the world actor task and return a handle plus the save-record receiver.
+///
+/// The caller (server `main`) must drain the `UnboundedReceiver<SaveRecord>` in
+/// a background task, mapping each record to `persistence::PlayerSave` and
+/// awaiting `store.save_player`. Also spawns the single global combat-tick task
+/// that sends `Command::CombatTick` every `COMBAT_TICK_MS` milliseconds.
+pub fn spawn(map: Arc<StaticMap>) -> (WorldHandle, mpsc::UnboundedReceiver<SaveRecord>) {
     let (tx, mut rx) = mpsc::channel::<Command>(64);
     let handle = WorldHandle { tx: tx.clone(), map: Arc::clone(&map) };
+
+    // Save channel: unbounded so the actor never blocks on logout.
+    let (save_tx, save_rx) = mpsc::unbounded_channel::<SaveRecord>();
 
     // Combat tick: one global interval task sends CombatTick { now_ms } into
     // the actor. `now_ms` is measured from this spawn instant so the actor has
@@ -1039,11 +1109,12 @@ pub fn spawn(map: Arc<StaticMap>) -> WorldHandle {
 
     tokio::spawn(async move {
         let mut game = Game::new(map);
+        game.save_tx = Some(save_tx);
         while let Some(cmd) = rx.recv().await {
             game.handle(cmd);
         }
     });
-    handle
+    (handle, save_rx)
 }
 
 #[cfg(test)]
@@ -1284,6 +1355,18 @@ mod tests {
         Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
     }
 
+    /// Build a default `InitialState` for use in tests that don't care about
+    /// the restored-vs-new distinction.
+    fn default_initial(outfit: Outfit) -> InitialState {
+        InitialState {
+            position: None,
+            direction: Direction::South,
+            outfit,
+            health: 150,
+            max_health: 150,
+        }
+    }
+
     /// Insert a player at `pos` and return (id, its push receiver).
     fn add_player(g: &mut Game, pos: Position) -> (u32, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel(super::PUSH_CAPACITY);
@@ -1384,12 +1467,12 @@ mod tests {
 
     #[tokio::test]
     async fn login_pushes_appear_to_existing_spectator() {
-        let world = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map());
         let (tx_a, mut rx_a) = push_channel();
-        let ack_a = world.login("A".into(), knight(), tx_a).await.unwrap();
+        let ack_a = world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         // Second player logs in next to A; A must receive a 0x6A appear.
         let (tx_b, _rx_b) = push_channel();
-        let _ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
+        let _ack_b = world.login("B".into(), default_initial(knight()), tx_b).await.unwrap();
         let pkt = rx_a.recv().await.unwrap();
         assert_eq!(pkt[0], protocol::tile_creature::OP_ADD_TILE_CREATURE);
         // ...followed by the teleport puff, so spectators see the spawn effect too.
@@ -1400,21 +1483,21 @@ mod tests {
 
     #[tokio::test]
     async fn second_login_sees_first_in_ack_others() {
-        let world = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map());
         let (tx_a, _rx_a) = push_channel();
-        world.login("A".into(), knight(), tx_a).await.unwrap();
+        world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, _rx_b) = push_channel();
-        let ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
+        let ack_b = world.login("B".into(), default_initial(knight()), tx_b).await.unwrap();
         assert_eq!(ack_b.others.len(), 1, "B's enter-world includes A");
     }
 
     #[tokio::test]
     async fn move_pushes_creature_move_to_spectator() {
-        let world = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map());
         let (tx_a, mut rx_a) = push_channel();
-        let ack_a = world.login("A".into(), knight(), tx_a).await.unwrap();
+        let ack_a = world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, mut rx_b) = push_channel();
-        let _ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
+        let _ack_b = world.login("B".into(), default_initial(knight()), tx_b).await.unwrap();
         // Drain A's appear-of-B packet.
         let _ = rx_a.recv().await.unwrap();
         // A steps east (95,117 -> 96,117); B (a spectator that sees both
@@ -1427,11 +1510,11 @@ mod tests {
 
     #[tokio::test]
     async fn logout_pushes_remove_to_spectator() {
-        let world = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map());
         let (tx_a, mut rx_a) = push_channel();
-        world.login("A".into(), knight(), tx_a).await.unwrap();
+        world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, _rx_b) = push_channel();
-        let ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
+        let ack_b = world.login("B".into(), default_initial(knight()), tx_b).await.unwrap();
         let _ = rx_a.recv().await.unwrap(); // appear (0x6A)
         let effect = rx_a.recv().await.unwrap(); // login teleport puff (0x83)
         assert_eq!(effect[0], protocol::enter_world::OP_MAGIC_EFFECT);
@@ -1477,11 +1560,11 @@ mod tests {
 
     #[tokio::test]
     async fn second_login_on_occupied_spawn_gets_free_tile() {
-        let world = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map());
         let (tx_a, _ra) = push_channel();
-        let ack_a = world.login("A".into(), knight(), tx_a).await.unwrap();
+        let ack_a = world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, _rb) = push_channel();
-        let ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
+        let ack_b = world.login("B".into(), default_initial(knight()), tx_b).await.unwrap();
         assert_ne!(
             ack_a.snapshot.position,
             ack_b.snapshot.position,
@@ -1511,11 +1594,11 @@ mod tests {
 
     #[tokio::test]
     async fn say_broadcasts_to_spectator_and_speaker() {
-        let world = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map());
         let (tx_a, mut rx_a) = push_channel();
-        let ack_a = world.login("A".into(), knight(), tx_a).await.unwrap();
+        let ack_a = world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, mut rx_b) = push_channel();
-        world.login("B".into(), knight(), tx_b).await.unwrap();
+        world.login("B".into(), default_initial(knight()), tx_b).await.unwrap();
         // Drain A's appear-of-B (0x6A) + teleport puff (0x83) from B's login.
         let _ = rx_a.recv().await.unwrap();
         let _ = rx_a.recv().await.unwrap();
@@ -2214,5 +2297,120 @@ mod tests {
             Some(s) => s.pre_creature.iter().chain(s.post_creature).map(|w| w.client_id).collect(),
             None => Vec::new(),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // M8 persistence-wiring tests
+    // -------------------------------------------------------------------------
+
+    /// A custom outfit distinct from the default knight outfit, for restore tests.
+    fn wizard_outfit() -> Outfit {
+        Outfit { look_type: 75, head: 20, body: 30, legs: 40, feet: 50, addons: 1, mount: 0 }
+    }
+
+    #[test]
+    fn login_with_initial_position_places_player_at_that_position() {
+        // RED: Game::login accepts InitialState { position: Some(p) } and places
+        // the player at p with the given outfit and health.
+        let mut g = Game::new(walk_map());
+        let (tx, _rx) = mpsc::channel(PUSH_CAPACITY);
+        let pos = Position::new(96, 117, 7);
+        let outfit = wizard_outfit();
+        let initial = InitialState {
+            position: Some(pos),
+            direction: Direction::North,
+            outfit,
+            health: 80,
+            max_health: 120,
+        };
+        let ack = g.login("Restored".into(), initial, tx);
+        let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
+        assert_eq!(ps.position, pos, "restored player must be at saved position");
+        assert_eq!(ps.outfit, outfit, "restored player must have saved outfit");
+        assert_eq!(ps.health, 80, "restored player must have saved health");
+        assert_eq!(ps.max_health, 120, "restored player must have saved max_health");
+        assert_eq!(ps.direction, Direction::North, "restored player must face saved direction");
+        assert_eq!(ack.snapshot.outfit, outfit, "snapshot outfit must match");
+    }
+
+    #[test]
+    fn login_with_no_position_falls_back_to_free_spawn() {
+        // RED: Game::login with InitialState { position: None } resolves position
+        // from free_spawn(), using default outfit/health for a new player.
+        let mut g = Game::new(walk_map());
+        let (tx, _rx) = mpsc::channel(PUSH_CAPACITY);
+        let spawn = g.map.spawn();
+        let initial = InitialState {
+            position: None,
+            direction: Direction::South,
+            outfit: knight(),
+            health: 150,
+            max_health: 150,
+        };
+        let ack = g.login("NewPlayer".into(), initial, tx);
+        assert_eq!(
+            g.players.get(&ack.snapshot.id).unwrap().position,
+            spawn,
+            "new player with no saved position must spawn at free_spawn()"
+        );
+    }
+
+    #[test]
+    fn logout_with_save_tx_emits_save_record() {
+        // RED: Game::logout emits a SaveRecord on save_tx when one is set.
+        // The record must carry the player's current name/position/direction/outfit/health.
+        let mut g = Game::new(walk_map());
+        let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
+        g.save_tx = Some(save_tx);
+
+        let pos = Position::new(96, 117, 7);
+        let outfit = wizard_outfit();
+        let (tx, _rx) = mpsc::channel(PUSH_CAPACITY);
+        let id = g.next_id;
+        g.next_id += 1;
+        g.players.insert(id, PlayerState {
+            name: "Hero".into(), position: pos, direction: Direction::East,
+            outfit, push_tx: tx, known: HashSet::new(),
+            health: 77, max_health: 150, fist_skill: 10,
+            attacking: None, last_attack_ms: 0,
+        });
+
+        g.logout(id);
+
+        let rec = save_rx.try_recv().expect("logout must emit a SaveRecord");
+        assert_eq!(rec.name, "Hero");
+        assert_eq!(rec.position, pos);
+        assert_eq!(rec.direction, Direction::East);
+        assert_eq!(rec.outfit, outfit);
+        assert_eq!(rec.health, 77);
+        assert_eq!(rec.max_health, 150);
+    }
+
+    #[test]
+    fn push_to_dead_channel_reap_also_emits_save_record() {
+        // RED: The internal dead-session reap path (push() -> logout()) also emits
+        // a SaveRecord when save_tx is set.
+        let mut g = Game::new(walk_map());
+        let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
+        g.save_tx = Some(save_tx);
+
+        // Create a player whose push channel has a DROPPED receiver — any push will fail.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        drop(rx); // receiver gone: try_send will immediately fail
+        let id = g.next_id;
+        g.next_id += 1;
+        g.players.insert(id, PlayerState {
+            name: "Ghost".into(), position: g.map.spawn(), direction: Direction::South,
+            outfit: knight(), push_tx: tx, known: HashSet::new(),
+            health: 50, max_health: 150, fist_skill: 10,
+            attacking: None, last_attack_ms: 0,
+        });
+
+        // Pushing any payload triggers the dead-session reap → logout → save.
+        g.push(id, vec![0xFF]);
+        let rec = save_rx.try_recv()
+            .expect("dead-session reap must also emit a SaveRecord");
+        assert_eq!(rec.name, "Ghost");
+        assert_eq!(rec.health, 50);
     }
 }
