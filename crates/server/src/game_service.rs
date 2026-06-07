@@ -387,7 +387,13 @@ where
                 // None for unsupported types (private/channel), empty, or malformed
                 // bodies — those are dropped.
                 if let Some((speak_type, text)) = chat::parse_say(&payload[1..]) {
-                    world.say(id, speak_type, text).await;
+                    // GM commands are chat lines beginning with '/'. The world
+                    // actor owns the gamemaster gate; the network layer never trusts.
+                    if text.starts_with('/') {
+                        world.gm_command(id, text).await;
+                    } else {
+                        world.say(id, speak_type, text).await;
+                    }
                 }
                 continue;
             }

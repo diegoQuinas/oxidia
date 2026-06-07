@@ -338,6 +338,7 @@ impl Game {
             Command::LookBattle { id, target_id } => self.do_look_battle(id, target_id),
             Command::MoveThing { id, from, from_stackpos, to, count } =>
                 self.do_move_thing(id, from, from_stackpos, to, count),
+            Command::GmCommand { id, text } => self.do_gm_command(id, text),
             // Intercepted in the actor loop (it must break the loop + ack);
             // never reaches `handle`. Arm kept for match exhaustiveness.
             Command::Shutdown { .. } => {}
@@ -1227,6 +1228,28 @@ impl Game {
         }
     }
 
+    /// Gate + parse + dispatch for `/`-prefixed GM commands. Non-gamemasters are
+    /// silently ignored (their `/` line is simply dropped). Every parse/lookup
+    /// failure replies to the sender via `push_status_message` and leaves the
+    /// world untouched — no panics, no partial state.
+    fn do_gm_command(&mut self, id: u32, text: String) {
+        if !self.players.get(&id).map(|p| p.gamemaster).unwrap_or(false) {
+            return; // not a GM: drop silently
+        }
+        let line = text.trim_start_matches('/').trim();
+        let mut parts = line.split_whitespace();
+        let Some(verb) = parts.next() else { return };
+        let args: Vec<&str> = parts.collect();
+        let _ = &args; // used by subcommands added in Tasks 3–5
+        match verb {
+            // real subcommands are added in Tasks 3–5
+            other => self.push_status_message(
+                id,
+                format!("Unknown command: /{other}").as_bytes(),
+            ),
+        }
+    }
+
     /// Apply `dmg` hit points of damage to `victim_id`, dealt by `attacker_id`.
     /// Clamps to 0, pushes health-bar (`0x8C`) to all spectators including the
     /// victim and attacker, pushes self-stats (`0xA0`) to the victim, emits the
@@ -1639,6 +1662,9 @@ enum Command {
     /// Client `0x78`: move a thing from one map position to another (M10.1: ground
     /// items only). `count` is the stackable split amount (ignored for non-stackables).
     MoveThing { id: u32, from: Position, from_stackpos: u8, to: Position, count: u8 },
+    /// Chat text beginning with `/` from a player. The actor gates on
+    /// `PlayerState.gamemaster`, parses the verb, and dispatches to a GM primitive.
+    GmCommand { id: u32, text: String },
     /// Graceful shutdown: persist every online player, ack, then stop the actor.
     /// Dropping the actor drops `save_tx`, closing the save channel so the DB
     /// drain task can finish. Handled in the actor loop, not in `handle`.
@@ -1720,6 +1746,13 @@ impl WorldHandle {
     /// pushes tile-update packets to spectators (M10.1: ground items only).
     pub async fn move_thing(&self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
         let _ = self.tx.send(Command::MoveThing { id, from, from_stackpos, to, count }).await;
+    }
+
+    /// Forward a `/`-prefixed chat line to the world as a GM command. The actor
+    /// validates that the sender is a gamemaster before doing anything.
+    /// Fire-and-forget; feedback is pushed to the sender as a `0xB4` message.
+    pub async fn gm_command(&self, id: u32, text: String) {
+        let _ = self.tx.send(Command::GmCommand { id, text }).await;
     }
 
     /// Persist every online player, then stop the world actor. Resolves once all
