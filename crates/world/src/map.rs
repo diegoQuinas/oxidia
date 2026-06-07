@@ -288,6 +288,17 @@ impl StaticMap {
         self.item_meta.get(&server_id)
     }
 
+    /// Find an item's server id by case-insensitive name (singular or plural).
+    /// Returns the lowest matching server id when several items share a name.
+    /// Linear scan — fine for the GM `/item` command, which is not a hot path.
+    pub fn find_item_id_by_name(&self, name: &str) -> Option<u16> {
+        self.item_meta
+            .iter()
+            .filter(|(_, m)| m.name.eq_ignore_ascii_case(name) || m.plural.eq_ignore_ascii_case(name))
+            .map(|(&sid, _)| sid)
+            .min()
+    }
+
     /// How many of a tile's items render below a creature (ground + top items).
     pub fn tile_pre_creature_len(&self, pos: Position) -> usize {
         self.tiles.get(&(pos.x, pos.y, pos.z)).map_or(0, |st| st.pre_creature_len)

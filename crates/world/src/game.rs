@@ -1237,10 +1237,12 @@ impl Game {
             return; // not a GM: drop silently
         }
         let line = text.trim_start_matches('/').trim();
-        let mut parts = line.split_whitespace();
-        let Some(verb) = parts.next() else { return };
-        let args: Vec<&str> = parts.collect();
-        match verb {
+        // Quote-aware tokenization so multi-word arguments survive: item names
+        // (`/item "Gold Coin" 100`) and player names with spaces (`/bring "God Diego"`).
+        let tokens = tokenize_args(line);
+        let Some((verb, rest)) = tokens.split_first() else { return };
+        let args: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
+        match verb.as_str() {
             "item" => self.gm_item(id, &args),
             "goto" => self.gm_goto(id, &args),
             "teleport" => self.gm_teleport(id, &args),
@@ -1274,11 +1276,23 @@ impl Game {
         self.push_status_message(id, format!("Teleported to {}, {}, {}.", pos.x, pos.y, pos.z).as_bytes());
     }
 
-    /// `/item <server_id> [count]` — spawn an item on the GM's own tile.
+    /// `/item <id|"name"> [count]` — spawn an item on the GM's own tile. The first
+    /// argument is a server id when it parses as a number, otherwise an item name
+    /// (case-insensitive, singular or plural; quote multi-word names).
     fn gm_item(&mut self, id: u32, args: &[&str]) {
-        let Some(server_id) = args.first().and_then(|s| s.parse::<u16>().ok()) else {
-            self.push_status_message(id, b"Usage: /item <id> [count]");
+        let Some(first) = args.first() else {
+            self.push_status_message(id, b"Usage: /item <id|\"name\"> [count]");
             return;
+        };
+        let server_id = match first.parse::<u16>() {
+            Ok(n) => n,
+            Err(_) => match self.map.find_item_id_by_name(first) {
+                Some(sid) => sid,
+                None => {
+                    self.push_status_message(id, format!("No item named '{first}'.").as_bytes());
+                    return;
+                }
+            },
         };
         let count = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
         let Some(pos) = self.players.get(&id).map(|p| p.position) else { return };
@@ -1843,6 +1857,40 @@ impl Game {
         );
         self.push(id, pkt);
     }
+}
+
+/// Split a GM command's argument string into tokens, treating `"..."` as a
+/// single token (so `"Gold Coin" 100` → `["Gold Coin", "100"]`). Unquoted runs
+/// split on whitespace; an unterminated quote consumes to the end of input.
+fn tokenize_args(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '"' {
+            chars.next(); // consume opening quote
+            let mut tok = String::new();
+            for c in chars.by_ref() {
+                if c == '"' {
+                    break;
+                }
+                tok.push(c);
+            }
+            tokens.push(tok);
+        } else {
+            let mut tok = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                tok.push(c);
+                chars.next();
+            }
+            tokens.push(tok);
+        }
+    }
+    tokens
 }
 
 /// Parse `<x> <y> <z>` from the front of a GM command's args. `None` if any
