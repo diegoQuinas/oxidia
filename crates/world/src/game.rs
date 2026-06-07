@@ -127,10 +127,40 @@ impl Game {
         }
     }
 
+    /// Is a creature (other than `exclude`) standing on `pos`?
+    fn tile_occupied(&self, pos: Position, exclude: u32) -> bool {
+        self.players.iter().any(|(&pid, p)| pid != exclude && p.position == pos)
+    }
+
+    /// The spawn tile, or the nearest walkable & unoccupied tile in expanding
+    /// square rings around it (so co-logins don't stack on one tile). Falls back
+    /// to the spawn itself if nothing free is found within the search radius.
+    fn free_spawn(&self) -> Position {
+        let origin = self.map.spawn();
+        if self.map.is_walkable(origin) && !self.tile_occupied(origin, u32::MAX) {
+            return origin;
+        }
+        for r in 1..=5i32 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs() != r && dy.abs() != r {
+                        continue; // ring perimeter only
+                    }
+                    if let Some(p) = origin.offset(dx, dy) {
+                        if self.map.is_walkable(p) && !self.tile_occupied(p, u32::MAX) {
+                            return p;
+                        }
+                    }
+                }
+            }
+        }
+        origin
+    }
+
     fn login(&mut self, name: String, outfit: Outfit, push_tx: mpsc::Sender<Vec<u8>>) -> LoginAck {
         let id = self.next_id;
         self.next_id += 1;
-        let position = self.map.spawn();
+        let position = self.free_spawn();
         let direction = Direction::South;
 
         // Existing in-range players, before inserting self.
@@ -190,7 +220,9 @@ impl Game {
             None => return,
         };
         let (dx, dy) = direction.delta();
-        let dest = from.offset(dx, dy).filter(|&d| self.map.is_walkable(d));
+        let dest = from
+            .offset(dx, dy)
+            .filter(|&d| self.map.is_walkable(d) && !self.tile_occupied(d, id));
 
         // Always update facing.
         if let Some(p) = self.players.get_mut(&id) { p.direction = direction; }
@@ -415,16 +447,16 @@ mod tests {
         let world = spawn(walk_map());
         let (tx_a, mut rx_a) = push_channel();
         let ack_a = world.login("A".into(), knight(), tx_a).await.unwrap();
-        let (tx_b, _rx_b) = push_channel();
-        let ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
+        let (tx_b, mut rx_b) = push_channel();
+        let _ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
         // Drain A's appear-of-B packet.
         let _ = rx_a.recv().await.unwrap();
-        // B steps east; A (a spectator that sees both endpoints) gets a 0x6D.
-        world.move_player(ack_b.snapshot.id, Direction::East).await;
-        let pkt = rx_a.recv().await.unwrap();
+        // A steps east (95,117 -> 96,117); B (a spectator that sees both
+        // endpoints) gets a 0x6D creature-move packet.
+        world.move_player(ack_a.snapshot.id, Direction::East).await;
+        let pkt = rx_b.recv().await.unwrap();
         assert_eq!(pkt[0], walk::OP_CREATURE_MOVE);
-        assert_eq!(u32::from_le_bytes([pkt[3], pkt[4], pkt[5], pkt[6]]), ack_b.snapshot.id);
-        let _ = ack_a;
+        assert_eq!(u32::from_le_bytes([pkt[3], pkt[4], pkt[5], pkt[6]]), ack_a.snapshot.id);
     }
 
     #[tokio::test]
@@ -458,5 +490,31 @@ mod tests {
         g.do_move(mover, Direction::East); // 95,117 -> 96,117
         let pkt = rx.try_recv().expect("spectator should receive a packet");
         assert_eq!(pkt[0], protocol::tile_creature::OP_ADD_TILE_CREATURE);
+    }
+
+    #[test]
+    fn cannot_move_onto_tile_occupied_by_creature() {
+        let mut g = Game::new(walk_map());
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7)); // east of A
+        // A tries to step east onto B's tile -> blocked.
+        g.do_move(a, Direction::East);
+        // A did not move (still at 95,117); B received no move/appear for A.
+        assert!(rb.try_recv().is_err(), "B should get nothing; A's move was blocked");
+        let _ = b;
+    }
+
+    #[tokio::test]
+    async fn second_login_on_occupied_spawn_gets_free_tile() {
+        let world = spawn(walk_map());
+        let (tx_a, _ra) = push_channel();
+        let ack_a = world.login("A".into(), knight(), tx_a).await.unwrap();
+        let (tx_b, _rb) = push_channel();
+        let ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
+        assert_ne!(
+            ack_a.snapshot.position,
+            ack_b.snapshot.position,
+            "co-logins must not share a tile"
+        );
     }
 }
