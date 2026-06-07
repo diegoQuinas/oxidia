@@ -55,11 +55,35 @@ impl FloorChange {
 }
 
 /// Per-item attributes loaded from `items.xml`, keyed by server id.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ItemXmlAttrs {
     pub floor_change: FloorChange,
-    // Future milestones extend this struct with weight, type, slot, armor, ...
-    // parsed generically in `parse_items_xml`.
+    /// Display name (`<item name=…>`); empty if absent.
+    pub name: String,
+    /// Indefinite article, `"a"` / `"an"` (`<item article=…>`).
+    pub article: String,
+    /// Plural name (`<item plural=…>`), used for stackable count > 1.
+    pub plural: String,
+    /// Look description (`<attribute key="description">`).
+    pub description: String,
+    /// Weight in **hundredths of an oz** (`<attribute key="weight">`).
+    pub weight: u32,
+    /// Whether the count prefixes the name for stacks (`showcount`, default true).
+    pub show_count: bool,
+}
+
+impl Default for ItemXmlAttrs {
+    fn default() -> Self {
+        Self {
+            floor_change: FloorChange::NONE,
+            name: String::new(),
+            article: String::new(),
+            plural: String::new(),
+            description: String::new(),
+            weight: 0,
+            show_count: true,
+        }
+    }
 }
 
 /// All `items.xml` attributes, indexed by server id.
@@ -96,6 +120,11 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
             continue;
         }
         let mut attrs = ItemXmlAttrs::default();
+        // Element attributes on <item …>.
+        if let Some(v) = item.attribute("name") { attrs.name = v.to_string(); }
+        if let Some(v) = item.attribute("article") { attrs.article = v.to_string(); }
+        if let Some(v) = item.attribute("plural") { attrs.plural = v.to_string(); }
+        // <attribute key=… value=…> children.
         for attr in item.children().filter(|n| n.has_tag_name("attribute")) {
             let key = attr.attribute("key").unwrap_or("");
             let value = attr.attribute("value").unwrap_or("");
@@ -103,15 +132,24 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
                 if let Some(fc) = FloorChange::from_xml_value(value) {
                     attrs.floor_change.insert(fc);
                 }
+            } else if key.eq_ignore_ascii_case("description") {
+                attrs.description = value.to_string();
+            } else if key.eq_ignore_ascii_case("weight") {
+                attrs.weight = value.parse::<u32>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("showcount") {
+                attrs.show_count = !value.eq_ignore_ascii_case("0")
+                    && !value.eq_ignore_ascii_case("false");
             }
-            // Other keys parsed here as later milestones need them.
         }
         for id in ids {
-            by_server_id
-                .entry(id)
-                .or_default()
-                .floor_change
-                .insert(attrs.floor_change);
+            let entry = by_server_id.entry(id).or_default();
+            entry.floor_change.insert(attrs.floor_change);
+            if !attrs.name.is_empty() { entry.name = attrs.name.clone(); }
+            if !attrs.article.is_empty() { entry.article = attrs.article.clone(); }
+            if !attrs.plural.is_empty() { entry.plural = attrs.plural.clone(); }
+            if !attrs.description.is_empty() { entry.description = attrs.description.clone(); }
+            if attrs.weight != 0 { entry.weight = attrs.weight; }
+            entry.show_count = attrs.show_count;
         }
     }
 
@@ -234,5 +272,45 @@ mod tests {
             any_down,
             "real items.xml should define floorchange=down stairs"
         );
+    }
+
+    #[test]
+    fn item_attrs_name_article_plural_description_weight() {
+        let xml = r#"<items>
+          <item id="2148" name="gold coin" article="a" plural="gold coins">
+            <attribute key="description" value="Shiny!"/>
+            <attribute key="weight" value="550"/>
+          </item>
+        </items>"#;
+        let parsed = parse_items_xml(xml).unwrap();
+        let a = parsed.attrs(2148).expect("item 2148 must be present");
+        assert_eq!(a.name, "gold coin");
+        assert_eq!(a.article, "a");
+        assert_eq!(a.plural, "gold coins");
+        assert_eq!(a.description, "Shiny!");
+        // Weight is stored in hundredths of an oz as-is (NOT divided).
+        assert_eq!(a.weight, 550);
+        // show_count defaults to true when no showcount attribute is present.
+        assert!(a.show_count, "show_count must default to true");
+    }
+
+    #[test]
+    fn item_attrs_showcount_false_when_zero() {
+        let xml = r#"<items>
+          <item id="1987" name="stone" article="a" plural="stones">
+            <attribute key="weight" value="110"/>
+            <attribute key="showcount" value="0"/>
+          </item>
+        </items>"#;
+        let parsed = parse_items_xml(xml).unwrap();
+        let a = parsed.attrs(1987).expect("item 1987 must be present");
+        assert!(!a.show_count, "showcount=0 must yield show_count == false");
+    }
+
+    #[test]
+    fn absent_item_attrs_returns_none() {
+        let xml = r#"<items><item id="100" name="grass"/></items>"#;
+        let parsed = parse_items_xml(xml).unwrap();
+        assert!(parsed.attrs(9999).is_none(), "absent item must return None");
     }
 }

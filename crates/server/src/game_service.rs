@@ -51,6 +51,7 @@ fn player_save_to_initial(save: &PlayerSave) -> InitialState {
         sex: save.sex,
         health: save.health,
         max_health: save.health_max,
+        gamemaster: false,
     }
 }
 
@@ -226,8 +227,11 @@ where
             sex: 1, // new character defaults to male, matching the default look_type 128
             health: 150,
             max_health: 150,
+            gamemaster: false,
         },
     };
+    let mut initial = initial;
+    initial.gamemaster = req.gamemaster;
     let (push_tx, push_rx) = world::game::push_channel();
     let Some(ack) = world.login(name.clone(), initial, push_tx).await else {
         return send_disconnect(&mut stream, &keys, "Your character could not be loaded.").await;
@@ -379,6 +383,20 @@ where
                 }
                 continue;
             }
+            // 0x8C — client look-at (parseLookAt). Body: [pos][spriteId u16][stackpos u8].
+            if opcode == 0x8C {
+                if let Some((x, y, z, stackpos)) = protocol::look::parse_look(&payload[1..]) {
+                    world.look(id, x, y, z, stackpos).await;
+                }
+                continue;
+            }
+            // 0x8D — client look-in-battle-list. Body: [creatureId u32].
+            if opcode == 0x8D {
+                if let Some(target_id) = protocol::look::parse_look_battle(&payload[1..]) {
+                    world.look_battle(id, target_id).await;
+                }
+                continue;
+            }
             let Some((direction, is_turn)) = opcode_action(opcode) else { continue };
             if is_turn {
                 world.turn_player(id, direction).await;
@@ -480,7 +498,7 @@ mod tests {
                     z: 7,
                     flags: 0,
                     house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }],
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }],
                 },
                 MapTile {
                     x: 96,
@@ -488,7 +506,7 @@ mod tests {
                     z: 7,
                     flags: 0,
                     house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }],
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }],
                 },
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
@@ -786,7 +804,7 @@ mod tests {
                 x: 100, y: 100, z: 7,
                 flags: 1, // PZ bit
                 house_id: None,
-                items: vec![MapItem { id: 100, contents: vec![] }],
+                items: vec![MapItem { id: 100, count: None, contents: vec![] }],
             }],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
             waypoints: vec![],

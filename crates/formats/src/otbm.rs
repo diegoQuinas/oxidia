@@ -30,9 +30,22 @@ const OTBM_WAYPOINT: u8 = 16;
 // Map-data / tile attributes (OTBM_AttrTypes_t).
 const OTBM_ATTR_DESCRIPTION: u8 = 1;
 const OTBM_ATTR_TILE_FLAGS: u8 = 3;
+const OTBM_ATTR_ACTION_ID: u8 = 4;
+const OTBM_ATTR_UNIQUE_ID: u8 = 5;
+const OTBM_ATTR_TEXT: u8 = 6;
+const OTBM_ATTR_DESC: u8 = 7;
+const OTBM_ATTR_TELE_DEST: u8 = 8;
 const OTBM_ATTR_ITEM: u8 = 9;
+const OTBM_ATTR_DEPOT_ID: u8 = 10;
 const OTBM_ATTR_EXT_SPAWN_FILE: u8 = 11;
+const OTBM_ATTR_RUNE_CHARGES: u8 = 12;
 const OTBM_ATTR_EXT_HOUSE_FILE: u8 = 13;
+const OTBM_ATTR_COUNT: u8 = 15;
+const OTBM_ATTR_DURATION: u8 = 16;
+const OTBM_ATTR_DECAYING_STATE: u8 = 17;
+const OTBM_ATTR_WRITTENDATE: u8 = 18;
+const OTBM_ATTR_WRITTENBY: u8 = 19;
+const OTBM_ATTR_CHARGES: u8 = 22;
 
 /// A fully parsed `.otbm` map.
 #[derive(Debug, Clone)]
@@ -76,12 +89,13 @@ pub struct MapTile {
     pub items: Vec<MapItem>,
 }
 
-/// An item on a tile (or inside a container). M2 keeps only the id and any
-/// contained items; full attribute decoding is deferred.
+/// An item on a tile (or inside a container).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapItem {
     /// Server item id.
     pub id: u16,
+    /// Stack count / subtype from `OTBM_ATTR_COUNT` (None if absent).
+    pub count: Option<u8>,
     /// Items contained within (for containers); empty otherwise.
     pub contents: Vec<MapItem>,
 }
@@ -213,7 +227,7 @@ fn parse_tile(node: &Node, base_x: u16, base_y: u16, z: u8) -> Result<MapTile, F
         match attr {
             OTBM_ATTR_TILE_FLAGS => flags = r.read_u32()?,
             // Inline ground item: Item::CreateItem reads exactly a u16 id.
-            OTBM_ATTR_ITEM => items.push(MapItem { id: r.read_u16()?, contents: vec![] }),
+            OTBM_ATTR_ITEM => items.push(MapItem { id: r.read_u16()?, count: None, contents: vec![] }),
             _ => return Err(FormatError::InvalidNode { what: "unknown tile attribute" }),
         }
     }
@@ -229,11 +243,29 @@ fn parse_tile(node: &Node, base_x: u16, base_y: u16, z: u8) -> Result<MapTile, F
     Ok(MapTile { x, y, z, flags, house_id, items })
 }
 
-/// Parse an OTBM_ITEM node: leading u16 id, then (ignored) attributes, then
-/// contained items as child nodes.
+/// Parse an OTBM_ITEM node: leading u16 id, then attributes (we capture COUNT),
+/// then contained items as child nodes. Attribute parsing stops at the first
+/// unknown tag — map stack items carry COUNT and a small set of known attrs.
 fn parse_item(node: &Node) -> Result<MapItem, FormatError> {
     let mut r = PropReader::new(&node.props);
     let id = r.read_u16()?;
+    let mut count = None;
+    while r.remaining() > 0 {
+        let attr = r.read_u8()?;
+        match attr {
+            OTBM_ATTR_COUNT => count = Some(r.read_u8()?),
+            // RUNE_CHARGES is a u8 (TFS `item.cpp:366-367` reads it like COUNT),
+            // not a u16 — read one byte and discard (not a stack count).
+            OTBM_ATTR_RUNE_CHARGES => { r.read_u8()?; }
+            OTBM_ATTR_ACTION_ID | OTBM_ATTR_UNIQUE_ID | OTBM_ATTR_DEPOT_ID
+            | OTBM_ATTR_CHARGES => { r.read_u16()?; }
+            OTBM_ATTR_TELE_DEST => { r.skip(5)?; } // x u16, y u16, z u8
+            OTBM_ATTR_DURATION | OTBM_ATTR_WRITTENDATE => { r.read_u32()?; }
+            OTBM_ATTR_DECAYING_STATE => { r.read_u8()?; }
+            OTBM_ATTR_TEXT | OTBM_ATTR_DESC | OTBM_ATTR_WRITTENBY => { r.read_string()?; }
+            _ => break, // unknown attr: stop (leftover bytes ignored, as before)
+        }
+    }
     let mut contents = Vec::with_capacity(node.children.len());
     for child in &node.children {
         if child.kind != OTBM_ITEM {
@@ -241,7 +273,7 @@ fn parse_item(node: &Node) -> Result<MapItem, FormatError> {
         }
         contents.push(parse_item(child)?);
     }
-    Ok(MapItem { id, contents })
+    Ok(MapItem { id, count, contents })
 }
 
 /// Parse the TOWNS node.
@@ -408,8 +440,8 @@ mod tests {
         assert_eq!(tile.flags, 1);
         assert_eq!(tile.house_id, None);
         assert_eq!(tile.items.len(), 2);
-        assert_eq!(tile.items[0], MapItem { id: 4526, contents: vec![] });
-        assert_eq!(tile.items[1], MapItem { id: 1234, contents: vec![] });
+        assert_eq!(tile.items[0], MapItem { id: 4526, count: None, contents: vec![] });
+        assert_eq!(tile.items[1], MapItem { id: 1234, count: None, contents: vec![] });
     }
 
     #[test]
@@ -423,5 +455,94 @@ mod tests {
             map.waypoints,
             vec![Waypoint { name: "temple".into(), x: 15, y: 25, z: 7 }]
         );
+    }
+
+    /// Build the minimal OTBM skeleton (identifier + root header + MAP_DATA shell)
+    /// and return a byte buffer with the given raw item props appended as a single
+    /// OTBM_ITEM child inside one TILE_AREA / TILE.
+    fn otbm_with_item_props(props: &[u8]) -> Vec<u8> {
+        fn string(v: &mut Vec<u8>, s: &str) {
+            v.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            v.extend_from_slice(s.as_bytes());
+        }
+        let mut v = vec![0x00, 0x00, 0x00, 0x00]; // identifier
+        v.push(0xFE);
+        v.push(0x00); // root type
+        v.extend_from_slice(&2u32.to_le_bytes()); // version
+        v.extend_from_slice(&100u16.to_le_bytes()); // width
+        v.extend_from_slice(&200u16.to_le_bytes()); // height
+        v.extend_from_slice(&3u32.to_le_bytes()); // major items
+        v.extend_from_slice(&57u32.to_le_bytes()); // minor items
+        // MAP_DATA
+        v.push(0xFE);
+        v.push(OTBM_MAP_DATA);
+        v.push(OTBM_ATTR_DESCRIPTION);
+        string(&mut v, "x");
+        // TILE_AREA at base (10, 20, 7)
+        v.push(0xFE);
+        v.push(OTBM_TILE_AREA);
+        v.extend_from_slice(&10u16.to_le_bytes());
+        v.extend_from_slice(&20u16.to_le_bytes());
+        v.push(7u8);
+        // TILE at offset (0, 0)
+        v.push(0xFE);
+        v.push(OTBM_TILE);
+        v.push(0u8); // x offset
+        v.push(0u8); // y offset
+        // child OTBM_ITEM with caller-supplied props
+        v.push(0xFE);
+        v.push(OTBM_ITEM);
+        v.extend_from_slice(props);
+        v.push(0xFF); // end item
+        v.push(0xFF); // end tile
+        v.push(0xFF); // end tile area
+        // TOWNS (empty but required by the parser)
+        v.push(0xFE);
+        v.push(OTBM_TOWNS);
+        v.push(0xFF); // end towns
+        // WAYPOINTS (empty)
+        v.push(0xFE);
+        v.push(OTBM_WAYPOINTS);
+        v.push(0xFF); // end waypoints
+        v.push(0xFF); // end map data
+        v.push(0xFF); // end root
+        v
+    }
+
+    #[test]
+    fn otbm_item_count_attr_is_parsed() {
+        // An OTBM_ITEM node whose props are [u16 id][OTBM_ATTR_COUNT=15][u8 count]
+        // must yield MapItem { id, count: Some(count), .. }.
+        let item_id: u16 = 2148;
+        let count: u8 = 47;
+        let mut props = Vec::new();
+        props.extend_from_slice(&item_id.to_le_bytes());
+        props.push(OTBM_ATTR_COUNT);
+        props.push(count);
+        let map = parse(&otbm_with_item_props(&props)).unwrap();
+        assert_eq!(map.tiles.len(), 1);
+        let items = &map.tiles[0].items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, item_id);
+        assert_eq!(items[0].count, Some(count));
+    }
+
+    #[test]
+    fn otbm_item_unknown_trailing_attr_does_not_panic_and_yields_id() {
+        // An item with an unknown attribute byte (0xFD, not in the known set) after
+        // the id must NOT panic. The id must still be parsed; count will be None
+        // because the loop breaks on the unknown attribute.
+        let item_id: u16 = 1234;
+        let unknown_attr: u8 = 0xFD; // not a known OTBM_ATTR_* value
+        let mut props = Vec::new();
+        props.extend_from_slice(&item_id.to_le_bytes());
+        props.push(unknown_attr);
+        props.push(42u8); // trailing byte for the unknown attr (consumed or ignored)
+        let map = parse(&otbm_with_item_props(&props)).unwrap();
+        assert_eq!(map.tiles.len(), 1);
+        let items = &map.tiles[0].items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, item_id);
+        assert_eq!(items[0].count, None, "unknown trailing attr yields count: None");
     }
 }

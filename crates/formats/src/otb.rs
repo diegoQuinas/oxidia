@@ -27,6 +27,9 @@ const FLAG_ALWAYS_ON_TOP: u32 = 1 << 13;
 const FLAG_HAS_HEIGHT: u32 = 1 << 3;
 /// `FLAG_STACKABLE` — the wire carries a u8 count after the item's mark byte.
 const FLAG_STACKABLE: u32 = 1 << 7;
+/// `FLAG_PICKUPABLE` (bit 5) — the item can be picked up; look-at shows weight
+/// only for pickupable items (TFS `item.cpp:1499`).
+const FLAG_PICKUPABLE: u32 = 1 << 5;
 /// `FLAG_ANIMATION` — the wire carries a u8 animation-phase byte after the item.
 const FLAG_ANIMATION: u32 = 1 << 24;
 
@@ -79,6 +82,11 @@ impl ItemType {
     /// `FLAG_STACKABLE` — the wire form carries a u8 count byte for this item.
     pub fn is_stackable(&self) -> bool {
         self.flags & FLAG_STACKABLE != 0
+    }
+
+    /// `FLAG_PICKUPABLE` — look-at shows a weight line only for pickupable items.
+    pub fn is_pickupable(&self) -> bool {
+        self.flags & FLAG_PICKUPABLE != 0
     }
 
     /// `FLAG_ANIMATION` — the wire form carries a u8 animation-phase byte.

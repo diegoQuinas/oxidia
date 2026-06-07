@@ -19,6 +19,7 @@ pub mod enter_world;
 pub mod frame;
 pub mod game_login;
 pub mod login;
+pub mod look;
 pub mod map_description;
 pub mod message;
 pub mod outfit;

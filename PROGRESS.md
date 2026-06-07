@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) ✅ **accepted live** — underground floor-change desync fixes (teleport sloped stairs/ladders + boundary mover re-add) landed and validated. **M7 ✅ combat core + PvP melee** and **M7.1 ✅ combat polish** (death→logout, PZ badge, blood) — both **accepted live**. **M8 ✅ persistence + accounts + outfit change/persist, accepted live** (load on login, save on logout; login never stacks on an occupied tile). M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
+- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) ✅ **accepted live** — underground floor-change desync fixes (teleport sloped stairs/ladders + boundary mover re-add) landed and validated. **M7 ✅ combat core + PvP melee** and **M7.1 ✅ combat polish** (death→logout, PZ badge, blood) — both **accepted live**. **M8 ✅ persistence + accounts + outfit change/persist, accepted live** (load on login, save on logout; login never stacks on an occupied tile). **M9 ✅ ground items + look-at, accepted live** (examine items/creatures, TFS item text, real OTBM stack counts, GM debug). M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
 - **Build:** `cargo build` clean, `cargo test` green (workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -40,7 +40,7 @@ performance-critical or stable stays native Rust.
 | M8 | Persistence + accounts: per-account characters, saved position/stats/outfit (load on login, save on logout via unbounded save channel); outfit change + persist (`0xD2` request → `0xC8` window, `0xD3` set → apply + `0x8E` broadcast); login never stacks on an occupied tile (`free_spawn_near`) | ✅ done |
 | M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⏸️ deferred (non-priority) |
 | **B** | **Items & Inventory** | |
-| M9 | Ground items, stacks, look-at | ⬜ |
+| M9 | Ground items, stacks, look-at: examine (`0x8C`/`0x8D`) with TFS-faithful item text (name/article/plural/description/weight) + real OTBM stack counts + creature look; GM debug (item id + position). Static item rendering already shipped in M4/M6.1 | ✅ done |
 | M10 | Inventory & equipment: move, equip, containers, use | ⬜ |
 | **C** | **Scripting** | |
 | M11 | Lua runtime (mlua): hot-reloadable content hooks (onUse/onStepIn/onSay/…). Includes use-driven floor changes (M6.2: ladders/holes via `teleport.lua` `onUse`) — see `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⬜ |
@@ -271,6 +271,62 @@ Gate: `cargo test` green (225), `cargo clippy --all-targets -- -D warnings` clea
 **Live acceptance — ✅ ACCEPTED (2026-06-07):** die in PvP → death window → character
 select → relog spawns at the temple with full HP; standing in the temple shows the
 PZ dove badge (clears on leaving); hits draw a visible blood animation.
+
+## M9 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-07-m9-ground-items-look-design.md`,
+`docs/superpowers/plans/2026-06-07-m9-ground-items-look.md`. Scope: **look-at
+(examine)** — the static item *rendering* roadmap M9 called for already shipped in
+M4/M6.1 (`StaticMap` stores the full per-tile stack; the encoder serializes it with
+the 10-thing cap). M9 added the examine path + the item metadata it needs. Built
+**spike-first** (implement → live-validate → tests), subagent-driven on the
+`m9-ground-items-look` branch.
+
+1. ✅ `formats::items_xml` — `ItemXmlAttrs` gains `name`/`article`/`plural`/
+   `description`/`weight` (hundredths of oz)/`show_count`; loader reads the `<item>`
+   element attrs + `description`/`weight`/`showcount` children. Metadata lives in
+   `ItemXmlAttrs` (NOT `ItemType`) to avoid churn on ~30 struct-literal sites.
+2. ✅ `formats::otb` — `is_pickupable()` (`FLAG_PICKUPABLE` 1<<5); weight shows only
+   for pickupable items.
+3. ✅ `formats::otbm` — `MapItem.count: Option<u8>` from `OTBM_ATTR_COUNT` (15); a
+   known-attr loop in `parse_item` stops at the first unknown attr (no panic path).
+   `RUNE_CHARGES` is a u8 (shares the COUNT case), corrected post-review.
+4. ✅ `protocol::look` — pure wire: `parse_look` (`0x8C` `[pos][spriteId u16][stackpos]`),
+   `parse_look_battle` (`0x8D` `[id u32]`), `info_descr` (`0xB4` `MESSAGE_INFO_DESCR=22`).
+5. ✅ `world::map` — `ItemMeta` catalog on `StaticMap` (`load_item_metadata`, keyed
+   by server id); `TileStack` carries parallel `server_ids`/`counts`; OTBM count
+   threads into `WireItem.subtype`. `from_formats_with_spawn` signature unchanged
+   (84 call sites) — only `main` populates the catalog at boot.
+6. ✅ `world::game` — `do_look`/`do_look_battle` on the actor (owns tiles + creatures):
+   STACKPOS_LOOK resolution under the ≤1-creature invariant, `can_see` gate,
+   Chebyshev `lookDistance` (+15 cross-floor), TFS-faithful item text
+   (`getDescription`/`getNameDescription`/`getWeightDescription`) and creature text
+   (`player.cpp` subset: name, Level 1, "no vocation", He/She from M8 sex); weight +
+   description only at distance ≤1; GM debug (`Item ID` + `Position`) gated on the
+   login gamemaster flag (threaded via `InitialState`/`PlayerState`).
+7. ✅ `server` — `reader_loop` dispatches `0x8C`/`0x8D`; `main` calls
+   `load_item_metadata` after `merge_items_xml`.
+
+Gate: `cargo test` **268 green** (whole workspace), `cargo clippy --all-targets
+-- -D warnings` clean, `#![forbid(unsafe_code)]` intact.
+
+**Final holistic review** (verdict SHIP, no CRITICAL) caught two edge-case bugs fixed
+post-implementation: `OTBM_ATTR_RUNE_CHARGES` was read as u16 instead of u8 (would
+desync an item's attr stream on the rare map item carrying rune charges); and a stray
+`world_light(250,…)` daylight tweak swept into the look-dispatch commit was reverted.
+One **known limitation** documented in `creatures_on`: when 2+ creatures co-occupy a
+tile (stair landings), the id-order look resolution can swap which name is shown —
+both render identically otherwise; deferred until it matters.
+
+**Live acceptance — ✅ ACCEPTED (2026-06-07):** real OTClient examines a ground item
+near the temple (green "You see a …" with weight + description when adjacent, name
+only from afar); look at a second player → "You see <name> (Level 1). He has no
+vocation." (and She for a female char); self-look → "yourself"; gamemaster login adds
+the item id + position lines.
+
+**Deferred:** look in inventory/containers (M10), trade/shop (M16); action/unique/
+decay/transform IDs + writable book text in GM debug; rune/weapon/armor stat lines;
+real level/vocation/mana/party/IP; dynamic ground items + runtime stack counts (M10).
 
 ## M6.1 plan
 

@@ -37,9 +37,9 @@ fn decorated_map() -> (OtbmMap, ItemsOtb) {
         tiles: vec![MapTile {
             x: 1000, y: 1000, z: 7, flags: 0, house_id: None,
             items: vec![
-                MapItem { id: 100, contents: vec![] },
-                MapItem { id: 200, contents: vec![] },
-                MapItem { id: 300, contents: vec![] },
+                MapItem { id: 100, count: None, contents: vec![] },
+                MapItem { id: 200, count: None, contents: vec![] },
+                MapItem { id: 300, count: None, contents: vec![] },
             ],
         }],
         towns: vec![Town { id: 1, name: "Thais".into(), x: 1000, y: 1000, z: 7 }],
