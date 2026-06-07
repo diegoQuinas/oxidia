@@ -21,3 +21,6 @@ debug.log
 
 # Agent tooling state
 .atl/
+
+# git worktrees created for isolated milestone work
+.claude/worktrees/
