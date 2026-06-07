@@ -8,7 +8,8 @@ use protocol::rsa::RsaPrivateKey;
 use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, outfit as outfit_packets, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
 use world::game::{InitialState, SaveRecord, WorldHandle};
-use world::Direction;
+use world::map::StaticMap;
+use world::{Direction, Position};
 
 pub const CLIENT_VERSION_MIN: u16 = 1097;
 pub const CLIENT_VERSION_MAX: u16 = 1098;
@@ -108,7 +109,7 @@ pub fn build_enter_world_burst(
     player: &EnterWorldPlayer<'_>,
     center: Center,
     others: &[PlacedCreature],
-    map: &impl map_description::TileSource,
+    map: &StaticMap,
 ) -> Vec<u8> {
     let snapshot_id = player.id;
     let direction = player.direction;
@@ -156,7 +157,12 @@ pub fn build_enter_world_burst(
     burst.extend(enter_world::world_light(215, 215));
     burst.extend(enter_world::creature_light(snapshot_id, 0, 0));
     burst.extend(enter_world::basic_data());
-    burst.extend(enter_world::icons(0));
+    let icon_mask = if map.is_protection_zone(Position::new(center.x, center.y, center.z)) {
+        enter_world::ICON_PIGEON
+    } else {
+        0
+    };
+    burst.extend(enter_world::icons(icon_mask));
     burst
 }
 
@@ -752,5 +758,52 @@ mod tests {
         assert_eq!(save.level, 1);
         assert_eq!(save.mana, 0);
         assert_eq!(save.mana_max, 0);
+    }
+
+    /// A one-tile StaticMap at (100,100,7) with the PZ flag set (flags: 1).
+    fn pz_test_map() -> Arc<StaticMap> {
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: vec![ItemType {
+                group: 1, flags: 0, server_id: 100, client_id: 4526,
+                always_on_top: false, top_order: 0, has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            }],
+        };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![MapTile {
+                x: 100, y: 100, z: 7,
+                flags: 1, // PZ bit
+                house_id: None,
+                items: vec![MapItem { id: 100, contents: vec![] }],
+            }],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        Arc::new(StaticMap::from_formats(&map, &items))
+    }
+
+    #[test]
+    fn burst_includes_pz_icon_when_spawn_in_protection_zone() {
+        let map = pz_test_map();
+        let center = Center { x: 100, y: 100, z: 7 };
+        let player = EnterWorldPlayer {
+            id: 0x1000_0000,
+            name: b"Tester",
+            direction: Direction::South.to_byte(),
+            outfit: creature::Outfit { look_type: 128, head: 0, body: 0, legs: 0, feet: 0, addons: 0, mount: 0 },
+            health: 150,
+            max_health: 150,
+        };
+        let burst = build_enter_world_burst(&player, center, &[], map.as_ref());
+        // The icons packet [0xA2, lo, hi] for ICON_PIGEON (0x4000) must be present.
+        assert!(
+            burst.windows(3).any(|w| w == [enter_world::OP_ICONS, 0x00, 0x40]),
+            "burst must carry ICON_PIGEON when spawning in a PZ"
+        );
     }
 }
