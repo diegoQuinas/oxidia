@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) ✅ **accepted live** — underground floor-change desync fixes (teleport sloped stairs/ladders + boundary mover re-add) landed and validated. **M7 ✅ combat core + PvP melee** and **M7.1 ✅ combat polish** (death→logout, PZ badge, blood) — both **accepted live**. **M8 ✅ persistence + accounts + outfit change/persist, accepted live** (load on login, save on logout; login never stacks on an occupied tile). **M9 ✅ ground items + look-at, accepted live** (examine items/creatures, TFS item text, real OTBM stack counts, GM debug). M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
+- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) ✅ **accepted live** — underground floor-change desync fixes (teleport sloped stairs/ladders + boundary mover re-add) landed and validated. **M7 ✅ combat core + PvP melee** and **M7.1 ✅ combat polish** (death→logout, PZ badge, blood) — both **accepted live**. **M8 ✅ persistence + accounts + outfit change/persist, accepted live** (load on login, save on logout; login never stacks on an occupied tile). **M9 ✅ ground items + look-at, accepted live** (examine items/creatures, TFS item text, real OTBM stack counts, GM debug). **M10.1 ✅ ground items dynamic + move-thing, accepted live** (copy-on-write tile overlay, `0x78` ground→ground move with stack merge/split, faithful throw-range + line-of-sight, newest-item-on-top) — first slice of the M10 inventory chain; M10.2/M10.3 next. M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
 - **Build:** `cargo build` clean, `cargo test` green (workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -41,7 +41,10 @@ performance-critical or stable stays native Rust.
 | M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⏸️ deferred (non-priority) |
 | **B** | **Items & Inventory** | |
 | M9 | Ground items, stacks, look-at: examine (`0x8C`/`0x8D`) with TFS-faithful item text (name/article/plural/description/weight) + real OTBM stack counts + creature look; GM debug (item id + position). Static item rendering already shipped in M4/M6.1 | ✅ done |
-| M10 | Inventory & equipment: move, equip, containers, use | ⬜ |
+| M10 | Inventory & equipment — split into a dependency chain (M10.1/M10.2/M10.3), like M6.1/M7.1 | 🔄 |
+| M10.1 | Ground items dynamic + move-thing: mutable per-tile overlay (copy-on-write) + `0x78` ground→ground move, stack merge/split, faithful throw-range + line-of-sight (`canThrowObjectTo`/`isSightClear`), spectator broadcast (`0x6A`/`0x6B` item forms, `0x6C` remove). Moved item renders on top (TFS front-insert into the down-items) | ✅ done |
+| M10.2 | Inventory & equipment slots: equip/unequip, pickup/drop (ground↔inventory), weight/cap enforcement, persist inventory | ⬜ |
+| M10.3 | Containers (backpack): open/close + nested + move in/out, plus use-to-open (`0x82` use opens a container). Rest of `use` (levers/keys/runes/potions) → M11/Lua | ⬜ |
 | **C** | **Scripting** | |
 | M11 | Lua runtime (mlua): hot-reloadable content hooks (onUse/onStepIn/onSay/…). Includes use-driven floor changes (M6.2: ladders/holes via `teleport.lua` `onUse`) — see `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⬜ |
 | **D** | **PvE → pre-alpha #2** | |
@@ -327,6 +330,60 @@ the item id + position lines.
 **Deferred:** look in inventory/containers (M10), trade/shop (M16); action/unique/
 decay/transform IDs + writable book text in GM debug; rune/weapon/armor stat lines;
 real level/vocation/mana/party/IP; dynamic ground items + runtime stack counts (M10).
+
+## M10.1 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-07-m10.1-ground-items-move-design.md`,
+`docs/superpowers/plans/2026-06-07-m10.1-ground-items-move.md`. Scope: **the mutable
+item foundation** — make the per-tile stack mutable at runtime and move items
+ground→ground via `0x78`, with stack merge/split, faithful throw-range + line of
+sight, and live spectator broadcast. First slice of the M10 chain (M10.2 inventory,
+M10.3 containers). Built spike-first (implement → live-validate → tests) via
+subagent-driven TDD-free execution.
+
+1. ✅ `formats::otb` — `is_moveable()` (`FLAG_MOVEABLE` 1<<6) + `is_block_projectile()`
+   (1<<1); `world::map` precomputes a `block_projectile` tile set at load (alongside
+   `blocked`).
+2. ✅ `world` — **copy-on-write overlay**: `Game.dynamic: HashMap<pos, TileStack>`
+   (sparse, materialise-on-first-touch) + a `MergedTiles` view implementing the
+   existing `TileSource` trait (overlay-first, fall back to `StaticMap`), so the M3
+   map encoder is untouched. `StaticMap` stays immutable.
+3. ✅ `protocol` — `move_thing::parse_throw` (inbound `0x78`); `tile_item::add_tile_item`
+   (`0x6A`) / `update_tile_item` (`0x6B`) item forms (`0x6C` remove reuses M5's
+   `remove_tile_thing`).
+4. ✅ `world::map` — faithful `canThrowObjectTo` + `isSightClear` (Bresenham LOS,
+   arg-swap + epsilon ported line-for-line from TFS `map.cpp`).
+5. ✅ `world::game` — `do_move_thing`: reach (Chebyshev ≤1 of source, same floor; no
+   auto-walk) + throw/LOS validation + moveable gate; remove/split at source; merge
+   same-type stackables (cap 100, overflow spills) or insert a new down item at the
+   **front** of the down-items (newest on top, TFS `getBeginDownItem`); broadcast
+   `0x6A`/`0x6B`/`0x6C` to spectators. Reads item flags from an extended `ItemMeta`.
+6. ✅ `server::game_service` — dispatch `0x78` → `world.move_thing`.
+
+Gate: `cargo test` green (workspace), `cargo clippy --all-targets -- -D warnings`
+clean, `#![forbid(unsafe_code)]` intact.
+
+**Review caught (fixed pre/post live):** item **duplication** when the requested
+count exceeded the available stack (clamp `moved = count.min(available)`); a **silent
+merge-spill** (an overflow >100 created a new stack that was never broadcast — now
+emits a second `0x6A`); a missing `from == to` no-op guard; spill `u8` truncation.
+
+**Live acceptance — ✅ ACCEPTED (2026-06-07):** real OTClient — drag a movable ground
+item to another tile; merge gold onto gold; split a stack; a non-movable item refuses
+to move; line-of-sight blocks a throw through a wall; a second client sees every change
+live. **Stacking-order bug found in live test and fixed:** a moved item now inserts at
+the front of the down-items so it renders **on top** of the pre-existing item (was
+appending → rendered underneath), matching TFS.
+
+**Known limitation (deferred):** the enter-world login burst encodes from the static
+map, not the overlay — a player logging in after an item moved mid-session won't see
+that change on their initial screen until they walk (walk slices use `MergedTiles`).
+Dynamic ground items reset on restart (TFS doesn't persist them either). LOS reads the
+static `block_projectile` set (movable items aren't sight-blocking, so it's authoritative).
+
+**Deferred to the rest of the M10 chain / later:** inventory/container `0x78` endpoints,
+pickup/drop, weight/cap (M10.2); containers + use-to-open (M10.3); `use` content
+(levers/keys/runes) → M11/Lua; item decay; persistence of dynamic ground items.
 
 ## M6.1 plan
 
