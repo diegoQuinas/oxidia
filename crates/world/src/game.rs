@@ -677,6 +677,17 @@ impl Game {
                 Some(p) => (p.position, p.last_attack_ms, p.fist_skill),
                 None => continue,
             };
+            // W3 fix: TFS clears the fight the moment EITHER party is in a PZ
+            // (`canTargetCreature` combat.cpp:221-229; `onAttackedCreatureChangeZone`
+            // player.cpp:1153). A victim who fled into the temple must stop taking
+            // hits on the very next tick — clearing `attacking` (not just skipping
+            // the swing) so the attacker also gets their combat state cleared.
+            if self.map.is_protection_zone(attacker_pos)
+                || self.map.is_protection_zone(target_pos)
+            {
+                if let Some(p) = self.players.get_mut(&attacker_id) { p.attacking = None; }
+                continue;
+            }
             // Interval check.
             if now_ms.saturating_sub(last_attack) < MELEE_ATTACK_INTERVAL_MS {
                 continue;
