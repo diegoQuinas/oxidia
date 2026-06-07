@@ -58,10 +58,13 @@ impl Game {
         Game { map, players: HashMap::new(), next_id: 0x1000_0000 }
     }
 
-    /// Can a viewer at `viewer` see tile `target`? Client viewport ±8x / ±6y,
-    /// same floor (Map::maxClientViewportX/Y). Multi-floor band is deferred.
+    /// Can a viewer at `viewer` see tile `target`? Client viewport ±8x / ±6y.
+    /// Overground (z <= 7) is strictly same-floor; underground (z >= 8) spans the
+    /// `±2` floor band (TFS underground viewport z rule).
     fn can_see(viewer: Position, target: Position) -> bool {
-        viewer.z == target.z
+        let dz = i32::from(viewer.z) - i32::from(target.z);
+        let z_ok = if viewer.z <= 7 { dz == 0 } else { dz.abs() <= 2 };
+        z_ok
             && (i32::from(viewer.x) - i32::from(target.x)).abs() <= 8
             && (i32::from(viewer.y) - i32::from(target.y)).abs() <= 6
     }
@@ -703,5 +706,20 @@ mod tests {
             ack_b.snapshot.position,
             "co-logins must not share a tile"
         );
+    }
+
+    #[test]
+    fn underground_spectator_sees_within_two_floors() {
+        // viewer underground at z=9; targets at z=6 (out, >2) and z=11 (in, =2).
+        assert!(!Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 6)), "3 floors below: out");
+        assert!(Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 11)), "2 floors below: in");
+        assert!(Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 7)), "2 floors above: in");
+    }
+
+    #[test]
+    fn overground_visibility_unchanged() {
+        // Overground stays strictly same-floor (matches M5).
+        assert!(Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 7)));
+        assert!(!Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 6)));
     }
 }
