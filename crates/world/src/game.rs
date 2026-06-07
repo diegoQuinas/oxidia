@@ -138,6 +138,9 @@ struct PlayerState {
 
 struct Game {
     map: Arc<StaticMap>,
+    /// Copy-on-write overlay of runtime-modified tile stacks (M10.1). Empty until
+    /// the first item move; reads fall back to `map` for untouched tiles.
+    dynamic: std::collections::HashMap<(u16, u16, u8), crate::map::TileStack>,
     players: HashMap<u32, PlayerState>,
     next_id: u32,
     next_statement_id: u32,
@@ -153,6 +156,7 @@ impl Game {
     fn new(map: Arc<StaticMap>) -> Self {
         Game {
             map,
+            dynamic: std::collections::HashMap::new(),
             players: HashMap::new(),
             next_id: 0x1000_0000,
             next_statement_id: 1,
@@ -167,11 +171,31 @@ impl Game {
     fn new_seeded(map: Arc<StaticMap>, seed: u64) -> Self {
         Game {
             map,
+            dynamic: std::collections::HashMap::new(),
             players: HashMap::new(),
             next_id: 0x1000_0000,
             next_statement_id: 1,
             rng: StdRng::seed_from_u64(seed),
             save_tx: None,
+        }
+    }
+
+    /// A merged read view (overlay + static) for the map encoder.
+    fn merged(&self) -> crate::map::MergedTiles<'_> {
+        crate::map::MergedTiles { base: self.map.as_ref(), dynamic: &self.dynamic }
+    }
+
+    /// Ensure `pos` has a dynamic (owned, mutable) stack, cloning the static one
+    /// on first touch. Returns `false` if the tile has no stack at all.
+    #[allow(dead_code)] // used by do_move_thing (M10.1 Task 5)
+    fn materialize(&mut self, pos: Position) -> bool {
+        let key = (pos.x, pos.y, pos.z);
+        if self.dynamic.contains_key(&key) {
+            return true;
+        }
+        match self.map.tile_stack_clone(pos) {
+            Some(st) => { self.dynamic.insert(key, st); true }
+            None => false,
         }
     }
 
@@ -1182,13 +1206,16 @@ impl Game {
                 wire_creatures.push(PlacedCreature { x: to.x, y: to.y, z: to.z, bytes });
             }
         }
-        let pkt = walk::walk_update(
-            id,
-            (from.x, from.y, from.z),
-            (to.x, to.y, to.z),
-            self.map.as_ref(),
-            &wire_creatures,
-        );
+        let pkt = {
+            let merged = self.merged();
+            walk::walk_update(
+                id,
+                (from.x, from.y, from.z),
+                (to.x, to.y, to.z),
+                &merged,
+                &wire_creatures,
+            )
+        };
         tracing::debug!(
             id, pkt_len = pkt.len(),
             others = others_count,

@@ -35,16 +35,17 @@ pub struct ItemMeta {
 }
 
 /// Wire-ordered items for one tile, split around the creature slot.
-struct TileStack {
+#[derive(Clone)]
+pub(crate) struct TileStack {
     /// `[ground, ...top items (by top_order), ...down items]`, capped at 10.
-    items: Vec<WireItem>,
+    pub(crate) items: Vec<WireItem>,
     /// Server ids parallel to `items` (same order/length) for look-at metadata.
-    server_ids: Vec<u16>,
+    pub(crate) server_ids: Vec<u16>,
     /// OTBM stack counts parallel to `items` (None when unspecified). Drives the
     /// look-at text ("You see 50 gold coins.") for stackable items.
-    counts: Vec<Option<u8>>,
+    pub(crate) counts: Vec<Option<u8>>,
     /// `items[..pre_creature_len]` render below a creature (ground + top items).
-    pre_creature_len: usize,
+    pub(crate) pre_creature_len: usize,
 }
 
 /// Resolve an `items.otb` entry + its OTBM stack count into the wire form,
@@ -338,7 +339,7 @@ impl StaticMap {
 
 impl StaticMap {
     /// Bounds-check a world coordinate down to a `(u16, u16, u8)` tile key.
-    fn key(x: i32, y: i32, z: i32) -> Option<(u16, u16, u8)> {
+    pub(crate) fn key(x: i32, y: i32, z: i32) -> Option<(u16, u16, u8)> {
         if !(0..=i32::from(u16::MAX)).contains(&x)
             || !(0..=i32::from(u16::MAX)).contains(&y)
             || !(0..=i32::from(u8::MAX)).contains(&z)
@@ -346,6 +347,13 @@ impl StaticMap {
             return None;
         }
         Some((x as u16, y as u16, z as u8))
+    }
+
+    /// Snapshot a tile's full stack for the copy-on-write overlay. `None` if the
+    /// tile has no entry (no ground).
+    #[allow(dead_code)] // used by materialize (M10.1 Task 5)
+    pub(crate) fn tile_stack_clone(&self, pos: Position) -> Option<TileStack> {
+        self.tiles.get(&(pos.x, pos.y, pos.z)).cloned()
     }
 }
 
@@ -363,6 +371,36 @@ impl TileSource for StaticMap {
         Self::key(x, y, z)
             .and_then(|k| self.tiles.get(&k))
             .map_or(1, |st| st.pre_creature_len as u8)
+    }
+}
+
+/// A read view over the immutable `StaticMap` plus the actor's runtime overlay.
+/// Tile reads check the overlay first (a materialised dynamic stack), then fall
+/// back to the static map. Passed to the map encoder in place of `&StaticMap`.
+pub(crate) struct MergedTiles<'a> {
+    pub(crate) base: &'a StaticMap,
+    pub(crate) dynamic: &'a std::collections::HashMap<(u16, u16, u8), TileStack>,
+}
+
+impl TileSource for MergedTiles<'_> {
+    fn tile(&self, x: i32, y: i32, z: i32) -> Option<TileSlices<'_>> {
+        let key = StaticMap::key(x, y, z)?;
+        if let Some(st) = self.dynamic.get(&key) {
+            return Some(TileSlices {
+                pre_creature: &st.items[..st.pre_creature_len],
+                post_creature: &st.items[st.pre_creature_len..],
+            });
+        }
+        self.base.tile(x, y, z)
+    }
+
+    fn creature_stackpos(&self, x: i32, y: i32, z: i32) -> u8 {
+        if let Some(key) = StaticMap::key(x, y, z) {
+            if let Some(st) = self.dynamic.get(&key) {
+                return st.pre_creature_len as u8;
+            }
+        }
+        self.base.creature_stackpos(x, y, z)
     }
 }
 
