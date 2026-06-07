@@ -52,6 +52,7 @@ fn player_save_to_initial(save: &PlayerSave) -> InitialState {
         health: save.health,
         max_health: save.health_max,
         gamemaster: false,
+        inventory: Vec::new(),
     }
 }
 
@@ -228,6 +229,7 @@ where
             health: 150,
             max_health: 150,
             gamemaster: false,
+            inventory: Vec::new(),
         },
     };
     let mut initial = initial;
@@ -785,6 +787,7 @@ mod tests {
             health: 80,
             max_health: 160,
             sex: 0, // female
+            inventory: Vec::new(),
         };
         let save = save_record_to_player_save(&rec);
         assert_eq!(save.name, "Hero");

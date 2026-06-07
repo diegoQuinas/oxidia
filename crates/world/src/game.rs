@@ -92,6 +92,9 @@ pub struct InitialState {
     pub sex: u8,
     /// `true` if the session authenticated as a gamemaster (look-at debug info).
     pub gamemaster: bool,
+    /// Equipped items to restore: `(slot 1..=10, server_id, count)`. Empty for
+    /// new characters. The world resolves each `server_id` via the item catalog.
+    pub inventory: Vec<(u8, u16, u8)>,
 }
 
 /// Emitted on the save channel the instant a player leaves the game.
@@ -107,6 +110,8 @@ pub struct SaveRecord {
     pub max_health: u16,
     /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
     pub sex: u8,
+    /// Equipped items at logout: `(slot 1..=10, server_id, count)`.
+    pub inventory: Vec<(u8, u16, u8)>,
 }
 
 /// One equipped item, with the cached wire fields needed to re-send `0x78`.
@@ -422,13 +427,24 @@ impl Game {
         // Existing in-range players, before inserting self.
         let others_ids = self.spectators(position, id);
 
+        let mut inventory: [Option<InvItem>; 10] = [None; 10];
+        for &(slot, server_id, count) in &initial.inventory {
+            if !(1..=10).contains(&slot) { continue; }
+            if let Some(meta) = self.map.item_meta(server_id) {
+                let cnt = if meta.stackable { Some(count.max(1)) } else { None };
+                inventory[(slot - 1) as usize] = Some(InvItem {
+                    server_id, client_id: meta.client_id, count: cnt, animated: meta.animated,
+                });
+            }
+        }
+
         self.players.insert(id, PlayerState {
             name, position, direction, outfit, push_tx, known: HashSet::new(),
             health: initial.health, max_health: initial.max_health, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
             sex: initial.sex,
             gamemaster: initial.gamemaster,
-            inventory: [None; 10],
+            inventory,
         });
 
         // Render each existing player into the new client's enter-world map, and
@@ -466,6 +482,9 @@ impl Game {
         let Some(p) = self.players.remove(&id) else { return };
         // Emit save record BEFORE broadcasting the removal, while `p` is owned.
         if let Some(tx) = &self.save_tx {
+            let inventory: Vec<(u8, u16, u8)> = p.inventory.iter().enumerate()
+                .filter_map(|(i, slot)| slot.map(|it| ((i + 1) as u8, it.server_id, it.count.unwrap_or(1))))
+                .collect();
             let rec = SaveRecord {
                 name: p.name.clone(),
                 position: p.position,
@@ -474,6 +493,7 @@ impl Game {
                 health: p.health,
                 max_health: p.max_health,
                 sex: p.sex,
+                inventory,
             };
             // Unbounded send never blocks; error only if the worker is gone
             // (server shutting down) — silently drop in that case.
@@ -1326,6 +1346,9 @@ impl Game {
                 health: p.max_health,
                 max_health: p.max_health,
                 sex: p.sex,
+                inventory: p.inventory.iter().enumerate()
+                    .filter_map(|(i, slot)| slot.map(|it| ((i + 1) as u8, it.server_id, it.count.unwrap_or(1))))
+                    .collect(),
             });
         }
 
@@ -1957,6 +1980,7 @@ mod tests {
             max_health: 150,
             sex: 1, // male (default)
             gamemaster: false,
+            inventory: Vec::new(),
         }
     }
 
@@ -2186,6 +2210,7 @@ mod tests {
             max_health: 150,
             sex: 1,
             gamemaster: false,
+            inventory: Vec::new(),
         };
         let ack = g.login("Returning".into(), initial, tx);
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
@@ -3561,6 +3586,7 @@ mod tests {
             max_health: 120,
             sex: 1,
             gamemaster: false,
+            inventory: Vec::new(),
         };
         let ack = g.login("Restored".into(), initial, tx);
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
@@ -3587,6 +3613,7 @@ mod tests {
             max_health: 150,
             sex: 1,
             gamemaster: false,
+            inventory: Vec::new(),
         };
         let ack = g.login("NewPlayer".into(), initial, tx);
         assert_eq!(
@@ -3814,6 +3841,7 @@ mod tests {
             max_health: 150,
             sex: 0, // female
             gamemaster: false,
+            inventory: Vec::new(),
         };
         let ack = g.login("Tester".into(), initial, tx);
         assert_eq!(
@@ -3837,6 +3865,7 @@ mod tests {
             max_health: 150,
             sex: 0, // female
             gamemaster: false,
+            inventory: Vec::new(),
         };
         let ack = g.login("Tester".into(), initial, tx);
         let id = ack.snapshot.id;
