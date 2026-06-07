@@ -225,15 +225,76 @@ impl Game {
         }
     }
 
+    /// Resolve the true destination of a step, applying the two TFS vertical
+    /// mechanics. `diagonal` steps skip height resolution (TFS guards with
+    /// `!diagonalMovement`). Returns the final position to validate.
+    fn resolve_vertical(&self, from: Position, dest: Position, diagonal: bool) -> Position {
+        let mut dest = dest;
+        if !diagonal {
+            // Mechanic A - up: standing on a raised tile, step onto the floor above.
+            if from.z != 8 && self.map.triggers_up(from) {
+                let above_open = match from.offset_z(-1) {
+                    Some(a) => !self.map.has_ground(a) && !self.map.is_blocked(a),
+                    None => true,
+                };
+                if above_open {
+                    if let Some(da) = dest.offset_z(-1) {
+                        if self.map.has_ground(da)
+                            && self.map.floor_change_at(
+                                i32::from(da.x), i32::from(da.y), i32::from(da.z),
+                            ).is_empty()
+                        {
+                            dest = da;
+                        }
+                    }
+                }
+            }
+            // Mechanic A - down: stepping into a void above a raised lower tile.
+            if from.z != 7 && from.z == dest.z {
+                let dest_void = !self.map.has_ground(dest) && !self.map.is_blocked(dest);
+                if dest_void {
+                    if let Some(db) = dest.offset_z(1) {
+                        if self.map.triggers_up(db) {
+                            dest = db;
+                        }
+                    }
+                }
+            }
+        }
+        // Mechanic B - floorChange staircase tile (queryDestination).
+        if let Some(landing) = self.map.resolve_floor_change(dest) {
+            dest = landing;
+        }
+        dest
+    }
+
     fn do_move(&mut self, id: u32, direction: Direction) {
         let (from, cur_dir) = match self.players.get(&id) {
             Some(p) => (p.position, p.direction),
             None => return,
         };
         let (dx, dy) = direction.delta();
+        let diagonal = matches!(
+            direction,
+            Direction::NorthEast | Direction::SouthEast | Direction::SouthWest | Direction::NorthWest
+        );
         let dest = from
             .offset(dx, dy)
-            .filter(|&d| self.map.is_walkable(d) && !self.tile_occupied(d, id));
+            .map(|d| self.resolve_vertical(from, d, diagonal))
+            .filter(|&d| {
+                // A vertical landing (stair/height redirect) is reached with TFS
+                // FLAG_NOLIMIT (tile.cpp:817) / FLAG_IGNOREBLOCKITEM
+                // (game.cpp:799), so block-solid items on the landing are ignored;
+                // it only needs to be a real tile. Same-floor steps keep the full
+                // walkability check. The creature-occupancy check stays in both
+                // cases to preserve the M5 one-creature-per-tile stackpos invariant.
+                let reachable = if d.z != from.z {
+                    self.map.has_ground(d)
+                } else {
+                    self.map.is_walkable(d)
+                };
+                reachable && !self.tile_occupied(d, id)
+            });
 
         let Some(to) = dest else {
             // Blocked: keep the original facing and snap the mover back;
@@ -364,6 +425,112 @@ mod tests {
     use crate::map::StaticMap;
     use formats::otb::{ItemType, ItemsOtb};
     use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
+
+    fn stair_map() -> Arc<StaticMap> {
+        use formats::items_xml::FloorChange;
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                ItemType { group: 5, flags: 0, server_id: 300, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::DOWN },
+            ],
+        };
+        let g = |x, y, z| MapTile { x, y, z, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }] };
+        let stair = |x, y, z| MapTile { x, y, z, flags: 0, house_id: None,
+            items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 300, contents: vec![] }] };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                g(100, 100, 7),          // spawn
+                stair(101, 100, 7),      // step east onto this -> floorchange down
+                g(101, 100, 8),          // landing one floor below
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        Arc::new(StaticMap::from_formats(&map, &items))
+    }
+
+    #[test]
+    fn walking_onto_a_down_stair_drops_a_floor() {
+        let mut g = Game::new(stair_map());
+        let (mover, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.do_move(mover, Direction::East); // 100,100,7 -> stair 101,100,7 -> land 101,100,8
+        assert_eq!(g.players.get(&mover).unwrap().position, Position::new(101, 100, 8));
+        // The mover's own client gets a floor-change-down packet (0xBF present).
+        let pkt = rx.try_recv().expect("mover gets a packet");
+        assert!(pkt.contains(&protocol::walk::OP_FLOOR_CHANGE_DOWN));
+    }
+
+    #[test]
+    fn down_stair_lands_even_when_landing_is_block_solid() {
+        // TFS sets FLAG_NOLIMIT on a stair landing (tile.cpp:817), so a
+        // block-solid item on the landing tile does NOT cancel the descent.
+        use formats::items_xml::FloorChange;
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                ItemType { group: 5, flags: 0, server_id: 300, client_id: 2, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::DOWN },
+                ItemType { group: 5, flags: 1 << 0, server_id: 200, client_id: 3, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            ],
+        };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }] },
+                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 300, contents: vec![] }] },
+                // landing one floor below carries a block-solid item
+                MapTile { x: 101, y: 100, z: 8, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 200, contents: vec![] }] },
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        let sm = Arc::new(StaticMap::from_formats(&map, &items));
+        let mut g = Game::new(sm);
+        let (mover, _rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.do_move(mover, Direction::East);
+        assert_eq!(g.players.get(&mover).unwrap().position, Position::new(101, 100, 8));
+    }
+
+    #[test]
+    fn walking_off_a_raised_tile_climbs_a_floor() {
+        // Mechanic A (height slopes): standing on a height>=3 tile with an open
+        // tile above, stepping toward a tile whose floor-above has ground climbs
+        // up one floor (TFS game.cpp:792-807).
+        use formats::items_xml::FloorChange;
+        let h = |sid| ItemType { group: 5, flags: 1 << 3, server_id: sid, client_id: sid, always_on_top: false, top_order: 0, has_height: true, floor_change: FloorChange::NONE };
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                h(301),
+            ],
+        };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                // raised tile on z=9: ground + 3 height items -> triggers_up
+                MapTile { x: 100, y: 100, z: 9, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 301, contents: vec![] }, MapItem { id: 301, contents: vec![] }, MapItem { id: 301, contents: vec![] }] },
+                // floor above the eastern destination has ground -> climb target
+                MapTile { x: 101, y: 100, z: 8, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }] },
+                // (100,100,8) intentionally absent so the tile above current is open
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 9 }],
+            waypoints: vec![],
+        };
+        let sm = Arc::new(StaticMap::from_formats(&map, &items));
+        let mut g = Game::new(sm);
+        let (mover, mut rx) = add_player(&mut g, Position::new(100, 100, 9));
+        g.do_move(mover, Direction::East); // raised z=9 -> climb to 101,100,8
+        assert_eq!(g.players.get(&mover).unwrap().position, Position::new(101, 100, 8));
+        let pkt = rx.try_recv().expect("mover gets a packet");
+        assert!(pkt.contains(&protocol::walk::OP_FLOOR_CHANGE_UP));
+    }
 
     fn walk_map() -> Arc<StaticMap> {
         let items = ItemsOtb {

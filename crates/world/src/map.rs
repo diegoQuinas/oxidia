@@ -138,6 +138,16 @@ impl StaticMap {
             && !self.blocked.contains(&(pos.x, pos.y, pos.z))
     }
 
+    /// Does this tile have a ground item (is it a real, steppable tile)?
+    pub fn has_ground(&self, pos: Position) -> bool {
+        self.tiles.contains_key(&(pos.x, pos.y, pos.z))
+    }
+
+    /// Is this tile flagged block-solid?
+    pub fn is_blocked(&self, pos: Position) -> bool {
+        self.blocked.contains(&(pos.x, pos.y, pos.z))
+    }
+
     /// Floor-change flags on a tile (NONE if absent / out of range).
     pub fn floor_change_at(&self, x: i32, y: i32, z: i32) -> FloorChange {
         Self::key(x, y, z)

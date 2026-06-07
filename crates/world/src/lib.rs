@@ -35,6 +35,17 @@ impl Position {
             None
         }
     }
+
+    /// Shift floor by `dz` (negative = up toward the surface). `None` if it
+    /// leaves the `u8` floor range.
+    pub fn offset_z(self, dz: i32) -> Option<Position> {
+        let z = i32::from(self.z) + dz;
+        if (0..=i32::from(u8::MAX)).contains(&z) {
+            Some(Position::new(self.x, self.y, z as u8))
+        } else {
+            None
+        }
+    }
 }
 
 /// A facing/movement direction. Wire bytes match TFS `Direction` (`position.h`).
