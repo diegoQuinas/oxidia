@@ -536,9 +536,10 @@ impl Game {
         };
         self.push(victim_id, stats);
         // Push a physical-hit magic effect on the victim's tile to all spectators.
-        // CONST_ME_DRAWBLOOD = 2 in TFS — the blood-drip hit animation.
-        const EFFECT_DRAWBLOOD: u8 = 2;
-        let effect = enter_world::magic_effect(victim_pos.x, victim_pos.y, victim_pos.z, EFFECT_DRAWBLOOD);
+        // CONST_ME_DRAWBLOOD = 1 in TFS (const.h); wire = TFS enum − 1 = 0.
+        // See enter_world::EFFECT_DRAWBLOOD; same convention as EFFECT_TELEPORT.
+        let effect = enter_world::magic_effect(
+            victim_pos.x, victim_pos.y, victim_pos.z, enter_world::EFFECT_DRAWBLOOD);
         for sid in &spectators {
             self.push(*sid, effect.clone());
         }

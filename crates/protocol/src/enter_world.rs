@@ -20,7 +20,10 @@ pub const OP_MAGIC_EFFECT: u8 = 0x83;
 pub const OP_EXTENDED: u8 = 0x32;
 
 pub const INVENTORY_SLOTS: u8 = 11;
-pub const EFFECT_TELEPORT: u8 = 10; // CONST_ME_TELEPORT
+/// TFS `CONST_ME_TELEPORT = 11` (const.h); wire value = TFS enum − 1.
+pub const EFFECT_TELEPORT: u8 = 10;
+/// TFS `CONST_ME_DRAWBLOOD = 1` (const.h); wire value = TFS enum − 1.
+pub const EFFECT_DRAWBLOOD: u8 = 0;
 
 /// Variable stats the client renders; the rest are M3 constants baked in.
 #[derive(Debug, Clone, Copy)]
