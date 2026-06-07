@@ -9,6 +9,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
+    pub world: WorldConfig,
     pub network: NetworkConfig,
     pub database: DatabaseConfig,
     pub log: LogConfig,
@@ -19,6 +20,17 @@ pub struct ServerConfig {
     pub world_name: String,
     pub host: String,
     pub motd: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorldConfig {
+    /// Path to the `.otbm` map file, relative to the working directory or
+    /// absolute. The server refuses to start if it is missing or fails to parse.
+    pub map_path: String,
+    /// Name of the town whose temple players spawn at. When absent or unknown,
+    /// the world falls back to the map's first town.
+    #[serde(default)]
+    pub spawn_town: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +84,10 @@ mod tests {
         host = "127.0.0.1"
         motd = "Welcome to Rusted"
 
+        [world]
+        map_path = "reference/tfs/data/world/map.otbm"
+        spawn_town = "Ab'Dendriel"
+
         [network]
         login_port = 7171
         game_port = 7172
@@ -92,7 +108,19 @@ mod tests {
         assert_eq!(cfg.network.game_port, 7172);
         assert_eq!(cfg.login_addr().to_string(), "0.0.0.0:7171");
         assert_eq!(cfg.game_addr().to_string(), "0.0.0.0:7172");
-        assert_eq!(cfg.server.motd, "Welcome to Rusted")
+        assert_eq!(cfg.server.motd, "Welcome to Rusted");
+        assert_eq!(cfg.world.map_path, "reference/tfs/data/world/map.otbm");
+        assert_eq!(cfg.world.spawn_town.as_deref(), Some("Ab'Dendriel"));
+    }
+
+    #[test]
+    fn rejects_world_without_map_path() {
+        let cfg = Config::from_toml(
+            "[server]\nworld_name=\"x\"\nhost=\"y\"\nmotd=\"z\"\n[world]\n\
+             [network]\nlogin_port=1\ngame_port=2\nbind=\"0.0.0.0\"\n\
+             [database]\npath=\"d\"\n[log]\nfilter=\"info\"\n",
+        );
+        assert!(cfg.is_err(), "config without [world].map_path must fail");
     }
 
     #[test]

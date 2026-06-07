@@ -6,8 +6,16 @@ world_name = "Oxidia"
 # client can actually reach (127.0.0.1 for local play, or the LAN/public IP for
 # remote clients) — NOT a bind wildcard like 0.0.0.0. The interface the server
 # listens on is configured separately via [network].bind.
-host = "127.0.0.1"
+host = "10.149.129.185"
 motd = "Welcome to Oxidia"
+
+[world]
+# Path to the .otbm map, relative to the working directory or absolute.
+# The server refuses to start if this file is missing or fails to parse.
+map_path = "reference/tfs/data/world/map.otbm"
+# Town whose temple players spawn at. Falls back to the map's first town if unset
+# or unknown. The 1098 real map ships Ab'Dendriel at temple (32732, 31634, 7).
+spawn_town = "Ab'Dendriel"
 
 [network]
 # Login protocol (7171) and game protocol (7172).
