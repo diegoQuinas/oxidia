@@ -1240,14 +1240,68 @@ impl Game {
         let mut parts = line.split_whitespace();
         let Some(verb) = parts.next() else { return };
         let args: Vec<&str> = parts.collect();
-        let _ = &args; // used by subcommands added in Tasks 3–5
         match verb {
-            // real subcommands are added in Tasks 3–5
+            "item" => self.gm_item(id, &args),
+            // real subcommands are added in Tasks 4–5
             other => self.push_status_message(
                 id,
                 format!("Unknown command: /{other}").as_bytes(),
             ),
         }
+    }
+
+    /// `/item <server_id> [count]` — spawn an item on the GM's own tile.
+    fn gm_item(&mut self, id: u32, args: &[&str]) {
+        let Some(server_id) = args.first().and_then(|s| s.parse::<u16>().ok()) else {
+            self.push_status_message(id, b"Usage: /item <id> [count]");
+            return;
+        };
+        let count = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
+        let Some(pos) = self.players.get(&id).map(|p| p.position) else { return };
+        self.do_spawn_item(id, pos, server_id, count);
+    }
+
+    /// Place a fresh item on `pos` and broadcast a `0x6A` add to spectators.
+    /// Mirrors the destination half of `do_move_thing`: materialize the tile,
+    /// insert at the front of the down-items (newest on top), broadcast at the
+    /// top down-item stackpos. Replies to `gm_id` on success or failure.
+    fn do_spawn_item(&mut self, gm_id: u32, pos: Position, server_id: u16, count: u16) {
+        let Some(meta) = self.map.item_meta(server_id) else {
+            self.push_status_message(gm_id, format!("Unknown item id {server_id}.").as_bytes());
+            return;
+        };
+        let client_id = meta.client_id;
+        let animated = meta.animated;
+        let stackable = meta.stackable;
+
+        if !self.materialize(pos) {
+            self.push_status_message(gm_id, b"You cannot create an item there.");
+            return;
+        }
+        // TFS 10-thing-per-tile cap.
+        let len = self.dynamic.get(&(pos.x, pos.y, pos.z)).map(|st| st.items.len()).unwrap_or(0);
+        if len >= 10 {
+            self.push_status_message(gm_id, b"This tile is full.");
+            return;
+        }
+
+        let subtype = if stackable { Some(count.clamp(1, 100) as u8) } else { None };
+        let wi = WireItem { client_id, subtype, animated };
+
+        // creatures_on borrows &self immutably; compute before the &mut get_mut.
+        let dest_creatures = self.creatures_on(pos).len();
+        {
+            let st = self.dynamic.get_mut(&(pos.x, pos.y, pos.z)).unwrap();
+            let front = st.pre_creature_len; // first down-item slot
+            st.items.insert(front, wi);
+            st.server_ids.insert(front, server_id);
+            st.counts.insert(front, subtype);
+        }
+        let front = self.dynamic.get(&(pos.x, pos.y, pos.z)).map(|st| st.pre_creature_len).unwrap_or(0);
+        let dest_s = (front + dest_creatures).min(9) as u8;
+        self.broadcast_dest(pos, dest_s, wi, false);
+
+        self.push_status_message(gm_id, format!("Created item {server_id}.").as_bytes());
     }
 
     /// Apply `dmg` hit points of damage to `victim_id`, dealt by `attacker_id`.
