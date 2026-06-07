@@ -2532,6 +2532,50 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_args_groups_quoted_segments() {
+        assert_eq!(tokenize_args("crystal coin 100"), ["crystal", "coin", "100"]);
+        assert_eq!(tokenize_args("\"Gold Coin\" 100"), ["Gold Coin", "100"]);
+        assert_eq!(tokenize_args("   spaced   out   "), ["spaced", "out"]);
+        assert_eq!(tokenize_args("\"unterminated"), ["unterminated"]); // quote to end of input
+        assert!(tokenize_args("").is_empty());
+    }
+
+    #[test]
+    fn parse_pos_reads_three_coords() {
+        assert_eq!(parse_pos(&["100", "200", "7"]), Some(Position::new(100, 200, 7)));
+        assert_eq!(parse_pos(&["100", "200"]), None); // too few
+        assert_eq!(parse_pos(&["x", "200", "7"]), None); // non-numeric
+        assert_eq!(parse_pos(&[]), None);
+    }
+
+    #[test]
+    fn find_player_by_name_is_case_insensitive() {
+        let mut g = Game::new(stair_map());
+        let (id, _rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.players.get_mut(&id).unwrap().name = "God Diego".into();
+        assert_eq!(g.find_player_by_name("god diego"), Some(id));
+        assert_eq!(g.find_player_by_name("GOD DIEGO"), Some(id));
+        assert_eq!(g.find_player_by_name("nobody"), None);
+    }
+
+    #[test]
+    fn gmverb_registry_is_complete_and_resolvable() {
+        // The enum is the single source of truth: every command must declare help
+        // text and every word must resolve back to its variant.
+        for &cmd in GmVerb::ALL {
+            assert!(!cmd.usage().is_empty(), "a GmVerb is missing its usage");
+            assert!(!cmd.description().is_empty(), "a GmVerb is missing its description");
+            assert!(!cmd.words().is_empty(), "a GmVerb is missing its words");
+            for w in cmd.words() {
+                assert!(GmVerb::from_word(w).is_some(), "from_word does not resolve '{w}'");
+            }
+        }
+        assert!(matches!(GmVerb::from_word("i"), Some(GmVerb::Item))); // alias
+        assert!(matches!(GmVerb::from_word("item"), Some(GmVerb::Item)));
+        assert!(GmVerb::from_word("nonsense").is_none());
+    }
+
+    #[test]
     fn spectators_within_client_viewport() {
         let mut g = Game::new(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(100, 100, 7));

@@ -701,6 +701,44 @@ mod tests {
     }
 
     #[test]
+    fn find_item_id_by_name_matches_name_and_derived_plural() {
+        let (map, items) = tiny_map();
+        let mut sm = StaticMap::from_formats(&map, &items);
+        sm.item_meta.insert(2160, ItemMeta {
+            name: "crystal coin".into(), show_count: true, stackable: true,
+            client_id: 1, ..Default::default()
+        });
+        sm.item_meta.insert(2152, ItemMeta {
+            name: "platinum coin".into(), client_id: 2, ..Default::default()
+        });
+        assert_eq!(sm.find_item_id_by_name("crystal coin"), Some(2160));
+        assert_eq!(sm.find_item_id_by_name("CRYSTAL COIN"), Some(2160)); // case-insensitive
+        assert_eq!(sm.find_item_id_by_name("crystal coins"), Some(2160)); // derived plural
+        assert_eq!(sm.find_item_id_by_name("platinum coin"), Some(2152));
+        assert_eq!(sm.find_item_id_by_name("nonexistent"), None);
+    }
+
+    #[test]
+    fn find_item_id_by_name_breaks_ties_on_lowest_id() {
+        let (map, items) = tiny_map();
+        let mut sm = StaticMap::from_formats(&map, &items);
+        sm.item_meta.insert(500, ItemMeta { name: "door".into(), ..Default::default() });
+        sm.item_meta.insert(400, ItemMeta { name: "door".into(), ..Default::default() });
+        assert_eq!(sm.find_item_id_by_name("door"), Some(400));
+    }
+
+    #[test]
+    fn town_temple_lookup_by_name_and_id() {
+        let (map, items) = tiny_map(); // town Thais id 1 at (95, 117, 7)
+        let sm = StaticMap::from_formats(&map, &items);
+        assert_eq!(sm.town_temple_by_name("Thais"), Some(Position::new(95, 117, 7)));
+        assert_eq!(sm.town_temple_by_name("thais"), Some(Position::new(95, 117, 7))); // case-insensitive
+        assert_eq!(sm.town_temple_by_id(1), Some(Position::new(95, 117, 7)));
+        assert_eq!(sm.town_temple_by_name("Venore"), None);
+        assert_eq!(sm.town_temple_by_id(99), None);
+    }
+
+    #[test]
     fn resolves_ground_client_id_and_spawn() {
         use protocol::map_description::TileSource;
         let (map, items) = tiny_map();
