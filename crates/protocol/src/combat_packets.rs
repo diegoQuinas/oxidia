@@ -9,11 +9,18 @@
 //! Outbound:
 //!   - `0x8C` creature health-bar: `[0x8C][u32 id][u8 percent]`.
 //!   - `0x28` death/relogin window: `[0x28][u8 0x00][u8 unfairFightReduction]`.
+//!   - `0xB4` text message (damage modes): floating damage numbers.
 //!
 //! Sources verified against `reference/tfs/src/protocolgame.cpp`:
 //!   - `parseAttack`       line 972–977
 //!   - `sendCreatureHealth` line 2339–2351
 //!   - `sendReLoginWindow`  line 1376–1383
+//!   - `sendTextMessage`    line 1411–1447
+//!
+//! The `0xB4` damage wire layout is cross-checked against the OTClient
+//! Redemption parser (`protocolgameparse.cpp::parseTextMessage`, the
+//! `MessageDamage*` arm) and its mode-byte table (`protocolcodes.cpp::
+//! buildMessageModesMap`, `version >= 1055`).
 
 use crate::message::MessageWriter;
 
@@ -36,6 +43,37 @@ pub const OP_CREATURE_HEALTH: u8 = 0x8C;
 /// Outbound: death / relogin window sent to the dying player
 /// (`sendReLoginWindow`, TFS line 1376).
 pub const OP_DEATH_WINDOW: u8 = 0x28;
+
+/// Outbound: text message (`sendTextMessage`, TFS line 1411). For the damage
+/// modes it carries a tile position + value/color pairs that the client renders
+/// as a floating "animated text" number. Replaces the pre-10.x `0x84`
+/// `AddAnimatedText` opcode, which OTClient Redemption no longer parses.
+pub const OP_TEXT_MESSAGE: u8 = 0xB4;
+
+// ---------------------------------------------------------------------------
+// Text-message mode bytes (wire values for protocol 10.98)
+// ---------------------------------------------------------------------------
+//
+// These are the on-the-wire mode bytes the OTClient Redemption client maps in
+// `buildMessageModesMap` for `version >= 1055` (protocolcodes.cpp). They are
+// NOT the TFS internal `MessageClasses` enum values — TFS translates those per
+// protocol version before sending; we emit the post-translation wire bytes
+// directly.
+
+/// Damage the local player dealt — floats on the victim's tile, shown to the
+/// attacker (`MessageDamageDealed = 23`).
+pub const MSG_DAMAGE_DEALT: u8 = 23;
+
+/// Damage the local player received — shown to the victim
+/// (`MessageDamageReceived = 24`).
+pub const MSG_DAMAGE_RECEIVED: u8 = 24;
+
+/// Damage between two other creatures — shown to bystanders
+/// (`MessageDamageOthers = 27`).
+pub const MSG_DAMAGE_OTHERS: u8 = 27;
+
+/// Text colour for physical damage numbers (`TEXTCOLOR_RED`, TFS const.h:320).
+pub const TEXTCOLOR_RED: u8 = 180;
 
 // ---------------------------------------------------------------------------
 // Health-percent helper
@@ -89,6 +127,50 @@ pub fn creature_health(creature_id: u32, percent: u8) -> Vec<u8> {
 /// M7 always passes `unfair_fight_reduction = 0` (no skull/PvP math until M23).
 pub fn death_window(unfair_fight_reduction: u8) -> Vec<u8> {
     vec![OP_DEATH_WINDOW, 0x00, unfair_fight_reduction]
+}
+
+/// Encode a `0xB4` damage text message (a floating damage number):
+///
+/// ```text
+/// [0xB4][mode u8][x u16][y u16][z u8]
+///       [primary.value u32][primary.color u8]
+///       [secondary.value u32][secondary.color u8]
+///       [text u16-len + bytes]
+/// ```
+///
+/// `mode` is one of [`MSG_DAMAGE_DEALT`], [`MSG_DAMAGE_RECEIVED`], or
+/// [`MSG_DAMAGE_OTHERS`]. The primary slot carries the physical damage
+/// (`value`/`color`); the secondary slot (magic damage) is always zeroed here
+/// because fist combat is purely physical. The client renders each non-zero
+/// value as an animated number on the tile and skips a `0` value.
+///
+/// `text` MUST be non-empty: the 10.98 parser reads the trailing string for the
+/// damage modes and, if it comes back empty, reads *another* string — an empty
+/// payload would desync the stream. Callers always pass a console line.
+pub fn damage_text(
+    mode: u8,
+    x: u16,
+    y: u16,
+    z: u8,
+    value: u32,
+    color: u8,
+    text: &[u8],
+) -> Vec<u8> {
+    debug_assert!(!text.is_empty(), "damage_text requires a non-empty string");
+    let mut w = MessageWriter::new();
+    w.write_u8(OP_TEXT_MESSAGE);
+    w.write_u8(mode);
+    w.write_u16(x);
+    w.write_u16(y);
+    w.write_u8(z);
+    // Primary slot: physical damage.
+    w.write_u32(value);
+    w.write_u8(color);
+    // Secondary slot: magic damage — unused by fist combat.
+    w.write_u32(0);
+    w.write_u8(0);
+    w.write_string(text);
+    w.into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -279,5 +361,63 @@ mod tests {
     #[test]
     fn follow_opcode_constant() {
         assert_eq!(OP_FOLLOW, 0xA2);
+    }
+
+    // -------------------------------------------------------------------------
+    // damage_text (0xB4) — floating damage number encoder
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn damage_text_exact_wire_layout() {
+        // [0xB4][mode][x u16][y u16][z u8][value u32][color u8][0 u32][0 u8][str u16len+bytes]
+        let text = b"You lose 5 hitpoints.";
+        let p = damage_text(MSG_DAMAGE_RECEIVED, 0x0102, 0x0304, 7, 5, TEXTCOLOR_RED, text);
+
+        let mut i = 0;
+        assert_eq!(p[i], OP_TEXT_MESSAGE, "opcode"); i += 1;
+        assert_eq!(p[i], MSG_DAMAGE_RECEIVED, "mode"); i += 1;
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 0x0102, "x"); i += 2;
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 0x0304, "y"); i += 2;
+        assert_eq!(p[i], 7, "z"); i += 1;
+        assert_eq!(u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]), 5, "primary value"); i += 4;
+        assert_eq!(p[i], TEXTCOLOR_RED, "primary color"); i += 1;
+        assert_eq!(u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]), 0, "secondary value"); i += 4;
+        assert_eq!(p[i], 0, "secondary color"); i += 1;
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), text.len() as u16, "string length"); i += 2;
+        assert_eq!(&p[i..i + text.len()], text, "string body"); i += text.len();
+        assert_eq!(i, p.len(), "no trailing bytes after the string");
+    }
+
+    #[test]
+    fn damage_text_mode_bytes_match_redemption_table() {
+        // Wire mode bytes from OTClient Redemption `buildMessageModesMap`
+        // (version >= 1055). These are protocol constants, not arbitrary — this
+        // guards against an accidental renumbering that would desync the client.
+        assert_eq!(OP_TEXT_MESSAGE, 0xB4);
+        assert_eq!(MSG_DAMAGE_DEALT, 23);
+        assert_eq!(MSG_DAMAGE_RECEIVED, 24);
+        assert_eq!(MSG_DAMAGE_OTHERS, 27);
+        assert_eq!(TEXTCOLOR_RED, 180);
+    }
+
+    #[test]
+    fn damage_text_string_is_present_and_length_prefixed() {
+        // The 10.98 parser re-reads a string if the first comes back empty
+        // (protocolgameparse.cpp:3066), which would desync the stream. The
+        // trailing string must be present and length-prefixed exactly once.
+        let text = b"x";
+        let p = damage_text(MSG_DAMAGE_DEALT, 1, 1, 0, 1, TEXTCOLOR_RED, text);
+        let n = p.len();
+        assert_eq!(u16::from_le_bytes([p[n - 3], p[n - 2]]), 1, "string length prefix");
+        assert_eq!(p[n - 1], b'x', "string body");
+    }
+
+    #[test]
+    fn damage_text_routes_each_mode() {
+        for mode in [MSG_DAMAGE_DEALT, MSG_DAMAGE_RECEIVED, MSG_DAMAGE_OTHERS] {
+            let p = damage_text(mode, 100, 200, 7, 42, TEXTCOLOR_RED, b"hit");
+            assert_eq!(p[0], OP_TEXT_MESSAGE);
+            assert_eq!(p[1], mode, "mode byte must round-trip into byte 1");
+        }
     }
 }

@@ -650,17 +650,20 @@ impl Game {
         }
     }
 
-    /// Apply `dmg` hit points of damage to `victim_id`. Clamps to 0, pushes
-    /// health-bar (`0x8C`) to all spectators including the victim and attacker,
-    /// pushes self-stats (`0xA0`) to the victim, and fires `do_death` on 0 HP.
-    fn apply_damage(&mut self, victim_id: u32, dmg: i32) {
-        let (new_health, max_health) = {
+    /// Apply `dmg` hit points of damage to `victim_id`, dealt by `attacker_id`.
+    /// Clamps to 0, pushes health-bar (`0x8C`) to all spectators including the
+    /// victim and attacker, pushes self-stats (`0xA0`) to the victim, emits the
+    /// physical-hit blood effect plus a floating damage number (`0xB4`), and
+    /// fires `do_death` on 0 HP.
+    fn apply_damage(&mut self, attacker_id: u32, victim_id: u32, dmg: i32) {
+        let (health_before, new_health, max_health) = {
             let v = match self.players.get_mut(&victim_id) {
                 Some(p) => p,
                 None => return,
             };
+            let before = v.health;
             v.health = v.health.saturating_sub(dmg.max(0) as u16);
-            (v.health, v.max_health)
+            (before, v.health, v.max_health)
         };
         let victim_pos = match self.players.get(&victim_id) {
             Some(p) => p.position,
@@ -707,6 +710,34 @@ impl Game {
             victim_pos.x, victim_pos.y, victim_pos.z, enter_world::EFFECT_DRAWBLOOD);
         for sid in &spectators {
             self.push(*sid, effect.clone());
+        }
+        // Floating damage number (0xB4 TextMessage). Use the damage actually
+        // applied (clamped at the victim's remaining HP), not the raw roll, so
+        // an overkill shows the real hit. A 0 value renders nothing client-side,
+        // so skip the packet entirely. The mode byte is routed per recipient:
+        // the attacker sees "dealt", the victim "received", bystanders "others".
+        let applied = u32::from(health_before.saturating_sub(new_health));
+        if applied > 0 {
+            let victim_name = self.players.get(&victim_id)
+                .map(|p| p.name.clone()).unwrap_or_default();
+            let attacker_name = self.players.get(&attacker_id)
+                .map(|p| p.name.clone()).unwrap_or_default();
+            for sid in &spectators {
+                let (mode, text) = if *sid == attacker_id {
+                    (combat_packets::MSG_DAMAGE_DEALT,
+                     format!("You deal {applied} damage to {victim_name}."))
+                } else if *sid == victim_id {
+                    (combat_packets::MSG_DAMAGE_RECEIVED,
+                     format!("You lose {applied} hitpoints due to an attack by {attacker_name}."))
+                } else {
+                    (combat_packets::MSG_DAMAGE_OTHERS,
+                     format!("{victim_name} loses {applied} hitpoints due to an attack by {attacker_name}."))
+                };
+                let pkt = combat_packets::damage_text(
+                    mode, victim_pos.x, victim_pos.y, victim_pos.z,
+                    applied, combat_packets::TEXTCOLOR_RED, text.as_bytes());
+                self.push(*sid, pkt);
+            }
         }
         // Death?
         if new_health == 0 {
@@ -832,7 +863,7 @@ impl Game {
             if let Some(p) = self.players.get_mut(&attacker_id) {
                 p.last_attack_ms = now_ms;
             }
-            self.apply_damage(target_id, dmg);
+            self.apply_damage(attacker_id, target_id, dmg);
         }
     }
 
