@@ -4821,6 +4821,9 @@ mod tests {
                 // decoration: NOT moveable (no FLAG_MOVEABLE)
                 OtbItemType { group: 5, flags: 0, server_id: 400, client_id: 999,
                     always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                // helmet: moveable + pickupable, slotType head (equippable in slot 1)
+                OtbItemType { group: 5, flags: FLAG_MOVEABLE_OTB | FLAG_PICKUPABLE_OTB, server_id: 500, client_id: 5741,
+                    always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
             ],
         };
 
@@ -4828,6 +4831,7 @@ mod tests {
           <item id="200" name="stone" article="a" plural="stones"><attribute key="weight" value="110"/></item>
           <item id="300" name="gold coin" article="a" plural="gold coins"><attribute key="weight" value="10"/><attribute key="showcount" value="1"/></item>
           <item id="400" name="decoration" article="a" plural="decorations"/>
+          <item id="500" name="helmet" article="a"><attribute key="slotType" value="head"/></item>
         </items>"#;
         let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
 
@@ -4849,6 +4853,9 @@ mod tests {
                                 MapItem { id: 400, count: None, contents: vec![] }] }, // deco (non-moveable)
                 // (104,100) deliberately absent — no tile → invalid dest
                 g(105), // valid empty-item dest
+                MapTile { x: 106, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] },
+                                MapItem { id: 500, count: None, contents: vec![] }] }, // helmet
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
             waypoints: vec![],
@@ -5118,6 +5125,9 @@ mod tests {
         );
     }
 
+    /// Wire position for inventory slot `slot` (TFS: x=0xFFFF, y=slot, z=0).
+    fn inv_pos(slot: u8) -> Position { Position::new(0xFFFF, u16::from(slot), 0) }
+
     /// Regression: a non-stackable moved onto a tile that already has a down-item must land
     /// at index `pre_creature_len` (front / newest-on-top), and the broadcast 0x6A must use
     /// stackpos `pre_creature_len + creatures` (no creatures → `pre_creature_len`).
@@ -5162,5 +5172,58 @@ mod tests {
             broadcast_sp, pre as u8,
             "broadcast stackpos must equal pre_creature_len ({pre}); got {broadcast_sp}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // M10.2 equip / unequip routing tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn equip_ground_item_into_matching_slot() {
+        let mut g = Game::new(move_map());
+        // Player adjacent to the helmet tile (106,100,7); stand on (105,100,7).
+        let (player, mut rx) = add_player(&mut g, Position::new(105, 100, 7));
+        drain(&mut rx);
+        // Equip helmet (sid 500) from ground stackpos 1 into the head slot (1).
+        // pre_creature_len for (106,100,7) = 1 (ground only), no creature on 106
+        // → helmet at item index 1 → wire stackpos 1.
+        g.do_move_thing(player, Position::new(106, 100, 7), 1, inv_pos(1), 1);
+        // Slot 1 now holds the helmet.
+        let slot = g.players.get(&player).unwrap().inventory[0];
+        assert_eq!(slot.map(|it| it.server_id), Some(500), "helmet must be in head slot");
+        // A 0x78 set-inventory packet was pushed to the player.
+        assert!(has_op(&drain(&mut rx), 0x78), "equip must push 0x78");
+        // The helmet left the ground overlay.
+        assert_eq!(count_sid_in_overlays(&g, 500), 0, "helmet must leave the ground");
+    }
+
+    #[test]
+    fn equip_into_wrong_slot_is_rejected() {
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(105, 100, 7));
+        drain(&mut rx);
+        // Try to put the helmet (head item) into the feet slot (8) → rejected.
+        g.do_move_thing(player, Position::new(106, 100, 7), 1, inv_pos(8), 1);
+        assert!(g.players.get(&player).unwrap().inventory[7].is_none(), "feet slot stays empty");
+        assert!(g.players.get(&player).unwrap().inventory.iter().all(|s| s.is_none()), "nothing equipped");
+        let pkts = drain(&mut rx);
+        assert!(has_op(&pkts, 0xB4), "wrong-slot equip must push a 0xB4 status message");
+        assert!(!has_op(&pkts, 0x78), "no inventory set on a rejected equip");
+    }
+
+    #[test]
+    fn unequip_returns_item_to_the_ground() {
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(105, 100, 7));
+        drain(&mut rx);
+        // Equip first.
+        g.do_move_thing(player, Position::new(106, 100, 7), 1, inv_pos(1), 1);
+        drain(&mut rx);
+        // Unequip back onto the player's own tile (105,100,7) — within throw range.
+        g.do_move_thing(player, inv_pos(1), 0, Position::new(105, 100, 7), 1);
+        assert!(g.players.get(&player).unwrap().inventory[0].is_none(), "head slot cleared");
+        let pkts = drain(&mut rx);
+        assert!(has_op(&pkts, 0x79), "unequip must push 0x79 clear");
+        assert_eq!(count_sid_in_overlays(&g, 500), 1, "helmet back on the ground");
     }
 }

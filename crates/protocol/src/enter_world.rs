@@ -307,4 +307,24 @@ mod tests {
         let pkt = magic_effect(100, 100, 7, EFFECT_DRAWBLOOD);
         assert_eq!(*pkt.last().unwrap(), 1, "drawblood effect byte must be 1");
     }
+
+    // -------------------------------------------------------------------------
+    // M10.2 set_inventory_slot tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn set_inventory_slot_layout() {
+        use crate::map_description::WireItem;
+        // Non-stackable helmet in slot 1: [0x78][slot][client_id LE][0xFF mark]
+        let pkt = set_inventory_slot(1, &WireItem { client_id: 0x0C5A, subtype: None, animated: false });
+        assert_eq!(pkt[0], OP_INVENTORY_SET);
+        assert_eq!(pkt[1], 1);
+        assert_eq!(u16::from_le_bytes([pkt[2], pkt[3]]), 0x0C5A);
+        assert_eq!(pkt[4], 0xFF);
+        assert_eq!(pkt.len(), 5);
+        // Stackable ammo in slot 10 carries the count byte after the 0xFF mark.
+        let pkt = set_inventory_slot(10, &WireItem { client_id: 0x0BB3, subtype: Some(50), animated: false });
+        assert_eq!(pkt[1], 10);
+        assert_eq!(*pkt.last().unwrap(), 50);
+    }
 }

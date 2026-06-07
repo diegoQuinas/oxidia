@@ -561,4 +561,31 @@ mod tests {
         let account = store.authenticate("test", "test").await.unwrap().unwrap();
         assert_eq!(account.characters.len(), 2);
     }
+
+    // -------------------------------------------------------------------------
+    // M10.2 inventory persistence tests
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn inventory_round_trips_through_save_load() {
+        let store = seeded().await;
+        let mut save = default_save("Test Knight");
+        save.inventory = vec![(1, 0x0BBB, 1), (10, 0x0BB3, 50)];
+        store.save_player(&save).await.unwrap();
+        let loaded = store.load_player("Test Knight").await.unwrap().expect("should be Some");
+        assert_eq!(loaded.inventory, vec![(1, 0x0BBB, 1), (10, 0x0BB3, 50)]);
+    }
+
+    #[tokio::test]
+    async fn save_player_replaces_inventory_rows() {
+        let store = seeded().await;
+        let mut save = default_save("Test Knight");
+        save.inventory = vec![(1, 111, 1), (4, 222, 1)];
+        store.save_player(&save).await.unwrap();
+        // Second save with a different set must REPLACE, not append.
+        save.inventory = vec![(2, 333, 1)];
+        store.save_player(&save).await.unwrap();
+        let loaded = store.load_player("Test Knight").await.unwrap().unwrap();
+        assert_eq!(loaded.inventory, vec![(2, 333, 1)]);
+    }
 }

@@ -1109,4 +1109,23 @@ mod tests {
             "dx > 8 must return false (out of throw range)"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // M10.2 EquipSlot tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn equip_slot_mapping_and_admits() {
+        assert_eq!(EquipSlot::from_xml("head", ""), Some(EquipSlot::Head));
+        assert_eq!(EquipSlot::from_xml("body", ""), Some(EquipSlot::Armor));
+        assert_eq!(EquipSlot::from_xml("", "sword"), Some(EquipSlot::Hand));
+        assert_eq!(EquipSlot::from_xml("", "shield"), Some(EquipSlot::Hand));
+        assert_eq!(EquipSlot::from_xml("two-handed", ""), Some(EquipSlot::Hand));
+        assert_eq!(EquipSlot::from_xml("", "ammunition"), Some(EquipSlot::Ammo));
+        assert_eq!(EquipSlot::from_xml("ammo", ""), Some(EquipSlot::Ammo));
+        assert_eq!(EquipSlot::from_xml("", ""), None);
+        assert!(EquipSlot::Head.admits(1) && !EquipSlot::Head.admits(2));
+        assert!(EquipSlot::Hand.admits(5) && EquipSlot::Hand.admits(6) && !EquipSlot::Hand.admits(4));
+        assert!(EquipSlot::Ammo.admits(10) && !EquipSlot::Ammo.admits(1));
+    }
 }
