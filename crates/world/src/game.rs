@@ -671,8 +671,9 @@ impl Game {
         };
         self.push(victim_id, stats);
         // Push a physical-hit magic effect on the victim's tile to all spectators.
-        // CONST_ME_DRAWBLOOD = 1 in TFS (const.h); wire = TFS enum − 1 = 0.
-        // See enter_world::EFFECT_DRAWBLOOD; same convention as EFFECT_TELEPORT.
+        // Physical-hit blood effect. TFS sends the effect byte directly, so the
+        // wire value is the enum value (CONST_ME_DRAWBLOOD = 1). See
+        // enter_world::EFFECT_DRAWBLOOD.
         let effect = enter_world::magic_effect(
             victim_pos.x, victim_pos.y, victim_pos.z, enter_world::EFFECT_DRAWBLOOD);
         for sid in &spectators {
@@ -684,16 +685,20 @@ impl Game {
         }
     }
 
-    /// Handle the death of `victim_id`: push `0x28` death window, clear all
-    /// fights targeting the victim, teleport to the temple, restore HP, and
-    /// broadcast remove+add to spectators.
-    ///
-    /// Death is a **remove** at the death tile + **add** at the temple — the
-    /// same atomic pair used in logout/login. This preserves the M5
-    /// ≤1-creature-per-tile stackpos invariant with no co-occupancy.
+    /// Handle the death of `victim_id`: death == logout. Send the `0x28` death
+    /// window, clear all fights, id-form remove at the death tile, then remove the
+    /// victim from the world and emit a `SaveRecord` at the temple with full HP.
+    /// Dropping the victim's `push_tx` ends the session; the relog spawns at the
+    /// temple (M8 `login` restores the saved position). Mirrors TFS `onDeath` →
+    /// `sendReLoginWindow` + `removeCreature` (player.cpp:2070, 2197).
     fn do_death(&mut self, victim_id: u32) {
-        // Push the death window to the victim.
-        self.push(victim_id, combat_packets::death_window(0));
+        // Death window to the victim — best-effort, non-reaping `try_send`. The
+        // reaping `push()` would, on a saturated client buffer, divert death
+        // through `logout()` (which saves at the death tile with 0 HP) and then
+        // the temple/full-HP save below would never run.
+        if let Some(p) = self.players.get(&victim_id) {
+            let _ = p.push_tx.try_send(combat_packets::death_window(0));
+        }
 
         // Clear all fights targeting the victim, and the victim's own fight.
         let all_ids: Vec<u32> = self.players.keys().copied().collect();
@@ -1817,6 +1822,28 @@ mod tests {
         let rec = save_rx.try_recv().expect("death must emit a SaveRecord");
         assert_eq!(rec.position, temple, "death saves the player at the temple");
         assert_eq!(rec.health, rec.max_health, "death saves the player at full HP");
+    }
+
+    #[test]
+    fn death_with_full_client_buffer_still_saves_at_temple() {
+        // Regression: a saturated victim push buffer must NOT divert death through
+        // the reaping push()/logout path (which saves at the death tile with the
+        // current HP). do_death uses a non-reaping try_send for the death window.
+        let mut g = Game::new(combat_map(false));
+        let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
+        g.save_tx = Some(save_tx);
+        let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
+        let temple = g.map.spawn();
+        g.players.get_mut(&b).unwrap().health = 1;
+        // Fill B's push channel to capacity so a reaping send would log it out.
+        for _ in 0..super::PUSH_CAPACITY {
+            g.push(b, vec![0u8]);
+        }
+        g.do_death(b);
+        let rec = save_rx.try_recv().expect("death must emit a SaveRecord even with a full buffer");
+        assert_eq!(rec.position, temple, "death saves at the temple even with a full client buffer");
+        assert_eq!(rec.health, rec.max_health, "death saves full HP even with a full client buffer");
+        assert!(!g.players.contains_key(&b), "victim must be removed from the world");
     }
 
     #[test]
