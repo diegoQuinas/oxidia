@@ -2,11 +2,16 @@
 **/*.rs.bk
 *.pdb
 
+# Local server config (custom host/ZeroTier IP). Tracked template lives in
+# config/server.toml.example — copy it to config/server.toml to run locally.
+/config/server.toml
+
 # Local runtime artifacts
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+debug.log
 
 # Reference clone is pulled on demand; keep it out of history
 /reference/
