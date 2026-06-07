@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M5 ✅ **multiplayer presence complete and accepted live** (two OTClients see each other spawn, walk, turn, and poof out on logout) → next is **M6 (chat)**. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) and auto-walk remain deferred.
+- **Milestone:** M5 ✅ **multiplayer presence complete and accepted live** (two OTClients see each other spawn, walk, turn, and poof out on logout) → next is **M6 (chat)**. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) are now scoped as **M6.1 (stairs, walk-driven)** + **M6.2 (ladders/holes, use-driven)**; auto-walk remains deferred.
 - **Build:** `cargo build` clean, `cargo test` green (112 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -33,6 +33,8 @@ performance-critical or stable stays native Rust.
 | M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | ✅ done |
 | M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ✅ done |
 | M6 | Chat: say / whisper / yell + default channel | ⬜ |
+| M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ⬜ |
+| M6.2 | Ladders & holes (use-driven): minimal `useItem 0x82` handler, floor-change-up on use, down-holes; reuses the M6.1 vertical engine | ⬜ |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
 | **B** | **Items & Inventory** | |
@@ -143,7 +145,7 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m4-walk-design.md`, `docs/supe
 7. ✅ `server::game_service` — render the player in the enter-world burst; `run_session` now decrypts each frame and dispatches walk (`0x65-0x68`, `0x6A-0x6D`) / turn (`0x6F-0x72`); `Moved`→`walk_update`, `Blocked`→`cancel_walk`. Integration replay walks east and asserts a `0x6D` comes back.
 8. ✅ **Accepted live** — real OTClient renders the Test Knight with its outfit on the Thais temple ground and walks it around with arrow keys; walls stop it. Fixed during review: a bad-checksum frame now drops instead of killing the session.
 
-**Deferred (later slice):** floor changes / stairs / underground (z≥8) walk; auto-walk / click-to-move pathfinding; diagonal corner-cut blocking; real player persistence; walkthrough byte fidelity (self currently `0x00`).
+**Deferred (later slice):** floor changes / stairs / underground (z≥8) walk → **now scoped as M6.1 (stairs) + M6.2 (ladders/holes)**; auto-walk / click-to-move pathfinding; diagonal corner-cut blocking; real player persistence; walkthrough byte fidelity (self currently `0x00`).
 
 ## M5 plan
 
