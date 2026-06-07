@@ -397,6 +397,19 @@ where
                 }
                 continue;
             }
+            // 0x78 — client move-thing (parseThrow). Ground→ground in M10.1.
+            if opcode == 0x78 {
+                if let Some(t) = protocol::move_thing::parse_throw(&payload[1..]) {
+                    world.move_thing(
+                        id,
+                        Position::new(t.from.0, t.from.1, t.from.2),
+                        t.from_stackpos,
+                        Position::new(t.to.0, t.to.1, t.to.2),
+                        t.count,
+                    ).await;
+                }
+                continue;
+            }
             let Some((direction, is_turn)) = opcode_action(opcode) else { continue };
             if is_turn {
                 world.turn_player(id, direction).await;
