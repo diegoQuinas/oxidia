@@ -52,6 +52,7 @@ fn player_save_to_initial(save: &PlayerSave) -> InitialState {
         health: save.health,
         max_health: save.health_max,
         gamemaster: false,
+        inventory: save.inventory.clone(),
     }
 }
 
@@ -79,6 +80,7 @@ pub fn save_record_to_player_save(rec: &SaveRecord) -> PlayerSave {
         look_addons: rec.outfit.addons,
         look_mount: rec.outfit.mount,
         sex: rec.sex,
+        inventory: rec.inventory.clone(),
     }
 }
 
@@ -105,6 +107,8 @@ pub struct EnterWorldPlayer<'a> {
     pub outfit: creature::Outfit,
     pub health: u16,
     pub max_health: u16,
+    /// Equipped items to render in the paperdoll: `(slot, server_id, count)`.
+    pub inventory: &'a [(u8, u16, u8)],
 }
 
 /// Build the full enter-world burst payload, in order, for a fresh login.
@@ -154,7 +158,27 @@ pub fn build_enter_world_burst(
         center.z,
         enter_world::EFFECT_TELEPORT,
     ));
-    burst.extend(enter_world::empty_inventory());
+    // Inventory: a 0x78 for each equipped slot, 0x79 for the empty ones.
+    let equipped: std::collections::HashMap<u8, (u16, u8)> =
+        player.inventory.iter().map(|&(s, sid, c)| (s, (sid, c))).collect();
+    for slot in 1..=enter_world::INVENTORY_SLOTS {
+        match equipped.get(&slot) {
+            Some(&(server_id, count)) => {
+                if let Some(meta) = map.item_meta(server_id) {
+                    let subtype = if meta.stackable { Some(count.max(1)) } else { None };
+                    let wi = protocol::map_description::WireItem {
+                        client_id: meta.client_id,
+                        subtype,
+                        animated: meta.animated,
+                    };
+                    burst.extend(enter_world::set_inventory_slot(slot, &wi));
+                } else {
+                    burst.extend([enter_world::OP_INVENTORY_EMPTY, slot]);
+                }
+            }
+            None => burst.extend([enter_world::OP_INVENTORY_EMPTY, slot]),
+        }
+    }
     burst.extend(enter_world::stats(&stats));
     burst.extend(enter_world::skills());
     burst.extend(enter_world::world_light(215, 215));
@@ -228,10 +252,13 @@ where
             health: 150,
             max_health: 150,
             gamemaster: false,
+            inventory: Vec::new(),
         },
     };
     let mut initial = initial;
     initial.gamemaster = req.gamemaster;
+    // Extract inventory before moving `initial` into the world actor.
+    let login_inventory = initial.inventory.clone();
     let (push_tx, push_rx) = world::game::push_channel();
     let Some(ack) = world.login(name.clone(), initial, push_tx).await else {
         return send_disconnect(&mut stream, &keys, "Your character could not be loaded.").await;
@@ -247,6 +274,7 @@ where
         outfit: snapshot.outfit,
         health: snapshot.health,
         max_health: snapshot.max_health,
+        inventory: &login_inventory,
     };
     let burst = build_enter_world_burst(&player_info, center, &ack.others, world.map.as_ref());
     send_encrypted(&mut stream, &keys, &burst).await?;
@@ -774,6 +802,7 @@ mod tests {
             look_addons: 1,
             look_mount: 0,
             sex: 0, // female
+            inventory: vec![],
         };
         let initial = player_save_to_initial(&save);
         assert_eq!(initial.position, Some(world::Position::new(200, 300, 8)));
@@ -814,6 +843,7 @@ mod tests {
             health: 80,
             max_health: 160,
             sex: 0, // female
+            inventory: Vec::new(),
         };
         let save = save_record_to_player_save(&rec);
         assert_eq!(save.name, "Hero");
@@ -875,6 +905,7 @@ mod tests {
             outfit: creature::Outfit { look_type: 128, head: 0, body: 0, legs: 0, feet: 0, addons: 0, mount: 0 },
             health: 150,
             max_health: 150,
+            inventory: &[],
         };
         let burst = build_enter_world_burst(&player, center, &[], map.as_ref());
         // The icons packet [0xA2, lo, hi] for ICON_PIGEON (0x4000) must be present.
