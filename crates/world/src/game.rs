@@ -201,6 +201,11 @@ impl Game {
         let stackpos = self.map.creature_stackpos(
             i32::from(pos.x), i32::from(pos.y), i32::from(pos.z));
         for spec in self.spectators(pos, id) {
+            // A teleport puff on the departing creature's tile, then the remove.
+            // (A deliberate polish over TFS, whose removeCreature disappears
+            // silently; symmetric with the login appear effect.)
+            self.push(spec, enter_world::magic_effect(
+                pos.x, pos.y, pos.z, enter_world::EFFECT_TELEPORT));
             self.push(spec, tile_creature::remove_tile_thing((pos.x, pos.y, pos.z), stackpos));
             // The departed creature must be re-introduced (full form) if it ever
             // returns: drop it from each spectator's known-set.
@@ -476,9 +481,12 @@ mod tests {
         let (tx_b, _rx_b) = push_channel();
         let ack_b = world.login("B".into(), knight(), tx_b).await.unwrap();
         let _ = rx_a.recv().await.unwrap(); // appear (0x6A)
-        let effect = rx_a.recv().await.unwrap(); // teleport puff (0x83)
+        let effect = rx_a.recv().await.unwrap(); // login teleport puff (0x83)
         assert_eq!(effect[0], protocol::enter_world::OP_MAGIC_EFFECT);
         world.logout(ack_b.snapshot.id).await;
+        // Logout pushes a teleport puff, then the remove.
+        let poof = rx_a.recv().await.unwrap();
+        assert_eq!(poof[0], protocol::enter_world::OP_MAGIC_EFFECT);
         let pkt = rx_a.recv().await.unwrap();
         assert_eq!(pkt[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
     }
