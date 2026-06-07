@@ -24,6 +24,14 @@ use crate::{Direction, Position};
 /// memory unbounded.
 const PUSH_CAPACITY: usize = 256;
 
+/// Client viewport extents from the player's tile, matching the 18x14 map
+/// description anchored at center-8 / center-6 (TFS `Map::maxClientViewportX/Y`).
+/// Asymmetric: one extra column east and one extra row south.
+const VIEW_LEFT: i32 = 8; // columns west of center
+const VIEW_RIGHT: i32 = 9; // columns east of center (the +1 edge)
+const VIEW_UP: i32 = 6; // rows north of center
+const VIEW_DOWN: i32 = 7; // rows south of center (the +1 edge)
+
 /// What the game service needs to build the enter-world burst for a player.
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerSnapshot {
@@ -60,16 +68,25 @@ impl Game {
         Game { map, players: HashMap::new(), next_id: 0x1000_0000, next_statement_id: 1 }
     }
 
-    /// Can a viewer at `viewer` see tile `target`? Client viewport ±8x / ±6y,
-    /// same floor (Map::maxClientViewportX/Y). Multi-floor band is deferred.
+    /// Can a viewer at `viewer` see tile `target`? The client renders an 18x14
+    /// map description anchored at center-8 / center-6, so the viewport is
+    /// ASYMMETRIC: it reaches one extra column east and one extra row south
+    /// (dx in -8..=9, dy in -6..=7). Mirrors TFS `ProtocolGame::canSee`
+    /// (`x <= myPos.x + maxClientViewportX + 1`). A symmetric `abs() <= 8` check
+    /// is short by one tile on the east/south edge, which misaligns "creature
+    /// entered view" from the slice that reveals it. Same floor; the multi-floor
+    /// band is deferred.
     fn can_see(viewer: Position, target: Position) -> bool {
+        let dx = i32::from(target.x) - i32::from(viewer.x);
+        let dy = i32::from(target.y) - i32::from(viewer.y);
         viewer.z == target.z
-            && (i32::from(viewer.x) - i32::from(target.x)).abs() <= 8
-            && (i32::from(viewer.y) - i32::from(target.y)).abs() <= 6
+            && (-VIEW_LEFT..=VIEW_RIGHT).contains(&dx)
+            && (-VIEW_UP..=VIEW_DOWN).contains(&dy)
     }
 
     /// Ids of players within (`rx`, `ry`) tiles of `pos` on the same floor,
-    /// excluding `exclude`.
+    /// excluding `exclude`. Symmetric range; used for the yell radius, not the
+    /// view (see [`Self::spectators`] for the asymmetric client viewport).
     fn spectators_in_range(&self, pos: Position, exclude: u32, rx: i32, ry: i32) -> Vec<u32> {
         self.players
             .iter()
@@ -83,9 +100,29 @@ impl Game {
             .collect()
     }
 
-    /// Ids of players who can see `pos` (client viewport ±8x/±6y), excluding `exclude`.
+    /// Ids of players who can see `pos`, excluding `exclude`. The exact dual of
+    /// [`Self::can_see`] (a viewer sees `pos` iff `pos` is in that viewer's
+    /// asymmetric viewport), so spectator notifications line up tile-for-tile
+    /// with what each client actually renders. Use this to notify watchers OF a
+    /// tile; use [`Self::visible_from`] for what a watcher AT a tile sees — under
+    /// the asymmetric viewport the two directions differ by a tile.
     fn spectators(&self, pos: Position, exclude: u32) -> Vec<u32> {
-        self.spectators_in_range(pos, exclude, 8, 6)
+        self.players
+            .iter()
+            .filter(|&(&id, p)| id != exclude && Self::can_see(p.position, pos))
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Ids of players a viewer standing at `viewer` can see, excluding `exclude`
+    /// — the forward direction of [`Self::can_see`]. This is what the moving
+    /// player renders in its own view, distinct from [`Self::spectators`].
+    fn visible_from(&self, viewer: Position, exclude: u32) -> Vec<u32> {
+        self.players
+            .iter()
+            .filter(|&(&id, p)| id != exclude && Self::can_see(viewer, p.position))
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// Build the creature-thing bytes for `target` as seen by `viewer`, choosing
@@ -343,7 +380,7 @@ impl Game {
         // for a creature the client already discarded, leaving it invisible and
         // tripping "parseCreatureMove: unable to remove creature" on its moves.
         let left_view: Vec<u32> = self
-            .spectators(from, id)
+            .visible_from(from, id)
             .into_iter()
             .filter(|oid| {
                 self.players.get(oid).is_some_and(|p| !Self::can_see(to, p.position))
@@ -356,7 +393,7 @@ impl Game {
         // The mover's own view: 0x6D + revealed slices, carrying every other
         // player now in range so they render in the newly exposed tiles.
         let others_in_range: Vec<PlacedCreature> = self
-            .spectators(to, id)
+            .visible_from(to, id)
             .into_iter()
             .filter_map(|oid| {
                 let opos = self.players.get(&oid)?.position;
@@ -507,6 +544,38 @@ mod tests {
     }
 
     #[test]
+    fn viewport_is_asymmetric_like_tfs() {
+        // The 18x14 client map description anchors at center-8 / center-6, so the
+        // viewer sees ONE more column east (+9) and one more row south (+7) than
+        // west/north. Mirrors TFS ProtocolGame::canSee (x <= myPos.x + (maxX+1)).
+        // A symmetric abs()<=8 check is short by one tile on the +x/+y edge, which
+        // misaligns "creature became visible" from the slice that actually reveals
+        // it — the creature gets marked known but never transmitted (invisible).
+        let c = Position::new(100, 100, 7);
+        assert!(Game::can_see(c, Position::new(109, 100, 7)), "+9 east is visible");
+        assert!(!Game::can_see(c, Position::new(110, 100, 7)), "+10 east is not");
+        assert!(Game::can_see(c, Position::new(92, 100, 7)), "-8 west is visible");
+        assert!(!Game::can_see(c, Position::new(91, 100, 7)), "-9 west is not");
+        assert!(Game::can_see(c, Position::new(100, 107, 7)), "+7 south is visible");
+        assert!(!Game::can_see(c, Position::new(100, 108, 7)), "+8 south is not");
+        assert!(Game::can_see(c, Position::new(100, 94, 7)), "-6 north is visible");
+        assert!(!Game::can_see(c, Position::new(100, 93, 7)), "-7 north is not");
+    }
+
+    #[test]
+    fn spectators_are_the_dual_of_can_see() {
+        // spectators(pos) must be exactly { P : can_see(P, pos) }. A player 9 tiles
+        // WEST sees pos on its +9 east edge and so IS a spectator; a player 9 tiles
+        // EAST cannot (that would need a +9 west view) and is NOT.
+        let mut g = Game::new(walk_map());
+        let (west9, _rw) = add_player(&mut g, Position::new(91, 100, 7)); // pos.x - 9
+        let (east9, _re) = add_player(&mut g, Position::new(109, 100, 7)); // pos.x + 9
+        let specs = g.spectators(Position::new(100, 100, 7), u32::MAX);
+        assert!(specs.contains(&west9), "a viewer 9 west sees pos at its east edge");
+        assert!(!specs.contains(&east9), "a viewer 9 east cannot see pos");
+    }
+
+    #[test]
     fn introduce_uses_full_then_short_form() {
         let mut g = Game::new(walk_map());
         let (viewer, _rv) = add_player(&mut g, Position::new(100, 100, 7));
@@ -528,9 +597,9 @@ mod tests {
         let mut g = Game::new(walk_map());
         // A one tile east of the wall at 94,117 so it can step west to 95,117.
         let (a, _ra) = add_player(&mut g, Position::new(96, 117, 7));
-        // B sits at the +8x edge of A@96: visible from 96 (|104-96|=8) but not
-        // from 95 (|104-95|=9). A's westward step drops B out of view.
-        let (b, _rb) = add_player(&mut g, Position::new(104, 117, 7));
+        // B sits at the +9x east edge of A@96: visible from 96 (dx=9, the edge)
+        // but not from 95 (dx=10). A's westward step drops B out of view.
+        let (b, _rb) = add_player(&mut g, Position::new(105, 117, 7));
         g.introduce(a, b).unwrap();
         assert!(g.players[&a].known.contains(&b), "A knows B after introduce");
 
@@ -607,7 +676,7 @@ mod tests {
     fn move_out_of_view_pushes_remove_to_spectator() {
         let mut g = Game::new(walk_map());
         let (mover, _rm) = add_player(&mut g, Position::new(95, 117, 7));
-        let (_spec, mut rx) = add_player(&mut g, Position::new(87, 117, 7)); // sees from, not to
+        let (_spec, mut rx) = add_player(&mut g, Position::new(86, 117, 7)); // sees from (dx=9), not to (dx=10)
         g.do_move(mover, Direction::East); // 95,117 -> 96,117
         let pkt = rx.try_recv().expect("spectator should receive a packet");
         assert_eq!(pkt[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
