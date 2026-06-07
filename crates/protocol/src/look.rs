@@ -39,3 +39,59 @@ pub fn info_descr(text: &[u8]) -> Vec<u8> {
     w.write_string(&text[..text.len().min(255)]);
     w.into_bytes()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_look` must round-trip (x, y, z, stackpos) and skip the 2-byte
+    /// spriteId that sits between z and stackpos on the wire.
+    #[test]
+    fn parse_look_round_trips_and_skips_sprite_id() {
+        // Wire layout: [x u16 LE][y u16 LE][z u8][spriteId u16 LE][stackpos u8]
+        // Use a spriteId value distinct from x/y so a wrong offset is caught.
+        let x: u16 = 1000;
+        let y: u16 = 2000;
+        let z: u8 = 7;
+        let sprite_id: u16 = 0xABCD; // distinct from coords
+        let stackpos: u8 = 3;
+        let mut body = Vec::new();
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.push(z);
+        body.extend_from_slice(&sprite_id.to_le_bytes());
+        body.push(stackpos);
+        let result = parse_look(&body).expect("valid body must parse");
+        assert_eq!(result, (x, y, z, stackpos));
+    }
+
+    #[test]
+    fn parse_look_returns_none_on_truncated_body() {
+        // A body that is too short (only 4 bytes instead of the required 7)
+        // must return None instead of panicking.
+        let body = [0x01, 0x00, 0x02, 0x00]; // just x and y, missing z/sprite/stackpos
+        assert!(parse_look(&body).is_none());
+    }
+
+    #[test]
+    fn parse_look_battle_reads_creature_id() {
+        let creature_id: u32 = 0x1234_5678;
+        let body = creature_id.to_le_bytes();
+        let result = parse_look_battle(&body).expect("valid body must parse");
+        assert_eq!(result, creature_id);
+    }
+
+    #[test]
+    fn info_descr_encodes_opcode_type_and_length_prefixed_string() {
+        // Expected layout: [0xB4][22][u16 LE len][bytes]
+        // For "hi" (2 bytes): [0xB4, 22, 0x02, 0x00, b'h', b'i']
+        let out = info_descr(b"hi");
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[0], 0xB4, "opcode");
+        assert_eq!(out[1], MSG_INFO_DESCR, "message type 22");
+        // u16 LE length = 2
+        let len = u16::from_le_bytes([out[2], out[3]]);
+        assert_eq!(len, 2, "u16 LE length prefix");
+        assert_eq!(&out[4..], b"hi", "payload bytes");
+    }
+}

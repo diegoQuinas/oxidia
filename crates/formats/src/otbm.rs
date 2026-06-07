@@ -456,4 +456,93 @@ mod tests {
             vec![Waypoint { name: "temple".into(), x: 15, y: 25, z: 7 }]
         );
     }
+
+    /// Build the minimal OTBM skeleton (identifier + root header + MAP_DATA shell)
+    /// and return a byte buffer with the given raw item props appended as a single
+    /// OTBM_ITEM child inside one TILE_AREA / TILE.
+    fn otbm_with_item_props(props: &[u8]) -> Vec<u8> {
+        fn string(v: &mut Vec<u8>, s: &str) {
+            v.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            v.extend_from_slice(s.as_bytes());
+        }
+        let mut v = vec![0x00, 0x00, 0x00, 0x00]; // identifier
+        v.push(0xFE);
+        v.push(0x00); // root type
+        v.extend_from_slice(&2u32.to_le_bytes()); // version
+        v.extend_from_slice(&100u16.to_le_bytes()); // width
+        v.extend_from_slice(&200u16.to_le_bytes()); // height
+        v.extend_from_slice(&3u32.to_le_bytes()); // major items
+        v.extend_from_slice(&57u32.to_le_bytes()); // minor items
+        // MAP_DATA
+        v.push(0xFE);
+        v.push(OTBM_MAP_DATA);
+        v.push(OTBM_ATTR_DESCRIPTION);
+        string(&mut v, "x");
+        // TILE_AREA at base (10, 20, 7)
+        v.push(0xFE);
+        v.push(OTBM_TILE_AREA);
+        v.extend_from_slice(&10u16.to_le_bytes());
+        v.extend_from_slice(&20u16.to_le_bytes());
+        v.push(7u8);
+        // TILE at offset (0, 0)
+        v.push(0xFE);
+        v.push(OTBM_TILE);
+        v.push(0u8); // x offset
+        v.push(0u8); // y offset
+        // child OTBM_ITEM with caller-supplied props
+        v.push(0xFE);
+        v.push(OTBM_ITEM);
+        v.extend_from_slice(props);
+        v.push(0xFF); // end item
+        v.push(0xFF); // end tile
+        v.push(0xFF); // end tile area
+        // TOWNS (empty but required by the parser)
+        v.push(0xFE);
+        v.push(OTBM_TOWNS);
+        v.push(0xFF); // end towns
+        // WAYPOINTS (empty)
+        v.push(0xFE);
+        v.push(OTBM_WAYPOINTS);
+        v.push(0xFF); // end waypoints
+        v.push(0xFF); // end map data
+        v.push(0xFF); // end root
+        v
+    }
+
+    #[test]
+    fn otbm_item_count_attr_is_parsed() {
+        // An OTBM_ITEM node whose props are [u16 id][OTBM_ATTR_COUNT=15][u8 count]
+        // must yield MapItem { id, count: Some(count), .. }.
+        let item_id: u16 = 2148;
+        let count: u8 = 47;
+        let mut props = Vec::new();
+        props.extend_from_slice(&item_id.to_le_bytes());
+        props.push(OTBM_ATTR_COUNT);
+        props.push(count);
+        let map = parse(&otbm_with_item_props(&props)).unwrap();
+        assert_eq!(map.tiles.len(), 1);
+        let items = &map.tiles[0].items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, item_id);
+        assert_eq!(items[0].count, Some(count));
+    }
+
+    #[test]
+    fn otbm_item_unknown_trailing_attr_does_not_panic_and_yields_id() {
+        // An item with an unknown attribute byte (0xFD, not in the known set) after
+        // the id must NOT panic. The id must still be parsed; count will be None
+        // because the loop breaks on the unknown attribute.
+        let item_id: u16 = 1234;
+        let unknown_attr: u8 = 0xFD; // not a known OTBM_ATTR_* value
+        let mut props = Vec::new();
+        props.extend_from_slice(&item_id.to_le_bytes());
+        props.push(unknown_attr);
+        props.push(42u8); // trailing byte for the unknown attr (consumed or ignored)
+        let map = parse(&otbm_with_item_props(&props)).unwrap();
+        assert_eq!(map.tiles.len(), 1);
+        let items = &map.tiles[0].items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, item_id);
+        assert_eq!(items[0].count, None, "unknown trailing attr yields count: None");
+    }
 }

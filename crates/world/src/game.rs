@@ -3470,4 +3470,228 @@ mod tests {
         let rec = save_rx.try_recv().expect("logout must emit a SaveRecord");
         assert_eq!(rec.sex, 0, "sex must round-trip login→logout through SaveRecord");
     }
+
+    // -------------------------------------------------------------------------
+    // M9 do_look tests
+    // -------------------------------------------------------------------------
+
+    /// FLAG_PICKUPABLE (bit 5) from items.otb.
+    const FLAG_PICKUPABLE_OTB: u32 = 1 << 5;
+    /// FLAG_STACKABLE (bit 7) from items.otb.
+    const FLAG_STACKABLE_OTB: u32 = 1 << 7;
+
+    /// Build a map with item metadata loaded:
+    ///
+    /// - server id 100: ground (group 1), no flags → not pickupable, not stackable
+    /// - server id 200: "stone" — pickupable, non-stackable, weight 110 (hundredths)
+    /// - server id 300: "gold coin" — pickupable + stackable, show_count true, weight 10
+    ///
+    /// Tiles:
+    ///
+    ///   - (100,100,7) spawn — ground only
+    ///   - (101,100,7) — ground + stone (sid 200) at index 1 (stackpos 1)
+    ///   - (102,100,7) — ground + gold coin (sid 300, count 50) at index 1
+    ///   - (103,100,7) — ground only (non-pickupable ground for weight-0 test)
+    fn look_map() -> Arc<StaticMap> {
+        use formats::items_xml::FloorChange;
+        use formats::items_xml::ItemsXml;
+        use formats::items_xml::parse_items_xml;
+        use formats::otb::{ItemType as OtbItemType, ItemsOtb};
+        use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
+
+        let otb = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                // ground (group 1, no flags)
+                OtbItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
+                    always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                // stone: pickupable (bit 5), not stackable
+                OtbItemType { group: 5, flags: FLAG_PICKUPABLE_OTB, server_id: 200, client_id: 1987,
+                    always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                // gold coin: pickupable + stackable (bits 5+7)
+                OtbItemType { group: 5, flags: FLAG_PICKUPABLE_OTB | FLAG_STACKABLE_OTB, server_id: 300,
+                    client_id: 2148, always_on_top: false, top_order: 0, has_height: false,
+                    floor_change: FloorChange::NONE },
+            ],
+        };
+
+        let xml_str = r#"<items>
+          <item id="200" name="stone" article="a" plural="stones">
+            <attribute key="weight" value="110"/>
+          </item>
+          <item id="300" name="gold coin" article="a" plural="gold coins">
+            <attribute key="weight" value="10"/>
+            <attribute key="showcount" value="1"/>
+          </item>
+        </items>"#;
+        let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
+
+        let g = |x: u16, y: u16| MapTile {
+            x, y, z: 7, flags: 0, house_id: None,
+            items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+        };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                g(100, 100),  // spawn — ground only
+                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![
+                        MapItem { id: 100, count: None, contents: vec![] },
+                        MapItem { id: 200, count: None, contents: vec![] }, // stone at stackpos 1
+                    ] },
+                MapTile { x: 102, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![
+                        MapItem { id: 100, count: None, contents: vec![] },
+                        MapItem { id: 300, count: Some(50), contents: vec![] }, // 50 gold coins
+                    ] },
+                g(103, 100),  // ground only
+                g(99, 100),   // one tile west of spawn (for out-of-viewport test)
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        let mut sm = StaticMap::from_formats(&map, &otb);
+        sm.load_item_metadata(&otb, &xml);
+        Arc::new(sm)
+    }
+
+    /// Decode the text from a `0xB4 MESSAGE_INFO_DESCR` packet pushed to the
+    /// receiver. Panics if nothing was pushed or the format is wrong.
+    fn recv_look_text(rx: &mut mpsc::Receiver<Vec<u8>>) -> String {
+        let pkt = rx.try_recv().expect("expected a 0xB4 look packet");
+        assert_eq!(pkt[0], 0xB4, "must be a 0xB4 text message");
+        assert_eq!(pkt[1], MSG_INFO_DESCR, "must be MESSAGE_INFO_DESCR (22)");
+        let len = u16::from_le_bytes([pkt[2], pkt[3]]) as usize;
+        String::from_utf8(pkt[4..4 + len].to_vec()).expect("look text must be valid UTF-8")
+    }
+
+    #[test]
+    fn do_look_ground_item_adjacent_shows_article_name_and_weight() {
+        let mut g = Game::new(look_map());
+        // Looker at (100,100,7), stone is at (101,100,7) — distance 1 (adjacent).
+        let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // stackpos 1 = stone on tile (101,100,7)
+        g.do_look(looker, 101, 100, 7, 1);
+        let text = recv_look_text(&mut rx);
+        // Must contain "You see a stone."
+        assert!(text.contains("You see a stone."), "text: {text:?}");
+        // Adjacent → must show weight line: "It weighs 1.10 oz."
+        assert!(text.contains("It weighs 1.10 oz."), "adjacent item must show weight; text: {text:?}");
+    }
+
+    #[test]
+    fn do_look_ground_item_far_away_omits_weight() {
+        let mut g = Game::new(look_map());
+        // Looker at (100,100,7). Put another player at (103,100,7) to create a
+        // position 3 tiles away. Actually just move the looker far from the stone.
+        // Stone is at (101,100,7). Place looker at (103,100,7) → dist = 2.
+        let (looker, mut rx) = add_player(&mut g, Position::new(103, 100, 7));
+        g.do_look(looker, 101, 100, 7, 1);
+        let text = recv_look_text(&mut rx);
+        assert!(text.contains("You see a stone."), "text: {text:?}");
+        // Distance ≥ 2 → no weight line
+        assert!(!text.contains("weighs"), "far look must NOT show weight; text: {text:?}");
+    }
+
+    #[test]
+    fn do_look_non_pickupable_item_no_weight_line() {
+        // Ground item (sid 100) is not pickupable → no weight line even when adjacent.
+        let mut g = Game::new(look_map());
+        let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // stackpos 0 = ground at (100,100,7) itself
+        g.do_look(looker, 100, 100, 7, 0);
+        let text = recv_look_text(&mut rx);
+        assert!(!text.contains("weighs"), "non-pickupable item must not show weight; text: {text:?}");
+    }
+
+    #[test]
+    fn do_look_stackable_item_with_count_shows_count_and_plural() {
+        // gold coins (sid 300) at (102,100,7), count 50. show_count true.
+        let mut g = Game::new(look_map());
+        let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // stackpos 1 = gold coins at (102,100,7)
+        g.do_look(looker, 102, 100, 7, 1);
+        let text = recv_look_text(&mut rx);
+        // "You see 50 gold coins."
+        assert!(text.contains("You see 50 gold coins."), "text: {text:?}");
+    }
+
+    #[test]
+    fn do_look_other_player_shows_name_level_and_pronoun() {
+        let mut g = Game::new(look_map());
+        let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // Add a target player with a distinctive name, placed adjacent.
+        let (tx2, _rx2) = mpsc::channel(PUSH_CAPACITY);
+        let target_id = g.next_id;
+        g.next_id += 1;
+        g.players.insert(target_id, PlayerState {
+            name: "Alice".into(), position: Position::new(100, 100, 7),
+            direction: Direction::South, outfit: knight(), push_tx: tx2,
+            known: HashSet::new(), health: 150, max_health: 150, fist_skill: 10,
+            attacking: None, last_attack_ms: 0,
+            sex: 0, // female
+            gamemaster: false,
+        });
+        // Looker is at the same tile; tile pre_creature_len is 1 (just the ground),
+        // creatures = [looker_id, target_id] (sorted). stackpos 1 = first creature
+        // (the lower id), stackpos 2 = second. Since both players are at (100,100,7)
+        // and ids are assigned sequentially with looker first, target_id > looker_id.
+        // pre = 1, creatures = [looker, target] sorted by id.
+        // looker_id < target_id so stackpos 1 = looker, stackpos 2 = target.
+        g.do_look(looker, 100, 100, 7, 2);
+        let text = recv_look_text(&mut rx);
+        assert!(text.contains("Alice (Level 1)."), "text: {text:?}");
+        assert!(text.contains("She has no vocation."), "female pronoun; text: {text:?}");
+        // Now change to male and re-verify.
+        g.players.get_mut(&target_id).unwrap().sex = 1;
+        g.do_look(looker, 100, 100, 7, 2);
+        let text2 = recv_look_text(&mut rx);
+        assert!(text2.contains("He has no vocation."), "male pronoun; text2: {text2:?}");
+    }
+
+    #[test]
+    fn do_look_self_shows_yourself() {
+        let mut g = Game::new(look_map());
+        let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // pre_creature_len = 1 (ground), stackpos 1 = looker itself.
+        g.do_look(looker, 100, 100, 7, 1);
+        let text = recv_look_text(&mut rx);
+        assert!(text.contains("You see yourself."), "text: {text:?}");
+        assert!(text.contains("You have no vocation."), "text: {text:?}");
+    }
+
+    #[test]
+    fn do_look_gamemaster_item_appends_item_id_and_position() {
+        let mut g = Game::new(look_map());
+        let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // Elevate to GM.
+        g.players.get_mut(&looker).unwrap().gamemaster = true;
+        // Look at stone (sid 200) at (101,100,7), stackpos 1.
+        g.do_look(looker, 101, 100, 7, 1);
+        let text = recv_look_text(&mut rx);
+        assert!(text.ends_with("\nItem ID: 200\nPosition: 101, 100, 7"),
+            "GM look must end with Item ID and Position; text: {text:?}");
+    }
+
+    #[test]
+    fn do_look_non_gamemaster_no_debug_suffix() {
+        let mut g = Game::new(look_map());
+        let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // gamemaster = false (default)
+        g.do_look(looker, 101, 100, 7, 1);
+        let text = recv_look_text(&mut rx);
+        assert!(!text.contains("Item ID:"), "non-GM must not see Item ID; text: {text:?}");
+        assert!(!text.contains("Position:"), "non-GM must not see Position; text: {text:?}");
+    }
+
+    #[test]
+    fn do_look_out_of_viewport_pushes_nothing() {
+        let mut g = Game::new(look_map());
+        // Looker at (100,100,7). A tile that is far out of the viewport
+        // (dx = 50 > 9) must produce no packet.
+        let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.do_look(looker, 150, 100, 7, 0);
+        assert!(rx.try_recv().is_err(), "look outside viewport must push nothing");
+    }
 }

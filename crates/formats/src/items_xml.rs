@@ -273,4 +273,44 @@ mod tests {
             "real items.xml should define floorchange=down stairs"
         );
     }
+
+    #[test]
+    fn item_attrs_name_article_plural_description_weight() {
+        let xml = r#"<items>
+          <item id="2148" name="gold coin" article="a" plural="gold coins">
+            <attribute key="description" value="Shiny!"/>
+            <attribute key="weight" value="550"/>
+          </item>
+        </items>"#;
+        let parsed = parse_items_xml(xml).unwrap();
+        let a = parsed.attrs(2148).expect("item 2148 must be present");
+        assert_eq!(a.name, "gold coin");
+        assert_eq!(a.article, "a");
+        assert_eq!(a.plural, "gold coins");
+        assert_eq!(a.description, "Shiny!");
+        // Weight is stored in hundredths of an oz as-is (NOT divided).
+        assert_eq!(a.weight, 550);
+        // show_count defaults to true when no showcount attribute is present.
+        assert!(a.show_count, "show_count must default to true");
+    }
+
+    #[test]
+    fn item_attrs_showcount_false_when_zero() {
+        let xml = r#"<items>
+          <item id="1987" name="stone" article="a" plural="stones">
+            <attribute key="weight" value="110"/>
+            <attribute key="showcount" value="0"/>
+          </item>
+        </items>"#;
+        let parsed = parse_items_xml(xml).unwrap();
+        let a = parsed.attrs(1987).expect("item 1987 must be present");
+        assert!(!a.show_count, "showcount=0 must yield show_count == false");
+    }
+
+    #[test]
+    fn absent_item_attrs_returns_none() {
+        let xml = r#"<items><item id="100" name="grass"/></items>"#;
+        let parsed = parse_items_xml(xml).unwrap();
+        assert!(parsed.attrs(9999).is_none(), "absent item must return None");
+    }
 }
