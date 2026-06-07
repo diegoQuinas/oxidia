@@ -16,7 +16,7 @@ use rand::{SeedableRng, rngs::StdRng};
 use protocol::chat::{self, SpeakType};
 use protocol::combat_packets;
 use protocol::creature::{self, CreatureView, Outfit};
-use protocol::map_description::{Center, PlacedCreature, TileSource};
+use protocol::map_description::{PlacedCreature, TileSource};
 use protocol::outfit as outfit_packets;
 use protocol::{enter_world, tile_creature, walk};
 
@@ -705,122 +705,41 @@ impl Game {
             }
         }
 
-        // Compute the death tile and temple before any mutations.
+        // Death position + temple destination (computed before removal).
         let death_pos = match self.players.get(&victim_id) {
             Some(p) => p.position,
             None => return,
         };
         let temple = self.map.temple_for(death_pos);
 
-        // --- Remove from death tile (mirrors logout) ---
-        // Id-form remove: under co-occupancy (stair/height landings) a
-        // position+stackpos remove is ambiguous when another creature shares the
-        // death tile. Matches logout and do_move.
-        let spectators_death: Vec<u32> = self.spectators(death_pos, victim_id);
-        for spec in &spectators_death {
-            self.push(*spec, walk::remove_creature_by_id(victim_id));
-            if let Some(s) = self.players.get_mut(spec) { s.known.remove(&victim_id); }
+        // Remove from the death tile for spectators. The id-form remove is
+        // unambiguous under co-occupancy (stair/height landings); drop the victim
+        // from each spectator's known-set so a relog re-introduces it (full form).
+        for spec in self.spectators(death_pos, victim_id) {
+            self.push(spec, walk::remove_creature_by_id(victim_id));
+            if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&victim_id); }
         }
 
-        // Teleport: find a free tile at/near the temple.
-        let respawn_pos = {
-            // Temporarily remove the victim to let free_spawn ignore it, then
-            // restore.  We do this by saving the player, removing, calling
-            // free_spawn_near, and re-inserting at the new position.
-            let mut victim_state = self.players.remove(&victim_id).expect("victim exists");
-            victim_state.position = temple;
-            victim_state.health = victim_state.max_health;
-            // Re-insert before free_spawn so we can call the method safely.
-            self.players.insert(victim_id, victim_state);
-            // Find a free tile near the temple (the victim's new position may
-            // collide with another player if the temple tile is occupied).
-            self.free_spawn_near(temple, victim_id)
-        };
-        if let Some(p) = self.players.get_mut(&victim_id) {
-            p.position = respawn_pos;
-            p.health = p.max_health;
-        }
-
-        // --- Add at the temple tile (mirrors login appear) ---
-        let stackpos_new = self.map.creature_stackpos(
-            i32::from(respawn_pos.x), i32::from(respawn_pos.y), i32::from(respawn_pos.z));
-        let spectators_temple: Vec<u32> = self.spectators(respawn_pos, victim_id);
-        for spec in &spectators_temple {
-            if let Some(bytes) = self.introduce(*spec, victim_id) {
-                self.push(*spec, tile_creature::add_tile_creature(
-                    (respawn_pos.x, respawn_pos.y, respawn_pos.z), stackpos_new, &bytes));
-            }
-        }
-        // Teleport puff at the new location for spectators (polish, mirrors login).
-        for spec in &spectators_temple {
-            self.push(*spec, enter_world::magic_effect(
-                respawn_pos.x, respawn_pos.y, respawn_pos.z, enter_world::EFFECT_TELEPORT));
-        }
-
-        // W2 fix: prune victim's known-set to only creatures visible from respawn_pos.
-        // At the death tile the victim accumulated a known-set; the client drops those
-        // when it re-renders from the 0x64 burst. Any stale id kept server-side would
-        // later produce the short 0x62 form for a creature the client already culled,
-        // triggering OTClient's "parseCreatureMove: unable to remove creature".
-        // Mirrors do_move's left_view prune (game.rs ~810-825).
-        let stale: Vec<u32> = {
-            let victim = match self.players.get(&victim_id) { Some(p) => p, None => return };
-            victim.known.iter().copied()
-                .filter(|&oid| {
-                    self.players.get(&oid)
-                        .is_none_or(|op| !Self::can_see(respawn_pos, op.position))
-                })
-                .collect()
-        };
-        if let Some(victim) = self.players.get_mut(&victim_id) {
-            for oid in &stale { victim.known.remove(oid); }
-        }
-
-        // Send the respawned victim a fresh map description + 0xA0 stats so its
-        // client re-renders the temple tile.
-        let center = Center { x: respawn_pos.x, y: respawn_pos.y, z: respawn_pos.z };
-
-        // W1 fix: include all other players visible from respawn_pos in `placed` so
-        // the victim's 0x64 burst renders them. Without this, players standing near
-        // the temple are invisible to the freshly respawned victim (it can be attacked
-        // by someone it cannot see). Mirrors do_move's others_in_range (game.rs ~829-837).
-        let victim_creature = {
-            let p = match self.players.get(&victim_id) { Some(p) => p, None => return };
-            let view = creature::CreatureView {
-                id: victim_id,
-                name: p.name.as_bytes(),
-                health_percent: 100,
-                direction: p.direction.to_byte(),
+        // Remove the victim from the world (death == logout). Persist the player
+        // AT THE TEMPLE with full HP so the relog spawns there — M8 `login`
+        // restores the saved position, so saving the death tile would respawn the
+        // player where they died. Dropping the PlayerState drops its session
+        // push_tx, which closes the writer channel and ends the session: the
+        // client shows the death window and returns to character select. Mirrors
+        // TFS onDeath -> sendReLoginWindow + removeCreature (player.cpp:2070, 2197);
+        // the death-respawn position is the town temple.
+        let Some(p) = self.players.remove(&victim_id) else { return };
+        if let Some(tx) = &self.save_tx {
+            let _ = tx.send(SaveRecord {
+                name: p.name.clone(),
+                position: temple,
+                direction: p.direction,
                 outfit: p.outfit,
-                light_level: 0, light_color: 0, speed: 220,
-            };
-            creature::add_creature(&view, false, 0)
-        };
-        let others_visible: Vec<u32> = self.visible_from(respawn_pos, victim_id);
-        let mut placed = vec![PlacedCreature {
-            x: respawn_pos.x, y: respawn_pos.y, z: respawn_pos.z,
-            bytes: victim_creature,
-        }];
-        for oid in others_visible {
-            if let Some(bytes) = self.introduce(victim_id, oid) {
-                let opos = match self.players.get(&oid) { Some(p) => p.position, None => continue };
-                placed.push(PlacedCreature { x: opos.x, y: opos.y, z: opos.z, bytes });
-            }
-        }
-        let map_desc = protocol::map_description::encode(center, self.map.as_ref(), &placed);
-        self.push(victim_id, map_desc);
-        let stats = {
-            let p = match self.players.get(&victim_id) { Some(p) => p, None => return };
-            enter_world::stats(&enter_world::Stats {
-                health: p.health,
+                health: p.max_health,
                 max_health: p.max_health,
-                free_capacity: 40_000, total_capacity: 40_000,
-                experience: 0, level: 1, level_percent: 0,
-                mana: 0, max_mana: 0, magic_level: 0,
-                soul: 100, stamina_minutes: 2520, base_speed: 220,
-            })
-        };
-        self.push(victim_id, stats);
+            });
+        }
+
     }
 
     /// Global combat tick. Iterates all players with an active target and, for
@@ -880,28 +799,6 @@ impl Game {
             }
             self.apply_damage(target_id, dmg);
         }
-    }
-
-    /// Like `free_spawn` but the `exclude` player is already in the players map
-    /// at its (potentially new) position. Finds the nearest walkable, unoccupied
-    /// tile near `origin` for `exclude`, returning `origin` if free.
-    fn free_spawn_near(&self, origin: Position, exclude: u32) -> Position {
-        if self.map.is_walkable(origin) && !self.tile_occupied(origin, exclude) {
-            return origin;
-        }
-        for r in 1..=5i32 {
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    if dx.abs() != r && dy.abs() != r { continue; }
-                    if let Some(p) = origin.offset(dx, dy) {
-                        if self.map.is_walkable(p) && !self.tile_occupied(p, exclude) {
-                            return p;
-                        }
-                    }
-                }
-            }
-        }
-        origin
     }
 
     fn do_move(&mut self, id: u32, direction: Direction) {
@@ -1890,21 +1787,20 @@ mod tests {
     }
 
     #[test]
-    fn death_sends_death_window_and_respawns_at_temple() {
-        // Drive enough ticks until B dies (HP reaches 0).
-        // B must receive 0x28 death window, then be at the spawn tile with full HP.
-        // A is placed at (97,117,7) so the spawn tile (95,117,7) is free for B's respawn.
+    fn death_sends_window_removes_victim_and_saves_at_temple() {
+        // Death == logout: the victim gets the 0x28 window, is removed from the
+        // world, and a SaveRecord is emitted at the temple with full HP — so the
+        // relog spawns at the temple (M8 `login` restores the saved position).
         let mut g = Game::new(combat_map(false));
+        let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
+        g.save_tx = Some(save_tx);
         let (a, _ra) = add_player(&mut g, Position::new(97, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         let max_hp = g.players[&b].max_health;
+        let temple = g.map.spawn();
         g.do_set_target(a, b);
-
-        // Force B's health to 1 to make death happen on the next (max-damage) tick.
         g.players.get_mut(&b).unwrap().health = 1;
 
-        // Run ticks until B's health hits 0 (death fires during apply_damage).
-        // We run at most max_hp ticks since even 1 damage per tick kills.
         let mut saw_death_window = false;
         for tick in 1..=(max_hp as u64 + 5) {
             g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
@@ -1913,43 +1809,33 @@ mod tests {
                     saw_death_window = true;
                 }
             }
-            if saw_death_window { break; }
+            if !g.players.contains_key(&b) { break; }
         }
 
-        assert!(saw_death_window, "dying player must receive 0x28 death window");
-        // After death: health restored, position is at the temple (spawn).
-        assert_eq!(g.players[&b].health, max_hp, "respawn must restore full health");
-        let spawn = g.map.spawn();
-        assert_eq!(g.players[&b].position, spawn, "respawn must teleport to temple");
+        assert!(saw_death_window, "dying player must receive the 0x28 death window");
+        assert!(!g.players.contains_key(&b), "victim must be removed from the world on death");
+        let rec = save_rx.try_recv().expect("death must emit a SaveRecord");
+        assert_eq!(rec.position, temple, "death saves the player at the temple");
+        assert_eq!(rec.health, rec.max_health, "death saves the player at full HP");
     }
 
     #[test]
-    fn death_clears_attacker_fight_and_respawn_tile_invariant_holds() {
-        // After B dies and respawns at the temple, B and A must be on different tiles
-        // (≤1 creature per tile invariant). Attacker A must also have attacking cleared.
-        // A at (97,117,7) so the spawn tile (95,117,7) is free for B's respawn.
+    fn death_clears_attacker_fight() {
+        // Death clears every fight targeting the victim. `fist_damage` rolls
+        // 0..=max (a swing can deal 0), so tick until the kill lands rather than
+        // assuming one swing kills.
         let mut g = Game::new(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(97, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
         g.players.get_mut(&b).unwrap().health = 1;
-        // `fist_damage` rolls in 0..=max (TFS `normal_random`), so a single swing
-        // can deal 0. Tick until the kill lands (mirrors the run-until-death sibling
-        // test) instead of assuming one swing kills — otherwise a 0-roll leaves the
-        // fight uncleared and the assertion flakes (~5%). Death clears `attacking`.
         for tick in 1..=200u64 {
             g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
             while rb.try_recv().is_ok() {} // drain packets
-            if g.players[&a].attacking.is_none() {
-                break;
-            }
+            if !g.players.contains_key(&b) { break; }
         }
-        // After death+respawn: A's fight must be cleared.
-        assert_eq!(g.players[&a].attacking, None, "attacker's fight must be cleared on target death");
-        // No two players on the same tile.
-        let pos_a = g.players[&a].position;
-        let pos_b = g.players[&b].position;
-        assert_ne!(pos_a, pos_b, "attacker and respawned victim must not share a tile");
+        assert!(!g.players.contains_key(&b), "victim must be removed from the world on death");
+        assert_eq!(g.players[&a].attacking, None, "attacker's fight must clear on target death");
     }
 
     #[test]
@@ -2003,45 +1889,8 @@ mod tests {
     // M7 review fix tests (W1, W2, W3)
     // -------------------------------------------------------------------------
 
-    /// Build a combat map with a second non-PZ tile far enough from the spawn that
-    /// the death tile and temple are OUT of each other's viewport. Player A stands
-    /// at the far tile; B (victim) is adjacent. The temple is at (95,117,7).
-    /// We place A at (96,117,7) and the death tile for B at (96,117,7); after death
-    /// B respawns at (95,117,7). We need a separate "far" tile far from temple for
-    /// the out-of-view scenario.
-    ///
-    /// For W1/W2 we need two players at the temple after respawn: a bystander C
-    /// standing near the temple tile, and the victim B respawning there. The map
-    /// needs a wide enough ground area for that.
-    fn wide_combat_map() -> Arc<StaticMap> {
-        let items = ItemsOtb {
-            major_version: 3, minor_version: 57, build_number: 0,
-            items: vec![
-                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
-                    always_on_top: false, top_order: 0, has_height: false,
-                    floor_change: formats::items_xml::FloorChange::NONE },
-            ],
-        };
-        let ground = |x: u16, y: u16| MapTile {
-            x, y, z: 7, flags: 0, house_id: None,
-            items: vec![MapItem { id: 100, contents: vec![] }],
-        };
-        // Spawn at (95,117). Build a wide row so spectators can stand near it
-        // and we can place the death tile far away (20 tiles east).
-        let mut tiles: Vec<MapTile> = (90u16..=116u16).map(|x| ground(x, 117)).collect();
-        // Also the PZ tile for W3 test — tile at (90,117) will be made PZ separately
-        tiles.push(ground(115, 116)); // extra tile for bystander clearance
-        let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
-            tiles,
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
-            waypoints: vec![],
-        };
-        Arc::new(StaticMap::from_formats(&map, &items))
-    }
-
-    /// Same as wide_combat_map but tile (90,117) is marked protection zone.
+    /// A wide combat map (row 90..=116 walkable, temple at 95,117) where tile
+    /// (90,117) is marked a protection zone — used by the PZ combat tests.
     fn wide_combat_map_with_pz() -> Arc<StaticMap> {
         let items = ItemsOtb {
             major_version: 3, minor_version: 57, build_number: 0,
@@ -2069,93 +1918,6 @@ mod tests {
             waypoints: vec![],
         };
         Arc::new(StaticMap::from_formats(&map, &items))
-    }
-
-    // W1 repro: after respawn the victim's map description must include a bystander
-    // standing near the temple tile within the victim's viewport.
-    //
-    // Setup: bystander C at (96,117,7) — one tile east of the temple (95,117,7).
-    // Victim B dies and respawns at (95,117,7). The map description sent to B after
-    // respawn must contain a PlacedCreature for C (its creature-id bytes embedded in
-    // the map tile stream via the full 0x61 form).
-    //
-    // Without the fix, `placed` only contains B itself, so C's id is absent from
-    // the map description and C is invisible to B's client.
-    #[test]
-    fn respawn_map_desc_includes_bystander_near_temple() {
-        let mut g = Game::new(wide_combat_map());
-        // Attacker A far from the temple so respawn tile (95,117) is free.
-        let (a, _ra) = add_player(&mut g, Position::new(114, 117, 7));
-        // Bystander C stands at (96,117,7) — adjacent to the temple, within viewport.
-        let (c, _rc) = add_player(&mut g, Position::new(96, 117, 7));
-        // Victim B starts adjacent to A so melee range works, then we force-kill.
-        let (b, mut rb) = add_player(&mut g, Position::new(113, 117, 7));
-        let max_hp = g.players[&b].max_health;
-        g.do_set_target(a, b);
-        g.players.get_mut(&b).unwrap().health = 1;
-
-        // Drive ticks until B dies (a single tick may roll 0 damage); capture the
-        // 0x64 map description pushed to B on respawn.
-        let mut map_desc: Option<Vec<u8>> = None;
-        for tick in 1..=(max_hp as u64 + 5) {
-            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
-            while let Ok(pkt) = rb.try_recv() {
-                if pkt[0] == protocol::map_description::OPCODE_MAP_DESCRIPTION {
-                    map_desc = Some(pkt);
-                }
-            }
-            if map_desc.is_some() {
-                break;
-            }
-        }
-        let map_bytes = map_desc.expect("respawned victim must receive a 0x64 map description");
-
-        // Bystander C's id (u32 LE) must appear in the map description bytes.
-        // The 0x61 full creature form encodes the id as u32 LE after the 0x61 marker.
-        // Without the fix, C is absent from `placed` and its id never appears.
-        let c_id_le = c.to_le_bytes();
-        let has_c = map_bytes.windows(4).any(|w| w == c_id_le);
-        assert!(
-            has_c,
-            "respawn map description must include bystander C (id {c}) near the temple"
-        );
-    }
-
-    // W2 repro: after respawn the victim must NOT have in its known-set any creature
-    // that was only visible from the death tile (out of view from the temple).
-    //
-    // Setup: creature X stands at the death tile area (>9 tiles from temple).
-    // Victim B knows X (was introduced before death). After respawn, X is out of
-    // view from the temple → B must have forgotten X (known.contains(&x) == false).
-    #[test]
-    fn respawn_prunes_known_set_of_out_of_view_creatures() {
-        let mut g = Game::new(wide_combat_map());
-        // X stands 15 tiles east of temple (95+15=110,117) — well out of view from temple.
-        let (x, _rx) = add_player(&mut g, Position::new(110, 117, 7));
-        // B starts adjacent to X so it can "know" X.
-        let (b, mut rb) = add_player(&mut g, Position::new(111, 117, 7));
-        // Introduce X to B (simulates B having seen X before death).
-        g.introduce(b, x);
-        assert!(g.players[&b].known.contains(&x), "B knows X before death");
-
-        // A at (112,117) adjacent to B; force B to die.
-        let (a, _ra) = add_player(&mut g, Position::new(112, 117, 7));
-        let max_hp = g.players[&b].max_health;
-        g.do_set_target(a, b);
-        g.players.get_mut(&b).unwrap().health = 1;
-        // Drive ticks until B dies + respawns (a single tick may roll 0 damage).
-        for tick in 1..=(max_hp as u64 + 5) {
-            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
-            while rb.try_recv().is_ok() {} // drain to avoid channel overflow
-        }
-
-        // B respawned at temple (95,117). X is at (110,117): dx=15 > VIEW_RIGHT(9).
-        // B must have forgotten X — otherwise a re-encounter sends the short 0x62
-        // form for a creature B's client already dropped.
-        assert!(
-            !g.players[&b].known.contains(&x),
-            "after respawn to temple, B must forget X which is out of its new viewport"
-        );
     }
 
     // W3 repro: attacker locked on a target; target moves onto a PZ tile → next
