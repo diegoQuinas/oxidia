@@ -5,7 +5,7 @@ use anyhow::Result;
 use persistence::{PlayerSave, Store};
 use protocol::map_description::{self, Center, PlacedCreature};
 use protocol::rsa::RsaPrivateKey;
-use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, xtea};
+use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, outfit as outfit_packets, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
 use world::game::{InitialState, SaveRecord, WorldHandle};
 use world::Direction;
@@ -353,6 +353,21 @@ where
             // 0xA2 — client follow request (parseFollow, TFS line 979-984).
             // M7: consume and ignore (no auto-walk follow yet).
             if opcode == combat_packets::OP_FOLLOW {
+                continue;
+            }
+            // 0xD2 — client requests the outfit-selection window.
+            // Reply: push 0xC8 outfit_window to this player only (no broadcast).
+            if opcode == outfit_packets::OP_REQUEST_OUTFIT {
+                world.request_outfit(id).await;
+                continue;
+            }
+            // 0xD3 — client commits a new outfit (parseSetOutfit, TFS line 829).
+            // Apply to live state + broadcast 0x8E to player and spectators.
+            // Persists automatically via Slice A on logout (no extra code here).
+            if opcode == outfit_packets::OP_SET_OUTFIT {
+                if let Some(outfit) = outfit_packets::parse_set_outfit(&payload[1..]) {
+                    world.change_outfit(id, outfit).await;
+                }
                 continue;
             }
             let Some((direction, is_turn)) = opcode_action(opcode) else { continue };
