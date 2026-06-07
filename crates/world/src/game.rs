@@ -41,6 +41,9 @@ const COMBAT_TICK_MS: u64 = 250;
 /// Used for PZ-rejection ("You may not attack…").
 const MSG_STATUS_SMALL: u8 = 21;
 
+/// TFS `MESSAGE_INFO_DESCR = 22`: green look-description message (`const.h:191`).
+const MSG_INFO_DESCR: u8 = 22;
+
 /// Client viewport extents from the player's tile, matching the 18x14 map
 /// description anchored at center-8 / center-6 (TFS `Map::maxClientViewportX/Y`).
 /// Asymmetric: one extra column east and one extra row south.
@@ -87,6 +90,8 @@ pub struct InitialState {
     /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
     /// Selects the gendered outfit catalog served by do_request_outfit.
     pub sex: u8,
+    /// `true` if the session authenticated as a gamemaster (look-at debug info).
+    pub gamemaster: bool,
 }
 
 /// Emitted on the save channel the instant a player leaves the game.
@@ -127,6 +132,8 @@ struct PlayerState {
     /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
     /// Determines which gendered outfit catalog is sent in the 0xC8 window.
     sex: u8,
+    /// Gamemaster flag from login; gates look-at debug (item id + position).
+    gamemaster: bool,
 }
 
 struct Game {
@@ -287,6 +294,8 @@ impl Game {
             Command::ChangeOutfit { id, outfit } => self.do_change_outfit(id, outfit),
             Command::RequestOutfit { id } => self.do_request_outfit(id),
             Command::CombatTick { now_ms } => self.on_combat_tick(now_ms),
+            Command::LookAt { id, x, y, z, stackpos } => self.do_look(id, x, y, z, stackpos),
+            Command::LookBattle { id, target_id } => self.do_look_battle(id, target_id),
         }
     }
 
@@ -381,6 +390,7 @@ impl Game {
             health: initial.health, max_health: initial.max_health, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
             sex: initial.sex,
+            gamemaster: initial.gamemaster,
         });
 
         // Render each existing player into the new client's enter-world map, and
@@ -597,6 +607,145 @@ impl Game {
     }
 
     // -----------------------------------------------------------------
+    // M9 look handlers
+    // -----------------------------------------------------------------
+
+    /// Handle `0x8C` look-at. Resolve the thing at `(x,y,z)` stackpos, build the
+    /// TFS "You see …" text, and push `0xB4`. Mirrors `Game::playerLookAt`
+    /// (game.cpp:3100): resolve thing, canSee check, distance, describe.
+    fn do_look(&mut self, id: u32, x: u16, y: u16, z: u8, stackpos: u8) {
+        let Some(looker) = self.players.get(&id) else { return };
+        let looker_pos = looker.position;
+        let gm = looker.gamemaster;
+        let pos = Position::new(x, y, z);
+
+        if !Self::can_see(looker_pos, pos) {
+            return;
+        }
+
+        let pre = self.map.tile_pre_creature_len(pos);
+        let creatures = self.creatures_on(pos);
+
+        let sp = stackpos as usize;
+        let text = if sp < pre {
+            self.describe_tile_item(pos, sp, looker_pos, gm)
+        } else if !creatures.is_empty() && sp < pre + creatures.len() {
+            let target = creatures[sp - pre];
+            self.describe_creature(id, target, gm)
+        } else {
+            let idx = sp.saturating_sub(creatures.len());
+            self.describe_tile_item(pos, idx, looker_pos, gm)
+        };
+
+        if let Some(text) = text {
+            self.push_info_descr(id, &text);
+        }
+    }
+
+    /// Handle `0x8D` look-in-battle-list: describe a creature by id.
+    fn do_look_battle(&mut self, id: u32, target_id: u32) {
+        let Some(looker) = self.players.get(&id) else { return };
+        let Some(target) = self.players.get(&target_id) else { return };
+        if !Self::can_see(looker.position, target.position) {
+            return;
+        }
+        let gm = looker.gamemaster;
+        if let Some(text) = self.describe_creature(id, target_id, gm) {
+            self.push_info_descr(id, &text);
+        }
+    }
+
+    /// Ids of creatures standing on `pos`, deterministic order. Mirrors the
+    /// stackpos ordering used by `creature_stackpos_on`.
+    fn creatures_on(&self, pos: Position) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.position == pos)
+            .map(|(&pid, _)| pid)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Build the "You see …" text for the tile item at stack index `idx`.
+    /// `None` if the tile / index has no catalogued item. Ports
+    /// `item.cpp::getDescription` (plain-item subset) + `getNameDescription`.
+    fn describe_tile_item(
+        &self,
+        pos: Position,
+        idx: usize,
+        looker_pos: Position,
+        gm: bool,
+    ) -> Option<String> {
+        let sid = self.map.tile_item_server_id(pos, idx)?;
+        let meta = self.map.item_meta(sid)?;
+        let count = u32::from(self.map.tile_item_count(pos, idx).unwrap_or(1).max(1));
+
+        let mut dist = (i32::from(looker_pos.x) - i32::from(pos.x))
+            .abs()
+            .max((i32::from(looker_pos.y) - i32::from(pos.y)).abs());
+        if looker_pos.z != pos.z {
+            dist += 15;
+        }
+
+        let mut s = String::from("You see ");
+        if meta.stackable && count > 1 && meta.show_count {
+            s.push_str(&format!("{} {}", count, meta.plural));
+        } else if !meta.name.is_empty() {
+            if !meta.article.is_empty() {
+                s.push_str(&meta.article);
+                s.push(' ');
+            }
+            s.push_str(&meta.name);
+        } else {
+            s.push_str(&format!("an item of type {}", sid));
+        }
+        s.push('.');
+
+        if dist <= 1 {
+            if meta.pickupable && meta.weight != 0 {
+                let total = meta.weight * count;
+                let plural = meta.stackable && count > 1;
+                s.push('\n');
+                s.push_str(if plural { "They weigh " } else { "It weighs " });
+                s.push_str(&format!("{}.{:02} oz.", total / 100, total % 100));
+            }
+            if !meta.description.is_empty() {
+                s.push('\n');
+                s.push_str(&meta.description);
+            }
+        }
+
+        if gm {
+            s.push_str(&format!("\nItem ID: {}", sid));
+            s.push_str(&format!("\nPosition: {}, {}, {}", pos.x, pos.y, pos.z));
+        }
+        Some(s)
+    }
+
+    /// Build the "You see …" text for a creature. Ports `player.cpp:85`
+    /// (faithful subset: name, level, vocation; no party/mana/IP).
+    fn describe_creature(&self, looker_id: u32, target_id: u32, gm: bool) -> Option<String> {
+        let target = self.players.get(&target_id)?;
+        let is_self = looker_id == target_id;
+        let mut s = String::from("You see ");
+        if is_self {
+            s.push_str("yourself. You have no vocation.");
+        } else {
+            s.push_str(&target.name);
+            s.push_str(" (Level 1).");
+            s.push_str(if target.sex == 0 { " She" } else { " He" });
+            s.push_str(" has no vocation.");
+        }
+        if gm {
+            let p = target.position;
+            s.push_str(&format!("\nPosition: {}, {}, {}", p.x, p.y, p.z));
+        }
+        Some(s)
+    }
+
+    // -----------------------------------------------------------------
     // M7 combat handlers
     // -----------------------------------------------------------------
 
@@ -607,6 +756,16 @@ impl Game {
         w.write_u8(0xB4);
         w.write_u8(MSG_STATUS_SMALL);
         w.write_string(text);
+        self.push(id, w.into_bytes());
+    }
+
+    /// Push a `0xB4 MESSAGE_INFO_DESCR` look description to a single player.
+    fn push_info_descr(&mut self, id: u32, text: &str) {
+        let bytes = text.as_bytes();
+        let mut w = protocol::message::MessageWriter::new();
+        w.write_u8(0xB4);
+        w.write_u8(MSG_INFO_DESCR);
+        w.write_string(&bytes[..bytes.len().min(255)]);
         self.push(id, w.into_bytes());
     }
 
@@ -1049,6 +1208,10 @@ enum Command {
     RequestOutfit { id: u32 },
     /// Global combat tick fired by the `tokio::time::interval` task.
     CombatTick { now_ms: u64 },
+    /// Client `0x8C`: look at the thing at `(x,y,z)` stackpos `stackpos`.
+    LookAt { id: u32, x: u16, y: u16, z: u8, stackpos: u8 },
+    /// Client `0x8D`: look at a creature in the battle list by id.
+    LookBattle { id: u32, target_id: u32 },
 }
 
 /// Cloneable handle to the running world.
@@ -1110,6 +1273,16 @@ impl WorldHandle {
     /// Fire-and-forget; no reply is expected.
     pub async fn request_outfit(&self, id: u32) {
         let _ = self.tx.send(Command::RequestOutfit { id }).await;
+    }
+
+    /// Look at a tile thing (`0x8C`). Fire-and-forget; the world pushes `0xB4`.
+    pub async fn look(&self, id: u32, x: u16, y: u16, z: u8, stackpos: u8) {
+        let _ = self.tx.send(Command::LookAt { id, x, y, z, stackpos }).await;
+    }
+
+    /// Look at a creature in the battle list (`0x8D`). Fire-and-forget.
+    pub async fn look_battle(&self, id: u32, target_id: u32) {
+        let _ = self.tx.send(Command::LookBattle { id, target_id }).await;
     }
 }
 
@@ -1407,6 +1580,7 @@ mod tests {
             health: 150,
             max_health: 150,
             sex: 1, // male (default)
+            gamemaster: false,
         }
     }
 
@@ -1421,6 +1595,7 @@ mod tests {
             health: 150, max_health: 150, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
             sex: 1, // male (default)
+            gamemaster: false,
         });
         (id, rx)
     }
@@ -1633,6 +1808,7 @@ mod tests {
             health: 150,
             max_health: 150,
             sex: 1,
+            gamemaster: false,
         };
         let ack = g.login("Returning".into(), initial, tx);
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
@@ -3007,6 +3183,7 @@ mod tests {
             health: 80,
             max_health: 120,
             sex: 1,
+            gamemaster: false,
         };
         let ack = g.login("Restored".into(), initial, tx);
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
@@ -3032,6 +3209,7 @@ mod tests {
             health: 150,
             max_health: 150,
             sex: 1,
+            gamemaster: false,
         };
         let ack = g.login("NewPlayer".into(), initial, tx);
         assert_eq!(
@@ -3060,6 +3238,7 @@ mod tests {
             health: 77, max_health: 150, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
             sex: 1,
+            gamemaster: false,
         });
 
         g.logout(id);
@@ -3092,6 +3271,7 @@ mod tests {
             health: 50, max_health: 150, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
             sex: 1,
+            gamemaster: false,
         });
 
         // Pushing any payload triggers the dead-session reap → logout → save.
@@ -3254,6 +3434,7 @@ mod tests {
             health: 150,
             max_health: 150,
             sex: 0, // female
+            gamemaster: false,
         };
         let ack = g.login("Tester".into(), initial, tx);
         assert_eq!(
@@ -3276,6 +3457,7 @@ mod tests {
             health: 150,
             max_health: 150,
             sex: 0, // female
+            gamemaster: false,
         };
         let ack = g.login("Tester".into(), initial, tx);
         let id = ack.snapshot.id;
