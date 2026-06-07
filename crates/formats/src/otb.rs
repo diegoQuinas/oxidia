@@ -25,11 +25,17 @@ const FLAG_ALWAYS_ON_TOP: u32 = 1 << 13;
 /// `FLAG_HAS_HEIGHT` (bit 3) — the item raises the tile; 3 stacked trigger a
 /// height-based floor change (TFS `itemloader.h:146`, `tile.cpp` `hasHeight`).
 const FLAG_HAS_HEIGHT: u32 = 1 << 3;
+/// `FLAG_BLOCK_PROJECTILE` (bit 1) — blocks line-of-sight for thrown items and
+/// spells (TFS `itemloader.h:144`).
+const FLAG_BLOCK_PROJECTILE: u32 = 1 << 1;
 /// `FLAG_STACKABLE` — the wire carries a u8 count after the item's mark byte.
 const FLAG_STACKABLE: u32 = 1 << 7;
 /// `FLAG_PICKUPABLE` (bit 5) — the item can be picked up; look-at shows weight
 /// only for pickupable items (TFS `item.cpp:1499`).
 const FLAG_PICKUPABLE: u32 = 1 << 5;
+/// `FLAG_MOVEABLE` (bit 6) — the item can be picked up or pushed by a player
+/// (TFS `itemloader.h:148`).
+const FLAG_MOVEABLE: u32 = 1 << 6;
 /// `FLAG_ANIMATION` — the wire carries a u8 animation-phase byte after the item.
 const FLAG_ANIMATION: u32 = 1 << 24;
 
@@ -87,6 +93,16 @@ impl ItemType {
     /// `FLAG_PICKUPABLE` — look-at shows a weight line only for pickupable items.
     pub fn is_pickupable(&self) -> bool {
         self.flags & FLAG_PICKUPABLE != 0
+    }
+
+    /// `FLAG_MOVEABLE` — the item can be picked up / pushed (move-thing gate).
+    pub fn is_moveable(&self) -> bool {
+        self.flags & FLAG_MOVEABLE != 0
+    }
+
+    /// `FLAG_BLOCK_PROJECTILE` — blocks line-of-sight (throw / sight checks).
+    pub fn is_block_projectile(&self) -> bool {
+        self.flags & FLAG_BLOCK_PROJECTILE != 0
     }
 
     /// `FLAG_ANIMATION` — the wire form carries a u8 animation-phase byte.

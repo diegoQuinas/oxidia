@@ -69,6 +69,9 @@ const OTBM_TILEFLAG_PROTECTIONZONE: u32 = 1 << 0;
 pub struct StaticMap {
     tiles: HashMap<(u16, u16, u8), TileStack>,
     blocked: HashSet<(u16, u16, u8)>,
+    /// Tiles whose stack contains a block-projectile item — opaque to line of
+    /// sight (TFS `isTileClear`). Built at load alongside `blocked`.
+    block_projectile: HashSet<(u16, u16, u8)>,
     /// Per-tile floor-change flags (union of the tile's items), for stairs.
     floor_change: HashMap<(u16, u16, u8), FloorChange>,
     /// Per-tile cumulative item height (count of `has_height` items).
@@ -106,6 +109,7 @@ impl StaticMap {
 
         let mut tiles = HashMap::new();
         let mut blocked = HashSet::new();
+        let mut block_projectile: HashSet<(u16, u16, u8)> = HashSet::new();
         let mut floor_change = HashMap::new();
         let mut tile_height = HashMap::new();
         let mut protection_zone = HashSet::new();
@@ -150,6 +154,7 @@ impl StaticMap {
             }
 
             // Vertical metadata: union of floor-change flags + summed item heights.
+            // Also precompute block-projectile for line-of-sight checks.
             let mut fc = FloorChange::NONE;
             let mut height: u8 = 0;
             for mi in &tile.items {
@@ -159,6 +164,9 @@ impl StaticMap {
                     }
                     if it.has_height {
                         height = height.saturating_add(1);
+                    }
+                    if it.is_block_projectile() {
+                        block_projectile.insert((tile.x, tile.y, tile.z));
                     }
                 }
             }
@@ -187,7 +195,7 @@ impl StaticMap {
             .map(|t| Position::new(t.x, t.y, t.z))
             .unwrap_or(FALLBACK_SPAWN);
 
-        Self { tiles, blocked, floor_change, tile_height, protection_zone, spawn, item_meta: HashMap::new() }
+        Self { tiles, blocked, block_projectile, floor_change, tile_height, protection_zone, spawn, item_meta: HashMap::new() }
     }
 
     /// Populate the look-at metadata catalog from items.otb (flags) + items.xml
@@ -259,6 +267,12 @@ impl StaticMap {
     /// Cumulative item height on a tile (0 if none).
     pub fn tile_height(&self, pos: Position) -> u8 {
         self.tile_height.get(&(pos.x, pos.y, pos.z)).copied().unwrap_or(0)
+    }
+
+    /// Is there a block-projectile item on this tile? Used for line-of-sight
+    /// checks (TFS `isTileClear`). Populated at load alongside `blocked`.
+    pub fn is_block_projectile(&self, pos: Position) -> bool {
+        self.block_projectile.contains(&(pos.x, pos.y, pos.z))
     }
 
     /// Returns `true` if the tile at `pos` is flagged `OTBM_TILEFLAG_PROTECTIONZONE`
