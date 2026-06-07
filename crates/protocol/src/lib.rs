@@ -22,9 +22,11 @@ pub mod login;
 pub mod look;
 pub mod map_description;
 pub mod message;
+pub mod move_thing;
 pub mod outfit;
 pub mod rsa;
 pub mod tile_creature;
+pub mod tile_item;
 pub mod walk;
 pub mod xtea;
 
