@@ -1126,7 +1126,7 @@ impl Game {
 
         let mut s = String::from("You see ");
         if meta.stackable && count > 1 && meta.show_count {
-            s.push_str(&format!("{} {}", count, meta.plural));
+            s.push_str(&format!("{} {}", count, meta.plural_name()));
         } else if !meta.name.is_empty() {
             if !meta.article.is_empty() {
                 s.push_str(&meta.article);
@@ -1348,25 +1348,40 @@ impl Game {
         self.push_status_message(id, format!("Teleported to temple ({}, {}, {}).", temple.x, temple.y, temple.z).as_bytes());
     }
 
-    /// `/item <id|"name"> [count]` — spawn an item on the GM's own tile. The first
-    /// argument is a server id when it parses as a number, otherwise an item name
-    /// (case-insensitive, singular or plural; quote multi-word names).
+    /// `/item <id|name> [count]` — spawn an item on the GM's own tile. A leading
+    /// number is a server id; otherwise the name is taken from the arguments
+    /// (case-insensitive, singular or plural, no quotes needed for multi-word
+    /// names) and an optional trailing number is the count. Quotes still group.
     fn gm_item(&mut self, id: u32, args: &[&str]) {
-        let Some(first) = args.first() else {
-            self.push_status_message(id, b"Usage: /item <id|\"name\"> [count]");
+        if args.is_empty() {
+            self.push_status_message(id, b"Usage: /item <id|name> [count]");
             return;
-        };
-        let server_id = match first.parse::<u16>() {
-            Ok(n) => n,
-            Err(_) => match self.map.find_item_id_by_name(first) {
-                Some(sid) => sid,
+        }
+        // ID form: a leading number is unambiguously a server id, since no item
+        // name in Tibia contains digits. `/item 2400 100`.
+        let (server_id, count) = if let Ok(server_id) = args[0].parse::<u16>() {
+            let count = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
+            (server_id, count)
+        } else {
+            // Name form: an optional trailing number is the count; everything
+            // before it joins into the (possibly multi-word, unquoted) item name.
+            // `/item crystal coin 100` → name "crystal coin", count 100.
+            let (name_tokens, count) = match args.split_last() {
+                Some((last, head)) if !head.is_empty() => match last.parse::<u16>() {
+                    Ok(n) => (head, n),
+                    Err(_) => (args, 1),
+                },
+                _ => (args, 1),
+            };
+            let name = name_tokens.join(" ");
+            match self.map.find_item_id_by_name(&name) {
+                Some(sid) => (sid, count),
                 None => {
-                    self.push_status_message(id, format!("No item named '{first}'.").as_bytes());
+                    self.push_status_message(id, format!("No item named '{name}'.").as_bytes());
                     return;
                 }
-            },
+            }
         };
-        let count = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
         let Some(pos) = self.players.get(&id).map(|p| p.position) else { return };
         self.do_spawn_item(id, pos, server_id, count);
     }
@@ -1977,7 +1992,7 @@ impl GmVerb {
     fn usage(self) -> &'static str {
         match self {
             Self::Help => "/help",
-            Self::Item => "/item <id|\"name\"> [count]",
+            Self::Item => "/item <id|name> [count]",
             Self::Goto => "/goto <x> <y> <z> | /goto \"player\"",
             Self::Temple => "/temple [\"name\"|id]",
             Self::Teleport => "/teleport \"player\" <x> <y> <z>",

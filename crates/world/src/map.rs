@@ -95,6 +95,22 @@ pub struct ItemMeta {
     pub equip_slot: Option<EquipSlot>,
 }
 
+impl ItemMeta {
+    /// Plural form for stackable count > 1, mirroring TFS `ItemType::getPluralName`
+    /// (`items.h`): the explicit `plural` attribute when set, else `name + "s"`
+    /// when `show_count`, else the bare `name`. This is why `crystal coin` (no
+    /// `plural` in items.xml) still reads "crystal coins".
+    pub fn plural_name(&self) -> String {
+        if !self.plural.is_empty() {
+            self.plural.clone()
+        } else if self.show_count {
+            format!("{}s", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
 /// Wire-ordered items for one tile, split around the creature slot.
 #[derive(Clone)]
 pub(crate) struct TileStack {
@@ -310,7 +326,9 @@ impl StaticMap {
     pub fn find_item_id_by_name(&self, name: &str) -> Option<u16> {
         self.item_meta
             .iter()
-            .filter(|(_, m)| m.name.eq_ignore_ascii_case(name) || m.plural.eq_ignore_ascii_case(name))
+            .filter(|(_, m)| {
+                m.name.eq_ignore_ascii_case(name) || m.plural_name().eq_ignore_ascii_case(name)
+            })
             .map(|(&sid, _)| sid)
             .min()
     }
