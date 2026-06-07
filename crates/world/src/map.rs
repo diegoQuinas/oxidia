@@ -335,6 +335,139 @@ impl StaticMap {
         if fc.contains(FloorChange::EAST_ALT) { dx += 2; }
         to_position(dx, dy, dz)
     }
+
+    // -------------------------------------------------------------------------
+    // Line-of-sight + throw-range (faithful port of TFS map.cpp:486-624)
+    // -------------------------------------------------------------------------
+
+    /// TFS `isTileClear`: a tile is opaque to sight if it holds a block-projectile
+    /// item, or (when `block_floor`) if it has ground at all. (`map.cpp` helper.)
+    fn is_tile_clear(&self, x: u16, y: u16, z: u8, block_floor: bool) -> bool {
+        let key = (x, y, z);
+        if self.block_projectile.contains(&key) {
+            return false;
+        }
+        if block_floor && self.tiles.contains_key(&key) {
+            return false;
+        }
+        true
+    }
+
+    /// TFS anonymous `checkSlightLine`: walk along x, sampling y by slope.
+    fn check_slight_line(&self, x0: u16, y0: u16, x1: u16, y1: u16, z: u8) -> bool {
+        let dx = f32::from(x1) - f32::from(x0);
+        let slope = if dx == 0.0 { 1.0 } else { (f32::from(y1) - f32::from(y0)) / dx };
+        let mut yi = f32::from(y0) + slope;
+        let mut x = x0 + 1;
+        while x < x1 {
+            // 0.1 guard mirrors TFS: "necessary to avoid loss of precision during calculation"
+            // Coords are bounded by map dimensions; cast is safe (mirrors TFS float math).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if !self.is_tile_clear(x, (yi + 0.1).floor() as u16, z, false) {
+                return false;
+            }
+            yi += slope;
+            x += 1;
+        }
+        true
+    }
+
+    /// TFS anonymous `checkSteepLine`: walk along y, sampling x by slope (args
+    /// pre-swapped by `check_sight_line`).
+    fn check_steep_line(&self, x0: u16, y0: u16, x1: u16, y1: u16, z: u8) -> bool {
+        let dx = f32::from(x1) - f32::from(x0);
+        let slope = if dx == 0.0 { 1.0 } else { (f32::from(y1) - f32::from(y0)) / dx };
+        let mut yi = f32::from(y0) + slope;
+        let mut x = x0 + 1;
+        while x < x1 {
+            // 0.1 guard mirrors TFS; coords bounded by map dimensions (faithful cast).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if !self.is_tile_clear((yi + 0.1).floor() as u16, x, z, false) {
+                return false;
+            }
+            yi += slope;
+            x += 1;
+        }
+        true
+    }
+
+    /// TFS `Map::checkSightLine` — pick the steep/slight walk by dominant axis.
+    /// When steep (|dy| > |dx|), x and y are swapped before calling `check_steep_line`,
+    /// exactly as TFS does (`checkSteepLine(y0, x0, y1, x1, z)`).
+    fn check_sight_line(&self, x0: u16, y0: u16, x1: u16, y1: u16, z: u8) -> bool {
+        if x0 == x1 && y0 == y1 {
+            return true;
+        }
+        let dy = i32::from(y1) - i32::from(y0);
+        let dx = i32::from(x1) - i32::from(x0);
+        if dy.abs() > dx.abs() {
+            if y1 > y0 {
+                return self.check_steep_line(y0, x0, y1, x1, z);
+            }
+            return self.check_steep_line(y1, x1, y0, x0, z);
+        }
+        if x0 > x1 {
+            return self.check_slight_line(x1, y1, x0, y0, z);
+        }
+        self.check_slight_line(x0, y0, x1, y1, z)
+    }
+
+    /// TFS `Map::isSightClear` (faithful). Same-floor fast path + the multifloor
+    /// branches. `same_floor=false` matches the throw default.
+    pub fn is_sight_clear(&self, from: Position, to: Position, same_floor: bool) -> bool {
+        if from.z == to.z {
+            let ddx = (i32::from(from.x) - i32::from(to.x)).abs();
+            let ddy = (i32::from(from.y) - i32::from(to.y)).abs();
+            if ddx < 2 && ddy < 2 {
+                return true;
+            }
+            let clear = self.check_sight_line(from.x, from.y, to.x, to.y, from.z);
+            if clear || same_floor {
+                return clear;
+            }
+            if from.z == 0 {
+                return true;
+            }
+            let nz = from.z - 1;
+            return self.is_tile_clear(from.x, from.y, nz, true)
+                && self.is_tile_clear(to.x, to.y, nz, true)
+                && self.check_sight_line(from.x, from.y, to.x, to.y, nz);
+        }
+        if same_floor {
+            return false;
+        }
+        if (from.z < 8 && to.z > 7) || (from.z > 7 && to.z < 8) {
+            return false;
+        }
+        if from.z > to.z {
+            if (i32::from(from.z) - i32::from(to.z)).abs() > 1 {
+                return false;
+            }
+            let nz = from.z - 1;
+            return self.is_tile_clear(from.x, from.y, nz, true)
+                && self.check_sight_line(from.x, from.y, to.x, to.y, nz);
+        }
+        let mut z = from.z;
+        while z < to.z {
+            if !self.is_tile_clear(to.x, to.y, z, true) {
+                return false;
+            }
+            z += 1;
+        }
+        self.check_sight_line(from.x, from.y, to.x, to.y, from.z)
+    }
+
+    /// TFS `Map::canThrowObjectTo`. Range default = client viewport (8×6); LOS on.
+    pub fn can_throw_object_to(&self, from: Position, to: Position) -> bool {
+        const RANGE_X: i32 = 8; // Map::maxClientViewportX (map.h:162)
+        const RANGE_Y: i32 = 6; // Map::maxClientViewportY (map.h:163)
+        if (i32::from(from.x) - i32::from(to.x)).abs() > RANGE_X
+            || (i32::from(from.y) - i32::from(to.y)).abs() > RANGE_Y
+        {
+            return false;
+        }
+        self.is_sight_clear(from, to, false)
+    }
 }
 
 impl StaticMap {
