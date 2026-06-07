@@ -109,6 +109,16 @@ pub struct SaveRecord {
     pub sex: u8,
 }
 
+/// One equipped item, with the cached wire fields needed to re-send `0x78`.
+#[derive(Debug, Clone, Copy)]
+struct InvItem {
+    server_id: u16,
+    client_id: u16,
+    /// Stack count for stackables (ammo); `None` for non-stackables.
+    count: Option<u8>,
+    animated: bool,
+}
+
 struct PlayerState {
     name: String,
     position: Position,
@@ -134,6 +144,8 @@ struct PlayerState {
     sex: u8,
     /// Gamemaster flag from login; gates look-at debug (item id + position).
     gamemaster: bool,
+    /// Equipment slots 1..=10, indexed 0..=9. `None` = empty slot.
+    inventory: [Option<InvItem>; 10],
 }
 
 struct Game {
@@ -416,6 +428,7 @@ impl Game {
             attacking: None, last_attack_ms: 0,
             sex: initial.sex,
             gamemaster: initial.gamemaster,
+            inventory: [None; 10],
         });
 
         // Render each existing player into the new client's enter-world map, and
@@ -703,6 +716,19 @@ impl Game {
         self.push_status_message(id, text.as_bytes());
     }
 
+    /// Push the private `0x78`/`0x79` for one equipment slot to its owner.
+    fn push_inventory_slot(&mut self, id: u32, slot: u8) {
+        let Some(p) = self.players.get(&id) else { return };
+        let pkt = match p.inventory[(slot - 1) as usize] {
+            Some(it) => {
+                let wi = WireItem { client_id: it.client_id, subtype: it.count, animated: it.animated };
+                enter_world::set_inventory_slot(slot, &wi)
+            }
+            None => vec![enter_world::OP_INVENTORY_EMPTY, slot],
+        };
+        self.push(id, pkt);
+    }
+
     /// The wire stackpos for the item at overlay/static index `idx` on `pos`,
     /// accounting for creatures inserted between the pre-creature items and the
     /// down items. Capped at 9 like the client stack.
@@ -790,7 +816,12 @@ impl Game {
     /// tiles are copied-on-write into `dynamic` before mutation, then the change
     /// is broadcast to spectators.
     fn do_move_thing(&mut self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
-        if from.x == 0xFFFF || to.x == 0xFFFF { return; } // inventory/container = M10.2/M10.3
+        // Container endpoints (y & 0x40) are M10.3 — reject for now.
+        if (from.x == 0xFFFF && from.y & 0x40 != 0) || (to.x == 0xFFFF && to.y & 0x40 != 0) { return; }
+        if from.x == 0xFFFF || to.x == 0xFFFF {
+            self.do_move_inventory(id, from, from_stackpos, to, count);
+            return;
+        }
         if from == to { return; }
         let Some(p) = self.players.get(&id) else { return };
         let player_pos = p.position;
@@ -844,6 +875,122 @@ impl Game {
             self.broadcast_dest(to, dest_s, item, false); // 0x6A add new/spill on top
         }
         self.broadcast_source(from, from_stackpos, removed_fully, src_idx);
+    }
+
+    /// Handle a move where at least one endpoint is an inventory slot (`x==0xFFFF`,
+    /// slot = `y`). Three cases: ground→slot (equip), slot→ground (unequip),
+    /// slot→slot (move/swap). Equipment packets are private to the player.
+    fn do_move_inventory(&mut self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
+        // An inventory endpoint must be a real slot 1..=10, validated on the raw
+        // u16 BEFORE truncating to u8 — else a hacked client sending e.g.
+        // y == 0x4001 (clears the upstream `& 0x40` container guard) would
+        // truncate to a valid-looking slot. A 0xFFFF endpoint with an out-of-range
+        // slot is rejected outright rather than mis-read as a ground tile.
+        let from_slot = if from.x == 0xFFFF {
+            if !(1..=10).contains(&from.y) { return; }
+            Some(from.y as u8)
+        } else { None };
+        let to_slot = if to.x == 0xFFFF {
+            if !(1..=10).contains(&to.y) { return; }
+            Some(to.y as u8)
+        } else { None };
+
+        match (from_slot, to_slot) {
+            // ---- equip: ground → slot ----
+            (None, Some(slot)) => {
+                if !(1..=10).contains(&slot) { return; }
+                let Some(p) = self.players.get(&id) else { return };
+                let player_pos = p.position;
+                if p.inventory[(slot - 1) as usize].is_some() {
+                    self.push_cannot_move(id, "You cannot equip this object."); return;
+                }
+                let near = (i32::from(player_pos.x) - i32::from(from.x)).abs() <= 1
+                    && (i32::from(player_pos.y) - i32::from(from.y)).abs() <= 1
+                    && player_pos.z == from.z;
+                if !near { self.push_cannot_move(id, "You are too far away."); return; }
+
+                let creatures = self.creatures_on(from).len();
+                let pre = self.dynamic.get(&(from.x, from.y, from.z))
+                    .map(|st| st.pre_creature_len)
+                    .unwrap_or_else(|| self.map.tile_pre_creature_len(from));
+                let sp = from_stackpos as usize;
+                let src_idx = if sp < pre { sp }
+                    else if sp < pre + creatures { return; }
+                    else { sp - creatures };
+
+                let Some(src_sid) = self.merged_server_id(from, src_idx) else { return };
+                let Some(meta) = self.map.item_meta(src_sid) else { return };
+                if !meta.moveable { self.push_cannot_move(id, "You cannot move this object."); return; }
+                let Some(eq) = meta.equip_slot else {
+                    self.push_cannot_move(id, "You cannot equip this object."); return;
+                };
+                if !eq.admits(slot) {
+                    self.push_cannot_move(id, "You cannot equip this object."); return;
+                }
+                let (stackable, client_id, animated) = (meta.stackable, meta.client_id, meta.animated);
+                let want = if stackable { count.max(1) } else { 1 };
+
+                let Some((moved, removed_fully)) = self.take_from_ground(from, src_idx, want, stackable) else { return };
+                self.broadcast_source(from, from_stackpos, removed_fully, src_idx);
+
+                let cnt = if stackable { Some(moved) } else { None };
+                if let Some(p) = self.players.get_mut(&id) {
+                    p.inventory[(slot - 1) as usize] = Some(InvItem { server_id: src_sid, client_id, count: cnt, animated });
+                }
+                self.push_inventory_slot(id, slot);
+            }
+            // ---- unequip: slot → ground ----
+            (Some(slot), None) => {
+                if !(1..=10).contains(&slot) { return; }
+                let Some(p) = self.players.get(&id) else { return };
+                let player_pos = p.position;
+                let Some(it) = p.inventory[(slot - 1) as usize] else { return };
+                let near = (i32::from(player_pos.x) - i32::from(to.x)).abs() <= 1
+                    && (i32::from(player_pos.y) - i32::from(to.y)).abs() <= 1
+                    && player_pos.z == to.z;
+                if !near { self.push_cannot_move(id, "You are too far away."); return; }
+                if self.map.tile_pre_creature_len(to) == 0 && self.map.tile_stack_clone(to).is_none() {
+                    self.push_cannot_move(id, "You cannot put that there."); return;
+                }
+                let meta_stackable = self.map.item_meta(it.server_id).map(|m| m.stackable).unwrap_or(false);
+                let moved = it.count.unwrap_or(1).max(1);
+
+                if let Some(p) = self.players.get_mut(&id) {
+                    p.inventory[(slot - 1) as usize] = None;
+                }
+                self.push_inventory_slot(id, slot);
+
+                let dest_creatures = self.creatures_on(to).len();
+                let Some((merged, added)) =
+                    self.add_to_ground_front(to, it.server_id, it.client_id, moved, it.animated, meta_stackable) else { return };
+                let dest_front = self.dynamic.get(&(to.x, to.y, to.z)).map(|st| st.pre_creature_len).unwrap_or(0);
+                let dest_s = (dest_front + dest_creatures).min(9) as u8;
+                if let Some(item) = merged { self.broadcast_dest(to, dest_s, item, true); }
+                if let Some(item) = added { self.broadcast_dest(to, dest_s, item, false); }
+            }
+            // ---- slot → slot: move or swap ----
+            (Some(src), Some(dst)) => {
+                if !(1..=10).contains(&src) || !(1..=10).contains(&dst) || src == dst { return; }
+                let Some(p) = self.players.get(&id) else { return };
+                let Some(moving) = p.inventory[(src - 1) as usize] else { return };
+                if let Some(eq) = self.map.item_meta(moving.server_id).and_then(|m| m.equip_slot) {
+                    if !eq.admits(dst) { self.push_cannot_move(id, "You cannot equip this object."); return; }
+                } else { self.push_cannot_move(id, "You cannot equip this object."); return; }
+                let displaced = p.inventory[(dst - 1) as usize];
+                if let Some(d) = displaced {
+                    let ok = self.map.item_meta(d.server_id).and_then(|m| m.equip_slot)
+                        .map(|eq| eq.admits(src)).unwrap_or(false);
+                    if !ok { self.push_cannot_move(id, "You cannot equip this object."); return; }
+                }
+                if let Some(p) = self.players.get_mut(&id) {
+                    p.inventory[(dst - 1) as usize] = Some(moving);
+                    p.inventory[(src - 1) as usize] = displaced;
+                }
+                self.push_inventory_slot(id, src);
+                self.push_inventory_slot(id, dst);
+            }
+            (None, None) => {}
+        }
     }
 
     /// Broadcast a 0x6A add (`is_update=false`) or 0x6B update (`is_update=true`) of `item`
@@ -1825,6 +1972,7 @@ mod tests {
             attacking: None, last_attack_ms: 0,
             sex: 1, // male (default)
             gamemaster: false,
+            inventory: [None; 10],
         });
         (id, rx)
     }
@@ -3468,6 +3616,7 @@ mod tests {
             attacking: None, last_attack_ms: 0,
             sex: 1,
             gamemaster: false,
+            inventory: [None; 10],
         });
 
         g.logout(id);
@@ -3501,6 +3650,7 @@ mod tests {
             attacking: None, last_attack_ms: 0,
             sex: 1,
             gamemaster: false,
+            inventory: [None; 10],
         });
 
         // Pushing any payload triggers the dead-session reap → logout → save.
@@ -3856,6 +4006,7 @@ mod tests {
             attacking: None, last_attack_ms: 0,
             sex: 0, // female
             gamemaster: false,
+            inventory: [None; 10],
         });
         // Looker is at the same tile; tile pre_creature_len is 1 (just the ground),
         // creatures = [looker_id, target_id] (sorted). stackpos 1 = first creature
