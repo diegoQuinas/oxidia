@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M6 ✅ **chat complete and accepted live** (say/whisper/yell; off-screen yell is chat-only — correct, the speech bubble only renders when the speaker is on your screen). **M6.1 (stairs / floor changes) is code-complete (live acceptance pending)** — merged from branch `m6.1-stairs`. Next is **M7 (combat core + PvP melee)**, the pre-alpha #1 gate. M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) and auto-walk remain deferred.
+- **Milestone:** M6 ✅ **chat complete and accepted live** (say/whisper/yell; off-screen yell is chat-only — correct, the speech bubble only renders when the speaker is on your screen). **M6.1 (stairs / floor changes) is code-complete (live acceptance pending)** — merged from branch `m6.1-stairs`. Next is **M7 (combat core + PvP melee)**, the pre-alpha #1 gate. M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
 - **Build:** `cargo build` clean, `cargo test` green (129 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -34,14 +34,14 @@ performance-critical or stable stays native Rust.
 | M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ✅ done |
 | M6 | Chat: say / whisper / yell + default channel | ✅ done |
 | M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ✅ code / live pending |
-| M6.2 | Ladders & holes (use-driven): minimal `useItem 0x82` handler, floor-change-up on use, down-holes; reuses the M6.1 vertical engine | ⬜ |
+| M6.2 | Ladders & holes (use-driven) — **deferred to M11**: the behavior is script-driven (`teleport.lua` `onUse`), not data; ladders/grates carry no `items.xml` attribute. Belongs on the Lua runtime, not hardcoded in Rust. Research: `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⏸️ → M11 |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
 | **B** | **Items & Inventory** | |
 | M9 | Ground items, stacks, look-at | ⬜ |
 | M10 | Inventory & equipment: move, equip, containers, use | ⬜ |
 | **C** | **Scripting** | |
-| M11 | Lua runtime (mlua): hot-reloadable content hooks (onUse/onStepIn/onSay/…) | ⬜ |
+| M11 | Lua runtime (mlua): hot-reloadable content hooks (onUse/onStepIn/onSay/…). Includes use-driven floor changes (M6.2: ladders/holes via `teleport.lua` `onUse`) — see `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⬜ |
 | **D** | **PvE → pre-alpha #2** | |
 | M12 | Creatures & monsters: spawns, AI, A* pathfinding | ⬜ |
 | M13 | Loot & corpses | ⬜ |
