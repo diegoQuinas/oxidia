@@ -36,6 +36,15 @@ pub const OP_ATTACK: u8 = 0xA1;
 /// reader never needs a magic literal.
 pub const OP_FOLLOW: u8 = 0xA2;
 
+/// Inbound: client cancels the current action — sent by the ESC / "Stop"
+/// hotkey (`parseCancelMove` → `Game::playerCancelAttackAndFollow`: clear the
+/// attacked creature, clear follow, stop walking). Body-less.
+///
+/// NOTE: `0xBE` is direction-overloaded — **outbound** it is the floor-change-up
+/// map slice (`walk::OP_FLOOR_CHANGE_UP`). The reader only ever matches inbound
+/// opcodes, so there is no conflict with that server→client writer.
+pub const OP_CANCEL_MOVE: u8 = 0xBE;
+
 /// Outbound: creature health-bar broadcast to spectators (`sendCreatureHealth`,
 /// TFS line 2339).
 pub const OP_CREATURE_HEALTH: u8 = 0x8C;

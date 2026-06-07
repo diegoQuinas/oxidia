@@ -368,6 +368,16 @@ where
             if opcode == combat_packets::OP_FOLLOW {
                 continue;
             }
+            // 0xBE — client cancel (ESC / "Stop" hotkey). TFS parseCancelMove ->
+            // Game::playerCancelAttackAndFollow clears attack + follow + stops
+            // walking. The red attack square is cleared client-side on ESC, but
+            // without handling this opcode `attacking` stays set and the combat
+            // tick keeps swinging. We have no follow/auto-walk yet, so clearing
+            // the fight (set_target 0) is the faithful subset.
+            if opcode == combat_packets::OP_CANCEL_MOVE {
+                world.set_target(id, 0).await;
+                continue;
+            }
             // 0xD2 — client requests the outfit-selection window.
             // Reply: push 0xC8 outfit_window to this player only (no broadcast).
             if opcode == outfit_packets::OP_REQUEST_OUTFIT {
