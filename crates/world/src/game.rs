@@ -80,18 +80,14 @@ impl Game {
     /// and recording the target in the viewer's known-set. Returns `None` if
     /// either player is gone.
     fn introduce(&mut self, viewer: u32, target: u32) -> Option<Vec<u8>> {
-        let (name, view_owned) = {
+        let (name, dir, outfit) = {
             let t = self.players.get(&target)?;
-            (
-                t.name.clone(),
-                (t.position, t.direction, t.outfit),
-            )
+            (t.name.clone(), t.direction, t.outfit)
         };
         let known = {
             let v = self.players.get_mut(&viewer)?;
             !v.known.insert(target) // insert returns true if newly added
         };
-        let (_, dir, outfit) = view_owned;
         let view = CreatureView {
             id: target,
             name: name.as_bytes(),
@@ -442,5 +438,25 @@ mod tests {
         world.logout(ack_b.snapshot.id).await;
         let pkt = rx_a.recv().await.unwrap();
         assert_eq!(pkt[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
+    }
+
+    #[test]
+    fn move_out_of_view_pushes_remove_to_spectator() {
+        let mut g = Game::new(walk_map());
+        let (mover, _rm) = add_player(&mut g, Position::new(95, 117, 7));
+        let (_spec, mut rx) = add_player(&mut g, Position::new(87, 117, 7)); // sees from, not to
+        g.do_move(mover, Direction::East); // 95,117 -> 96,117
+        let pkt = rx.try_recv().expect("spectator should receive a packet");
+        assert_eq!(pkt[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
+    }
+
+    #[test]
+    fn move_into_view_pushes_appear_to_spectator() {
+        let mut g = Game::new(walk_map());
+        let (mover, _rm) = add_player(&mut g, Position::new(95, 117, 7));
+        let (_spec, mut rx) = add_player(&mut g, Position::new(104, 117, 7)); // sees to, not from
+        g.do_move(mover, Direction::East); // 95,117 -> 96,117
+        let pkt = rx.try_recv().expect("spectator should receive a packet");
+        assert_eq!(pkt[0], protocol::tile_creature::OP_ADD_TILE_CREATURE);
     }
 }
