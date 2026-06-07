@@ -15,6 +15,10 @@ pub const CLIENT_VERSION_MIN: u16 = 1097;
 pub const CLIENT_VERSION_MAX: u16 = 1098;
 const OS_OTCLIENT_LINUX: u16 = 10;
 
+/// Classic Gamemaster outfit sprite id (TFS/Tibia `looktype 75`, stable across
+/// versions). Gamemasters are forced into this look so they are visibly GMs.
+const GM_LOOKTYPE: u16 = 75;
+
 /// Default outfit for a new character (Test Knight look).
 fn knight_outfit() -> creature::Outfit {
     creature::Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
@@ -256,7 +260,14 @@ where
         },
     };
     let mut initial = initial;
-    initial.gamemaster = req.gamemaster;
+    // "God Diego" is always a gamemaster, regardless of the login packet flag.
+    // Hardcoded by name (no DB schema for access levels yet — see the GM design spec).
+    initial.gamemaster = req.gamemaster || name.eq_ignore_ascii_case("diego");
+    if initial.gamemaster {
+        // Force the visible Gamemaster outfit (looktype 75). Colors are irrelevant
+        // for this fixed-sprite outfit; only look_type matters on the wire.
+        initial.outfit.look_type = GM_LOOKTYPE;
+    }
     // Extract inventory before moving `initial` into the world actor.
     let login_inventory = initial.inventory.clone();
     let (push_tx, push_rx) = world::game::push_channel();
