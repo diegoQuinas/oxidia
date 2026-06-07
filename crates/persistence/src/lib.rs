@@ -404,10 +404,20 @@ mod tests {
     async fn sex_field_round_trips_female_value() {
         // RED: sex=0 (female) must survive save→load unchanged.
         let store = seeded().await;
-        let save = PlayerSave { sex: 0, ..default_save("Test Knight") };
+        let save = PlayerSave {
+            sex: 0,
+            ..default_save("Test Knight")
+        };
         store.save_player(&save).await.unwrap();
-        let loaded = store.load_player("Test Knight").await.unwrap().expect("should be Some");
-        assert_eq!(loaded.sex, 0, "sex=0 (female) must round-trip through the DB");
+        let loaded = store
+            .load_player("Test Knight")
+            .await
+            .unwrap()
+            .expect("should be Some");
+        assert_eq!(
+            loaded.sex, 0,
+            "sex=0 (female) must round-trip through the DB"
+        );
     }
 
     #[tokio::test]

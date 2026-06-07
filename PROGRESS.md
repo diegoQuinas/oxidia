@@ -37,6 +37,7 @@ performance-critical or stable stays native Rust.
 | M6.2 | Ladders & holes (use-driven) — **deferred to M11**: the behavior is script-driven (`teleport.lua` `onUse`), not data; ladders/grates carry no `items.xml` attribute. Belongs on the Lua runtime, not hardcoded in Rust. Research: `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⏸️ → M11 |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ✅ done |
 | M7.1 | Combat polish: death→logout flow (relog at temple, save-on-death), protection-zone client badge (ICON_PIGEON), blood-hit effect fix | ✅ done |
+| M7.2 | Combat polish 2 — **stop-attack bug + miss/blocked hit effects**: (a) handle `0xBE` cancelMove → `playerCancelAttackAndFollow` (clear `attacking` + follow + stop walk). ESC clears the client's red attack square *locally* and sends `0xBE`; the server never handled it (drained as an unknown opcode), so the combat tick kept swinging with no visible target. (b) TFS-faithful hit-feedback effects: `CONST_ME_POFF` (3) on a full miss (`BLOCK_DEFENSE` / 0-damage roll), `CONST_ME_BLOCKHIT` (10) on armor-absorbed hits (`BLOCK_ARMOR`), `CONST_ME_DRAWBLOOD` (1) only on real damage — today DRAWBLOOD fires even on a 0 roll. Cancel-bug + miss-puff are shippable now; the armor branch depends on M10.2 (real armor values). Research: TFS `protocolgame.cpp` `parseCancelMove`, `game.cpp` `Game::playerCancelAttackAndFollow`/`Game::combatBlockHit` | ⬜ |
 | M8 | Persistence + accounts: per-account characters, saved position/stats/outfit (load on login, save on logout via unbounded save channel); outfit change + persist (`0xD2` request → `0xC8` window, `0xD3` set → apply + `0x8E` broadcast); login never stacks on an occupied tile (`free_spawn_near`) | ✅ done |
 | M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⏸️ deferred (non-priority) |
 | **B** | **Items & Inventory** | |
@@ -274,6 +275,37 @@ Gate: `cargo test` green (225), `cargo clippy --all-targets -- -D warnings` clea
 **Live acceptance — ✅ ACCEPTED (2026-06-07):** die in PvP → death window → character
 select → relog spawns at the temple with full HP; standing in the temple shows the
 PZ dove badge (clears on leaving); hits draw a visible blood animation.
+
+## M7.2 plan (research — not yet built)
+
+Two combat-feedback gaps found in live testing.
+
+**1. ESC does not stop the attack (server keeps swinging).** Alt-click a player,
+then press ESC: the red attack square disappears but damage keeps landing. The
+square is cleared *client-side* — the client sends `0xBE` (clientStop), which TFS
+maps to `parseCancelMove` → `Game::playerCancelAttackAndFollow` (clears the
+attacked creature, clears follow, `stopWalk`). Our `reader_loop`
+(`server::game_service`) has **no `0xBE` arm**, so the packet falls through to the
+opcode drain (`None => continue`) and `attacking` is never reset — the global
+combat tick keeps calling `apply_damage`. Fix: add a `0xBE` arm that calls
+`world.set_target(id, 0)` (`do_set_target` already clears the fight on target 0).
+Follow/auto-walk are no-ops today, so clearing the attack alone is faithful enough.
+
+**2. Miss vs armor-blocked hits use the wrong effect.** In classic Tibia the
+on-hit animation depends on how the hit was stopped; TFS selects it by block
+result in `Game::combatBlockHit` (`game.cpp`):
+  - `BLOCK_DEFENSE` (dodged/parried, damage fully defended) → `CONST_ME_POFF` (3) — the puff.
+  - `BLOCK_ARMOR` (absorbed by armor) → `CONST_ME_BLOCKHIT` (10) — the sparks.
+  - real damage lands → `CONST_ME_DRAWBLOOD` (1) — blood.
+Our `apply_damage` (`world::game`) always pushes `EFFECT_DRAWBLOOD`, even when the
+`0..=max` roll comes up 0 (a natural miss → should show POFF). Plan: add
+`EFFECT_POFF`/`EFFECT_BLOCKHIT` constants to `protocol::enter_world` next to
+`EFFECT_DRAWBLOOD`, and pick the effect by outcome instead of hard-coding blood.
+The **miss-puff branch (roll 0 ⇒ POFF) is shippable now** — no equipment needed.
+The **`BLOCK_ARMOR` ⇒ BLOCKHIT branch needs real armor values from M10.2** (no
+armor model yet), so it lands with/after M10.2. Caution: client effect IDs are
+version-sensitive — verify the wire byte live, as we did for the
+`EFFECT_TELEPORT` 10-vs-`CONST_ME_TELEPORT`-11 off-by-one (`enter_world.rs:30`).
 
 ## M9 plan
 
