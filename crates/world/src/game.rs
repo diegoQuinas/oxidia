@@ -789,74 +789,81 @@ impl Game {
             }
         }
 
-        // --- Destination: COW + merge (cap 100, spill) or append. Compute the
-        //     result INSIDE the get_mut block, end the borrow, then broadcast. ---
+        // ---- Destination: insert/merge at the FRONT of the down-items (newest on top). ----
+        // Compute dest_creatures before the get_mut borrow (immutable self borrow).
         if !self.materialize(to) { return; }
-        let dest_item: WireItem;
-        let dest_idx: usize;
-        let dest_update: bool;
-        let mut spill: Option<(usize, WireItem)> = None;
+        let dest_creatures = self.creatures_on(to).len();
+        // Results of the dest mutation, broadcast after the borrow ends:
+        // dest_merged_update: Some(WireItem) → 0x6B update of the existing (now-capped) stack at S
+        // dest_added:         Some(WireItem) → 0x6A add of the new/spill item at S
+        let dest_merged_update: Option<WireItem>;
+        let dest_added: Option<WireItem>;
         {
             let st = self.dynamic.get_mut(&(to.x, to.y, to.z)).unwrap();
-            // Top item is a mergeable same-type stackable only when it sits among
-            // the down items (>= pre_creature_len) and shares the source server id.
-            let merge_at = if stackable {
-                st.server_ids.len().checked_sub(1).filter(|&t|
-                    t >= st.pre_creature_len && st.server_ids[t] == src_sid)
-            } else {
-                None
-            };
-            if let Some(t) = merge_at {
-                let merged = u32::from(st.counts[t].unwrap_or(1).max(1))
-                    + u32::from(moved);
-                let capped = merged.min(100) as u8;
-                st.counts[t] = Some(capped);
-                st.items[t].subtype = Some(capped);
-                dest_item = st.items[t];
-                dest_idx = t;
-                dest_update = true;
-                if merged > 100 {
-                    let spill_count = u8::try_from(merged - 100).unwrap_or(u8::MAX);
+            let front = st.pre_creature_len;
+            // Merge only when the FRONT down-item is the same stackable type.
+            let merge_at_front = stackable
+                && st.server_ids.len() > front
+                && st.server_ids[front] == src_sid;
+            if merge_at_front {
+                let total = u32::from(st.counts[front].unwrap_or(1).max(1)) + u32::from(moved);
+                let capped = total.min(100) as u8;
+                st.counts[front] = Some(capped);
+                st.items[front].subtype = Some(capped);
+                let merged_item = st.items[front];
+                if total > 100 {
+                    // Overflow: spill the excess into a NEW stack placed on top (front).
+                    let spill_count = u8::try_from(total - 100).unwrap_or(u8::MAX);
                     let spill_wi = WireItem { client_id, subtype: Some(spill_count), animated };
-                    st.items.push(spill_wi);
-                    st.server_ids.push(src_sid);
-                    st.counts.push(Some(spill_count));
-                    spill = Some((st.items.len() - 1, spill_wi));
+                    st.items.insert(front, spill_wi);
+                    st.server_ids.insert(front, src_sid);
+                    st.counts.insert(front, Some(spill_count));
+                    dest_merged_update = Some(merged_item); // existing stack now capped at 100
+                    dest_added = Some(spill_wi);             // new spill stack on top
+                } else {
+                    dest_merged_update = Some(merged_item);
+                    dest_added = None;
                 }
             } else {
+                // Non-merge: insert the moved item at the FRONT of the down-items.
                 let subtype = if stackable { Some(moved) } else { None };
                 let wi = WireItem { client_id, subtype, animated };
-                st.items.push(wi);
-                st.server_ids.push(src_sid);
-                st.counts.push(subtype);
-                dest_item = wi;
-                dest_idx = st.items.len() - 1;
-                dest_update = false;
+                st.items.insert(front, wi);
+                st.server_ids.insert(front, src_sid);
+                st.counts.insert(front, if stackable { Some(moved) } else { None });
+                dest_merged_update = None;
+                dest_added = Some(wi);
             }
         }
-
-        self.broadcast_tile_update(to, dest_idx, dest_item, dest_update);
-        if let Some((sidx, sitem)) = spill {
-            self.broadcast_tile_update(to, sidx, sitem, false);
+        // Broadcast: all dest changes target the top down-item slot S = front + creatures.
+        // For the overflow case: UPDATE the existing stack at S first (it gets capped to 100),
+        // then ADD the spill at S (which pushes the existing one down to S+1 on the client).
+        let dest_front = self.dynamic.get(&(to.x, to.y, to.z))
+            .map(|st| st.pre_creature_len).unwrap_or(0);
+        let dest_s = (dest_front + dest_creatures).min(9) as u8;
+        if let Some(item) = dest_merged_update {
+            self.broadcast_dest(to, dest_s, item, true);  // 0x6B update existing stack
+        }
+        if let Some(item) = dest_added {
+            self.broadcast_dest(to, dest_s, item, false); // 0x6A add new/spill on top
         }
         self.broadcast_source(from, from_stackpos, removed_fully, src_idx);
     }
 
-    /// Broadcast a destination-tile change (add or in-place update) to spectators.
-    fn broadcast_tile_update(&mut self, pos: Position, idx: usize, item: WireItem, is_update: bool) {
+    /// Broadcast a 0x6A add (`is_update=false`) or 0x6B update (`is_update=true`) of `item`
+    /// at explicit wire stackpos `sp` on `pos`, to every player who can see the tile.
+    fn broadcast_dest(&mut self, pos: Position, sp: u8, item: WireItem, is_update: bool) {
         let mut targets = self.spectators(pos, u32::MAX);
-        targets.extend(
-            self.players.iter().filter(|(_, p)| p.position == pos).map(|(&i, _)| i));
+        targets.extend(self.players.iter().filter(|(_, p)| p.position == pos).map(|(&i, _)| i));
         targets.sort_unstable();
         targets.dedup();
-        let sp = self.item_wire_stackpos(pos, idx);
-        let pkt = if is_update {
-            tile_item::update_tile_item((pos.x, pos.y, pos.z), sp, &item)
-        } else {
-            tile_item::add_tile_item((pos.x, pos.y, pos.z), sp, &item)
-        };
         for t in targets {
-            self.push(t, pkt.clone());
+            let pkt = if is_update {
+                tile_item::update_tile_item((pos.x, pos.y, pos.z), sp, &item)
+            } else {
+                tile_item::add_tile_item((pos.x, pos.y, pos.z), sp, &item)
+            };
+            self.push(t, pkt);
         }
     }
 
@@ -4098,6 +4105,12 @@ mod tests {
             dst_st.server_ids.contains(&200),
             "stone must appear on destination overlay; sids: {:?}", dst_st.server_ids
         );
+        // Stone must be at index pre_creature_len (front of down-items, newest on top).
+        // (102,100,7) had [ground(100), coins(300)] → pre_creature_len=1; stone inserts at 1.
+        assert_eq!(
+            dst_st.server_ids[dst_st.pre_creature_len], 200,
+            "stone must be at front of down-items (index pre_creature_len); sids: {:?}", dst_st.server_ids
+        );
 
         // Spectator / mover receives a 0x6A add-tile-item for the destination.
         let pkts = drain(&mut rx);
@@ -4203,6 +4216,52 @@ mod tests {
             has_op(&spec_pkts, 0x6A) || has_op(&spec_pkts, 0x6B) || has_op(&spec_pkts, 0x6C),
             "spectator must receive at least one tile-update packet; got {:?}",
             spec_pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: a non-stackable moved onto a tile that already has a down-item must land
+    /// at index `pre_creature_len` (front / newest-on-top), and the broadcast 0x6A must use
+    /// stackpos `pre_creature_len + creatures` (no creatures → `pre_creature_len`).
+    #[test]
+    fn do_move_thing_dest_insert_front_of_down_items() {
+        // (102,100,7) starts with [ground(100), coins(300)] → pre_creature_len=1.
+        // Move stone (sid 200, non-stackable) from (101,100,7) onto (102,100,7).
+        // Expected after move: sids = [ground(100), stone(200), coins(300)]
+        //   i.e. stone at index 1 = pre_creature_len, coins shift to index 2.
+        // Expected broadcast: 0x6A at stackpos 1 (pre_creature_len=1, no creatures).
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx);
+
+        let from = Position::new(101, 100, 7);
+        let to   = Position::new(102, 100, 7);
+        // stone is at stackpos 1 on source (pre_creature_len=1, no creatures, stone at idx 1)
+        g.do_move_thing(player, from, 1, to, 1);
+
+        let dst_st = g.dynamic.get(&(102, 100, 7))
+            .expect("destination must have been materialized");
+        let pre = dst_st.pre_creature_len;
+
+        // Stone (sid 200) must be at index pre_creature_len (front of down-items).
+        assert_eq!(
+            dst_st.server_ids[pre], 200,
+            "moved stone must be at index pre_creature_len (front/top); sids: {:?}", dst_st.server_ids
+        );
+        // Coins (sid 300) must have shifted to index pre_creature_len + 1.
+        assert_eq!(
+            dst_st.server_ids[pre + 1], 300,
+            "pre-existing coins must shift to pre_creature_len+1; sids: {:?}", dst_st.server_ids
+        );
+
+        // Broadcast: the 0x6A add must carry stackpos = pre_creature_len (no creatures on tile).
+        // Packet layout: [0x6A, x_lo, x_hi, y_lo, y_hi, z, stackpos, ...]
+        let pkts = drain(&mut rx);
+        let add_pkt = pkts.iter().find(|p| p.first() == Some(&0x6A))
+            .expect("must have a 0x6A add-tile-item packet for destination");
+        let broadcast_sp = add_pkt[6];
+        assert_eq!(
+            broadcast_sp, pre as u8,
+            "broadcast stackpos must equal pre_creature_len ({pre}); got {broadcast_sp}"
         );
     }
 }
