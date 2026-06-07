@@ -622,9 +622,33 @@ impl Game {
                 respawn_pos.x, respawn_pos.y, respawn_pos.z, enter_world::EFFECT_TELEPORT));
         }
 
+        // W2 fix: prune victim's known-set to only creatures visible from respawn_pos.
+        // At the death tile the victim accumulated a known-set; the client drops those
+        // when it re-renders from the 0x64 burst. Any stale id kept server-side would
+        // later produce the short 0x62 form for a creature the client already culled,
+        // triggering OTClient's "parseCreatureMove: unable to remove creature".
+        // Mirrors do_move's left_view prune (game.rs ~810-825).
+        let stale: Vec<u32> = {
+            let victim = match self.players.get(&victim_id) { Some(p) => p, None => return };
+            victim.known.iter().copied()
+                .filter(|&oid| {
+                    self.players.get(&oid)
+                        .is_none_or(|op| !Self::can_see(respawn_pos, op.position))
+                })
+                .collect()
+        };
+        if let Some(victim) = self.players.get_mut(&victim_id) {
+            for oid in &stale { victim.known.remove(oid); }
+        }
+
         // Send the respawned victim a fresh map description + 0xA0 stats so its
         // client re-renders the temple tile.
         let center = Center { x: respawn_pos.x, y: respawn_pos.y, z: respawn_pos.z };
+
+        // W1 fix: include all other players visible from respawn_pos in `placed` so
+        // the victim's 0x64 burst renders them. Without this, players standing near
+        // the temple are invisible to the freshly respawned victim (it can be attacked
+        // by someone it cannot see). Mirrors do_move's others_in_range (game.rs ~829-837).
         let victim_creature = {
             let p = match self.players.get(&victim_id) { Some(p) => p, None => return };
             let view = creature::CreatureView {
@@ -637,7 +661,17 @@ impl Game {
             };
             creature::add_creature(&view, false, 0)
         };
-        let placed = vec![PlacedCreature { x: respawn_pos.x, y: respawn_pos.y, z: respawn_pos.z, bytes: victim_creature }];
+        let others_visible: Vec<u32> = self.visible_from(respawn_pos, victim_id);
+        let mut placed = vec![PlacedCreature {
+            x: respawn_pos.x, y: respawn_pos.y, z: respawn_pos.z,
+            bytes: victim_creature,
+        }];
+        for oid in others_visible {
+            if let Some(bytes) = self.introduce(victim_id, oid) {
+                let opos = match self.players.get(&oid) { Some(p) => p.position, None => continue };
+                placed.push(PlacedCreature { x: opos.x, y: opos.y, z: opos.z, bytes });
+            }
+        }
         let map_desc = protocol::map_description::encode(center, self.map.as_ref(), &placed);
         self.push(victim_id, map_desc);
         let stats = {
@@ -1635,5 +1669,187 @@ mod tests {
         g.logout(b); // B disconnects
         g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
         assert_eq!(g.players[&a].attacking, None, "attacker must clear when target logs out");
+    }
+
+    // -------------------------------------------------------------------------
+    // M7 review fix tests (W1, W2, W3)
+    // -------------------------------------------------------------------------
+
+    /// Build a combat map with a second non-PZ tile far enough from the spawn that
+    /// the death tile and temple are OUT of each other's viewport. Player A stands
+    /// at the far tile; B (victim) is adjacent. The temple is at (95,117,7).
+    /// We place A at (96,117,7) and the death tile for B at (96,117,7); after death
+    /// B respawns at (95,117,7). We need a separate "far" tile far from temple for
+    /// the out-of-view scenario.
+    ///
+    /// For W1/W2 we need two players at the temple after respawn: a bystander C
+    /// standing near the temple tile, and the victim B respawning there. The map
+    /// needs a wide enough ground area for that.
+    fn wide_combat_map() -> Arc<StaticMap> {
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
+                    always_on_top: false, top_order: 0, has_height: false,
+                    floor_change: formats::items_xml::FloorChange::NONE },
+            ],
+        };
+        let ground = |x: u16, y: u16| MapTile {
+            x, y, z: 7, flags: 0, house_id: None,
+            items: vec![MapItem { id: 100, contents: vec![] }],
+        };
+        // Spawn at (95,117). Build a wide row so spectators can stand near it
+        // and we can place the death tile far away (20 tiles east).
+        let mut tiles: Vec<MapTile> = (90u16..=116u16).map(|x| ground(x, 117)).collect();
+        // Also the PZ tile for W3 test — tile at (90,117) will be made PZ separately
+        tiles.push(ground(115, 116)); // extra tile for bystander clearance
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles,
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+            waypoints: vec![],
+        };
+        Arc::new(StaticMap::from_formats(&map, &items))
+    }
+
+    /// Same as wide_combat_map but tile (90,117) is marked protection zone.
+    fn wide_combat_map_with_pz() -> Arc<StaticMap> {
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
+                    always_on_top: false, top_order: 0, has_height: false,
+                    floor_change: formats::items_xml::FloorChange::NONE },
+            ],
+        };
+        let ground = |x: u16, y: u16, pz: bool| MapTile {
+            x, y, z: 7,
+            flags: if pz { 1 } else { 0 },
+            house_id: None,
+            items: vec![MapItem { id: 100, contents: vec![] }],
+        };
+        let mut tiles: Vec<MapTile> = (90u16..=116u16)
+            .map(|x| ground(x, 117, x == 90))
+            .collect();
+        tiles.push(ground(115, 116, false));
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles,
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+            waypoints: vec![],
+        };
+        Arc::new(StaticMap::from_formats(&map, &items))
+    }
+
+    // W1 repro: after respawn the victim's map description must include a bystander
+    // standing near the temple tile within the victim's viewport.
+    //
+    // Setup: bystander C at (96,117,7) — one tile east of the temple (95,117,7).
+    // Victim B dies and respawns at (95,117,7). The map description sent to B after
+    // respawn must contain a PlacedCreature for C (its creature-id bytes embedded in
+    // the map tile stream via the full 0x61 form).
+    //
+    // Without the fix, `placed` only contains B itself, so C's id is absent from
+    // the map description and C is invisible to B's client.
+    #[test]
+    fn respawn_map_desc_includes_bystander_near_temple() {
+        let mut g = Game::new(wide_combat_map());
+        // Attacker A far from the temple so respawn tile (95,117) is free.
+        let (a, _ra) = add_player(&mut g, Position::new(114, 117, 7));
+        // Bystander C stands at (96,117,7) — adjacent to the temple, within viewport.
+        let (c, _rc) = add_player(&mut g, Position::new(96, 117, 7));
+        // Victim B starts adjacent to A so melee range works, then we force-kill.
+        let (b, mut rb) = add_player(&mut g, Position::new(113, 117, 7));
+        g.do_set_target(a, b);
+        g.players.get_mut(&b).unwrap().health = 1;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+
+        // Drain all packets until we find the 0x64 map description sent on respawn.
+        let mut map_desc: Option<Vec<u8>> = None;
+        while let Ok(pkt) = rb.try_recv() {
+            if pkt[0] == protocol::map_description::OPCODE_MAP_DESCRIPTION {
+                map_desc = Some(pkt);
+            }
+        }
+        let map_bytes = map_desc.expect("respawned victim must receive a 0x64 map description");
+
+        // Bystander C's id (u32 LE) must appear in the map description bytes.
+        // The 0x61 full creature form encodes the id as u32 LE after the 0x61 marker.
+        // Without the fix, C is absent from `placed` and its id never appears.
+        let c_id_le = c.to_le_bytes();
+        let has_c = map_bytes.windows(4).any(|w| w == c_id_le);
+        assert!(
+            has_c,
+            "respawn map description must include bystander C (id {c}) near the temple"
+        );
+    }
+
+    // W2 repro: after respawn the victim must NOT have in its known-set any creature
+    // that was only visible from the death tile (out of view from the temple).
+    //
+    // Setup: creature X stands at the death tile area (>9 tiles from temple).
+    // Victim B knows X (was introduced before death). After respawn, X is out of
+    // view from the temple → B must have forgotten X (known.contains(&x) == false).
+    #[test]
+    fn respawn_prunes_known_set_of_out_of_view_creatures() {
+        let mut g = Game::new(wide_combat_map());
+        // X stands 15 tiles east of temple (95+15=110,117) — well out of view from temple.
+        let (x, _rx) = add_player(&mut g, Position::new(110, 117, 7));
+        // B starts adjacent to X so it can "know" X.
+        let (b, mut rb) = add_player(&mut g, Position::new(111, 117, 7));
+        // Introduce X to B (simulates B having seen X before death).
+        g.introduce(b, x);
+        assert!(g.players[&b].known.contains(&x), "B knows X before death");
+
+        // A at (112,117) adjacent to B; force B to die.
+        let (a, _ra) = add_player(&mut g, Position::new(112, 117, 7));
+        g.do_set_target(a, b);
+        g.players.get_mut(&b).unwrap().health = 1;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        while rb.try_recv().is_ok() {} // drain
+
+        // B respawned at temple (95,117). X is at (110,117): dx=15 > VIEW_RIGHT(9).
+        // B must have forgotten X — otherwise a re-encounter sends the short 0x62
+        // form for a creature B's client already dropped.
+        assert!(
+            !g.players[&b].known.contains(&x),
+            "after respawn to temple, B must forget X which is out of its new viewport"
+        );
+    }
+
+    // W3 repro: attacker locked on a target; target moves onto a PZ tile → next
+    // tick must deal NO damage AND clear the attacker's `attacking` field.
+    //
+    // We can't actually move the target in this unit test (do_move needs a walkable
+    // path), so we directly set the target's position to a PZ tile and fire a tick.
+    // The tick must clear the fight, not just skip damage.
+    #[test]
+    fn combat_tick_clears_fight_when_target_enters_pz() {
+        let mut g = Game::new(wide_combat_map_with_pz());
+        // Attacker A at (91,117,7); target B starts adjacent at (92,117,7).
+        let (a, _ra) = add_player(&mut g, Position::new(91, 117, 7));
+        let (b, mut rb) = add_player(&mut g, Position::new(92, 117, 7));
+        g.do_set_target(a, b);
+        assert_eq!(g.players[&a].attacking, Some(b));
+
+        // Teleport B onto the PZ tile (90,117,7) by direct state mutation —
+        // simulates B stepping into the temple PZ.
+        g.players.get_mut(&b).unwrap().position = Position::new(90, 117, 7);
+
+        // Fire the combat tick — B is now in PZ, Chebyshev range = 1 (adjacent).
+        // The tick MUST clear A's fight (not merely skip the swing).
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+
+        assert_eq!(
+            g.players[&a].attacking, None,
+            "combat tick must clear attacker.attacking when target is in PZ (W3)"
+        );
+        // B must have received NO damage packet (no 0x8C).
+        assert!(
+            rb.try_recv().is_err(),
+            "target in PZ must receive no damage (no 0x8C) on tick"
+        );
     }
 }

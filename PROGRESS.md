@@ -222,6 +222,12 @@ conditions (M15); monsters (M12); equipped weapons / real `attackValue` (M10);
 fight modes / skulls / frags (M23); auto-walk follow; logout-in-fight block
 (TODO marker already in `reader_loop`); unfair-fight reduction (M23).
 
+**Final holistic review** caught four bugs fixed post-implementation (all TDD — red then green):
+- **W1 (respawn render):** `do_death` only put the victim in `placed`; players standing near the temple were invisible to the respawned victim. Fixed: `placed` now includes all creatures `visible_from(respawn_pos)`, introduced one-by-one (mirrors `do_move`'s `others_in_range` rebuild).
+- **W2 (known-set prune):** `do_death` never pruned the victim's `known` set after the respawn teleport. Stale ids from the death tile would be sent short `0x62` form for creatures the client already discarded. Fixed: drop from `victim.known` every id not visible from `respawn_pos` (mirrors `do_move`'s left-view prune).
+- **W3 (PZ per-tick):** `on_combat_tick` checked range but not protection zones; a victim who fled into the temple kept taking hits. Fixed: if either party is in PZ, clear `attacker.attacking` and skip — matches TFS `canTargetCreature` (combat.cpp:221-229) clearing the fight, not just suppressing damage.
+- **S1 (drawblood effect id):** `EFFECT_DRAWBLOOD = 2` was wrong; TFS `CONST_ME_DRAWBLOOD = 1`, wire = TFS − 1 = `0`. Fixed: constant corrected and moved to `enter_world.rs` next to `EFFECT_TELEPORT` for consistency.
+
 **Live acceptance — PENDING (manual gate):** two OTClient Redemption sessions:
 A right-clicks B → B's HP bar drains on both screens; B's own HP digits drop;
 continued attacks kill B → B sees `0x28`, respawns at Thais temple with full
