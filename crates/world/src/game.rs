@@ -763,6 +763,11 @@ impl Game {
         if self.map.tile_pre_creature_len(to) == 0 && self.map.tile_stack_clone(to).is_none() {
             self.push_cannot_move(id, "You cannot put that there."); return;
         }
+        // Reject block-solid destinations (walls): TFS refuses to place items on a
+        // tile whose stack holds an unpassable item.
+        if self.map.is_blocked(to) {
+            self.push_cannot_move(id, "You cannot put that there."); return;
+        }
 
         let moved_req = if stackable { count.max(1) } else { 1 };
 
