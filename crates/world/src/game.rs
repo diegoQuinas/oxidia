@@ -16,9 +16,9 @@ use rand::{SeedableRng, rngs::StdRng};
 use protocol::chat::{self, SpeakType};
 use protocol::combat_packets;
 use protocol::creature::{self, CreatureView, Outfit};
-use protocol::map_description::{PlacedCreature, TileSource};
+use protocol::map_description::{PlacedCreature, TileSource, WireItem};
 use protocol::outfit as outfit_packets;
-use protocol::{enter_world, tile_creature, walk};
+use protocol::{enter_world, tile_creature, tile_item, walk};
 
 use crate::combat;
 use crate::map::StaticMap;
@@ -187,7 +187,6 @@ impl Game {
 
     /// Ensure `pos` has a dynamic (owned, mutable) stack, cloning the static one
     /// on first touch. Returns `false` if the tile has no stack at all.
-    #[allow(dead_code)] // used by do_move_thing (M10.1 Task 5)
     fn materialize(&mut self, pos: Position) -> bool {
         let key = (pos.x, pos.y, pos.z);
         if self.dynamic.contains_key(&key) {
@@ -320,6 +319,8 @@ impl Game {
             Command::CombatTick { now_ms } => self.on_combat_tick(now_ms),
             Command::LookAt { id, x, y, z, stackpos } => self.do_look(id, x, y, z, stackpos),
             Command::LookBattle { id, target_id } => self.do_look_battle(id, target_id),
+            Command::MoveThing { id, from, from_stackpos, to, count } =>
+                self.do_move_thing(id, from, from_stackpos, to, count),
         }
     }
 
@@ -695,6 +696,181 @@ impl Game {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Push a `0xB4` status message explaining why a move was rejected.
+    fn push_cannot_move(&mut self, id: u32, text: &str) {
+        self.push_status_message(id, text.as_bytes());
+    }
+
+    /// The wire stackpos for the item at overlay/static index `idx` on `pos`,
+    /// accounting for creatures inserted between the pre-creature items and the
+    /// down items. Capped at 9 like the client stack.
+    fn item_wire_stackpos(&self, pos: Position, idx: usize) -> u8 {
+        let pre = self.dynamic.get(&(pos.x, pos.y, pos.z))
+            .map(|st| st.pre_creature_len)
+            .unwrap_or_else(|| self.map.tile_pre_creature_len(pos));
+        let creatures = self.creatures_on(pos).len();
+        let sp = if idx < pre { idx } else { idx + creatures };
+        sp.min(9) as u8
+    }
+
+    /// Server id at overlay/static stack index `idx` on `pos` (overlay wins).
+    fn merged_server_id(&self, pos: Position, idx: usize) -> Option<u16> {
+        if let Some(st) = self.dynamic.get(&(pos.x, pos.y, pos.z)) {
+            return st.server_ids.get(idx).copied();
+        }
+        self.map.tile_item_server_id(pos, idx)
+    }
+
+    /// Move a thing from one map tile to another (M10.1: ground items only).
+    /// Validates moveability, reach, and throw line-of-sight; removes `count`
+    /// from the source (split or whole), then merges same-type stackables on the
+    /// destination (cap 100, overflow spills) or appends a new down item. Both
+    /// tiles are copied-on-write into `dynamic` before mutation, then the change
+    /// is broadcast to spectators.
+    fn do_move_thing(&mut self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
+        if from.x == 0xFFFF || to.x == 0xFFFF { return; } // inventory/container = M10.2/M10.3
+        let Some(p) = self.players.get(&id) else { return };
+        let player_pos = p.position;
+
+        let near = (i32::from(player_pos.x) - i32::from(from.x)).abs() <= 1
+            && (i32::from(player_pos.y) - i32::from(from.y)).abs() <= 1
+            && player_pos.z == from.z;
+        if !near { self.push_cannot_move(id, "You are too far away."); return; }
+
+        if !self.map.can_throw_object_to(from, to) {
+            self.push_cannot_move(id, "You cannot throw there."); return;
+        }
+
+        let creatures = self.creatures_on(from);
+        let pre = self.dynamic.get(&(from.x, from.y, from.z))
+            .map(|st| st.pre_creature_len)
+            .unwrap_or_else(|| self.map.tile_pre_creature_len(from));
+        let sp = from_stackpos as usize;
+        let src_idx = if sp < pre { sp }
+            else if sp < pre + creatures.len() { return; } // a creature, not an item
+            else { sp - creatures.len() };
+
+        let Some(src_sid) = self.merged_server_id(from, src_idx) else { return };
+        let Some(meta) = self.map.item_meta(src_sid) else { return };
+        let stackable = meta.stackable;
+        if !meta.moveable { self.push_cannot_move(id, "You cannot move this object."); return; }
+        let client_id = meta.client_id;
+        let animated = meta.animated;
+
+        if self.map.tile_pre_creature_len(to) == 0 && self.map.tile_stack_clone(to).is_none() {
+            self.push_cannot_move(id, "You cannot put that there."); return;
+        }
+
+        let move_count = if stackable { count.max(1) } else { 1 };
+
+        // --- Source: COW + remove/split. Scope the get_mut so no other self.* call
+        //     overlaps the &mut borrow. ---
+        if !self.materialize(from) { return; }
+        let removed_fully;
+        {
+            let st = self.dynamic.get_mut(&(from.x, from.y, from.z)).unwrap();
+            let cur = st.counts[src_idx].unwrap_or(1).max(1);
+            if stackable && i32::from(cur) > i32::from(move_count) {
+                let left = cur - move_count;
+                st.counts[src_idx] = Some(left);
+                st.items[src_idx].subtype = Some(left);
+                removed_fully = false;
+            } else {
+                st.items.remove(src_idx);
+                st.server_ids.remove(src_idx);
+                st.counts.remove(src_idx);
+                if src_idx < st.pre_creature_len { st.pre_creature_len -= 1; }
+                removed_fully = true;
+            }
+        }
+
+        // --- Destination: COW + merge (cap 100, spill) or append. Compute the
+        //     result INSIDE the get_mut block, end the borrow, then broadcast. ---
+        if !self.materialize(to) { return; }
+        let dest_item: WireItem;
+        let dest_idx: usize;
+        let dest_update: bool;
+        {
+            let st = self.dynamic.get_mut(&(to.x, to.y, to.z)).unwrap();
+            // Top item is a mergeable same-type stackable only when it sits among
+            // the down items (>= pre_creature_len) and shares the source server id.
+            let merge_at = if stackable {
+                st.server_ids.len().checked_sub(1).filter(|&t|
+                    t >= st.pre_creature_len && st.server_ids[t] == src_sid)
+            } else {
+                None
+            };
+            if let Some(t) = merge_at {
+                let merged = u32::from(st.counts[t].unwrap_or(1).max(1))
+                    + u32::from(move_count);
+                let capped = merged.min(100) as u8;
+                st.counts[t] = Some(capped);
+                st.items[t].subtype = Some(capped);
+                dest_item = st.items[t];
+                dest_idx = t;
+                dest_update = true;
+                if merged > 100 {
+                    let spill = (merged - 100) as u8;
+                    st.items.push(WireItem { client_id, subtype: Some(spill), animated });
+                    st.server_ids.push(src_sid);
+                    st.counts.push(Some(spill));
+                }
+            } else {
+                let subtype = if stackable { Some(move_count) } else { None };
+                let wi = WireItem { client_id, subtype, animated };
+                st.items.push(wi);
+                st.server_ids.push(src_sid);
+                st.counts.push(subtype);
+                dest_item = wi;
+                dest_idx = st.items.len() - 1;
+                dest_update = false;
+            }
+        }
+
+        self.broadcast_tile_update(to, dest_idx, dest_item, dest_update);
+        self.broadcast_source(from, from_stackpos, removed_fully, src_idx);
+    }
+
+    /// Broadcast a destination-tile change (add or in-place update) to spectators.
+    fn broadcast_tile_update(&mut self, pos: Position, idx: usize, item: WireItem, is_update: bool) {
+        let mut targets = self.spectators(pos, u32::MAX);
+        targets.extend(
+            self.players.iter().filter(|(_, p)| p.position == pos).map(|(&i, _)| i));
+        targets.sort_unstable();
+        targets.dedup();
+        let sp = self.item_wire_stackpos(pos, idx);
+        let pkt = if is_update {
+            tile_item::update_tile_item((pos.x, pos.y, pos.z), sp, &item)
+        } else {
+            tile_item::add_tile_item((pos.x, pos.y, pos.z), sp, &item)
+        };
+        for t in targets {
+            self.push(t, pkt.clone());
+        }
+    }
+
+    /// Broadcast the source-tile change: a full removal (`0x6C`) or an in-place
+    /// count update (`0x6B`) when only part of a stack was taken.
+    fn broadcast_source(&mut self, pos: Position, from_stackpos: u8, removed_fully: bool, src_idx: usize) {
+        let mut targets = self.spectators(pos, u32::MAX);
+        targets.extend(
+            self.players.iter().filter(|(_, p)| p.position == pos).map(|(&i, _)| i));
+        targets.sort_unstable();
+        targets.dedup();
+        let pkt = if removed_fully {
+            tile_creature::remove_tile_thing((pos.x, pos.y, pos.z), from_stackpos)
+        } else {
+            let item = self.dynamic.get(&(pos.x, pos.y, pos.z))
+                .and_then(|st| st.items.get(src_idx).copied());
+            let Some(item) = item else { return };
+            let sp = self.item_wire_stackpos(pos, src_idx);
+            tile_item::update_tile_item((pos.x, pos.y, pos.z), sp, &item)
+        };
+        for t in targets {
+            self.push(t, pkt.clone());
+        }
     }
 
     /// Build the "You see …" text for the tile item at stack index `idx`.
@@ -1244,6 +1420,9 @@ enum Command {
     LookAt { id: u32, x: u16, y: u16, z: u8, stackpos: u8 },
     /// Client `0x8D`: look at a creature in the battle list by id.
     LookBattle { id: u32, target_id: u32 },
+    /// Client `0x78`: move a thing from one map position to another (M10.1: ground
+    /// items only). `count` is the stackable split amount (ignored for non-stackables).
+    MoveThing { id: u32, from: Position, from_stackpos: u8, to: Position, count: u8 },
 }
 
 /// Cloneable handle to the running world.
@@ -1315,6 +1494,12 @@ impl WorldHandle {
     /// Look at a creature in the battle list (`0x8D`). Fire-and-forget.
     pub async fn look_battle(&self, id: u32, target_id: u32) {
         let _ = self.tx.send(Command::LookBattle { id, target_id }).await;
+    }
+
+    /// Move a thing on the map (`0x78`). Fire-and-forget; the world validates and
+    /// pushes tile-update packets to spectators (M10.1: ground items only).
+    pub async fn move_thing(&self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
+        let _ = self.tx.send(Command::MoveThing { id, from, from_stackpos, to, count }).await;
     }
 }
 

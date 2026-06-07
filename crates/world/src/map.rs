@@ -32,6 +32,12 @@ pub struct ItemMeta {
     pub show_count: bool,
     pub stackable: bool,
     pub pickupable: bool,
+    /// Client sprite id, for building wire items when an item is moved.
+    pub client_id: u16,
+    /// Whether the item carries a `0xFE` animation-phase byte on the wire.
+    pub animated: bool,
+    /// Whether the item may be picked up / moved by a player.
+    pub moveable: bool,
 }
 
 /// Wire-ordered items for one tile, split around the creature slot.
@@ -214,6 +220,9 @@ impl StaticMap {
                 show_count: x.map(|a| a.show_count).unwrap_or(true),
                 stackable: it.is_stackable(),
                 pickupable: it.is_pickupable(),
+                client_id: it.client_id,
+                animated: it.is_animated(),
+                moveable: it.is_moveable(),
             });
         }
     }
