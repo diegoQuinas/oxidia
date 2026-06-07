@@ -958,6 +958,13 @@ impl Game {
         );
         if let Some(p) = self.players.get_mut(&id) { p.direction = direction; p.position = to; }
 
+        // PZ badge: if the mover crossed a protection-zone boundary, resend the
+        // icons packet so the client shows/hides the dove (TFS getClientIcons).
+        if self.map.is_protection_zone(from) != self.map.is_protection_zone(to) {
+            let mask = if self.map.is_protection_zone(to) { enter_world::ICON_PIGEON } else { 0 };
+            self.push(id, enter_world::icons(mask));
+        }
+
         // Spectators that can see either endpoint.
         let mut seen: HashSet<u32> = HashSet::new();
         for s in self.spectators(from, id) { seen.insert(s); }
@@ -3296,5 +3303,31 @@ mod tests {
         let pkt = rx_self.try_recv().expect("requester must receive 0xC8");
         assert_eq!(pkt[0], protocol::outfit::OP_OUTFIT_WINDOW, "packet must be 0xC8");
         assert!(rx_spec.try_recv().is_err(), "spectator must NOT receive anything");
+    }
+
+    /// Drain a receiver and return the last `0xA2` icons packet seen, if any.
+    fn drain_find_icons(rx: &mut mpsc::Receiver<Vec<u8>>) -> Option<Vec<u8>> {
+        let mut found = None;
+        while let Ok(pkt) = rx.try_recv() {
+            if pkt.first() == Some(&enter_world::OP_ICONS) {
+                found = Some(pkt);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn moving_across_pz_boundary_pushes_icons() {
+        let mut g = Game::new(wide_combat_map_with_pz());
+        // Start just east of the PZ tile (91,117); the PZ tile is (90,117).
+        let (p, mut rp) = add_player(&mut g, Position::new(91, 117, 7));
+        // Step West into the PZ tile (90,117).
+        g.do_move(p, Direction::West);
+        let into_pz = drain_find_icons(&mut rp).expect("expected an icons packet entering PZ");
+        assert_eq!(into_pz, [enter_world::OP_ICONS, 0x00, 0x40], "ICON_PIGEON on entering PZ");
+        // Step East back out to (91,117).
+        g.do_move(p, Direction::East);
+        let out_pz = drain_find_icons(&mut rp).expect("expected an icons packet leaving PZ");
+        assert_eq!(out_pz, [enter_world::OP_ICONS, 0x00, 0x00], "icons cleared on leaving PZ");
     }
 }
