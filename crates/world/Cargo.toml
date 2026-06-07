@@ -11,3 +11,4 @@ tracing.workspace = true
 tokio = { workspace = true }
 protocol.workspace = true
 formats.workspace = true
+rand = "0.8"

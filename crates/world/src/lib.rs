@@ -8,6 +8,7 @@
 //!
 //! M3/M4 fill in the grid, creatures, and the loop.
 
+pub mod combat;
 pub mod game;
 pub mod map;
 
