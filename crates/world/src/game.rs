@@ -533,6 +533,9 @@ impl Game {
                 health: p.health,
                 max_health: p.max_health,
                 sex: p.sex,
+                inventory: p.inventory.iter().enumerate()
+                    .filter_map(|(i, slot)| slot.map(|it| ((i + 1) as u8, it.server_id, it.count.unwrap_or(1))))
+                    .collect(),
             });
         }
     }
@@ -997,6 +1000,10 @@ impl Game {
                     && player_pos.z == to.z;
                 if !near { self.push_cannot_move(id, "You are too far away."); return; }
                 if self.map.tile_pre_creature_len(to) == 0 && self.map.tile_stack_clone(to).is_none() {
+                    self.push_cannot_move(id, "You cannot put that there."); return;
+                }
+                // Reject block-solid destinations (walls), mirroring do_move_thing.
+                if self.map.is_blocked(to) {
                     self.push_cannot_move(id, "You cannot put that there."); return;
                 }
                 let meta_stackable = self.map.item_meta(it.server_id).map(|m| m.stackable).unwrap_or(false);
@@ -3748,6 +3755,7 @@ mod tests {
             outfit: wizard_outfit(), push_tx: tx_a, known: HashSet::new(),
             health: 90, max_health: 150, fist_skill: 10,
             attacking: None, last_attack_ms: 0, sex: 1, gamemaster: true,
+            inventory: [None; 10],
         });
 
         let (tx_b, _rx_b) = mpsc::channel(PUSH_CAPACITY);
@@ -3758,6 +3766,7 @@ mod tests {
             outfit: knight(), push_tx: tx_b, known: HashSet::new(),
             health: 145, max_health: 145, fist_skill: 10,
             attacking: None, last_attack_ms: 0, sex: 0, gamemaster: false,
+            inventory: [None; 10],
         });
 
         g.save_all();
@@ -3795,6 +3804,7 @@ mod tests {
             direction: Direction::West, outfit: knight(), push_tx: tx,
             known: HashSet::new(), health: 100, max_health: 100, fist_skill: 10,
             attacking: None, last_attack_ms: 0, sex: 1, gamemaster: false,
+            inventory: [None; 10],
         });
 
         g.save_all(); // must not panic
