@@ -37,6 +37,7 @@ performance-critical or stable stays native Rust.
 | M6.2 | Ladders & holes (use-driven) — **deferred to M11**: the behavior is script-driven (`teleport.lua` `onUse`), not data; ladders/grates carry no `items.xml` attribute. Belongs on the Lua runtime, not hardcoded in Rust. Research: `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⏸️ → M11 |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ✅ code / live pending |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
+| M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⬜ |
 | **B** | **Items & Inventory** | |
 | M9 | Ground items, stacks, look-at | ⬜ |
 | M10 | Inventory & equipment: move, equip, containers, use | ⬜ |
@@ -56,7 +57,7 @@ performance-critical or stable stays native Rust.
 | M20 | Houses | ⬜ |
 | M21 | Quests | ⬜ |
 | M22 | Market | ⬜ |
-| M23 | PvP systems: skulls, frags, war/PZ rules | ⬜ |
+| M23 | Guild war systems: war declarations, war PvP rules, war/PZ exceptions (basic PK skulls/frags moved to M8.1) | ⬜ |
 | **G** | **Production Hardening** 🏁 | |
 | M24 | GM/admin tools | ⬜ |
 | M25 | Persistence robustness | ⬜ |
