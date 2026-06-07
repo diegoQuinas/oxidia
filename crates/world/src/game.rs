@@ -64,9 +64,13 @@ impl Game {
     fn can_see(viewer: Position, target: Position) -> bool {
         let dz = i32::from(viewer.z) - i32::from(target.z);
         let z_ok = if viewer.z <= 7 { dz == 0 } else { dz.abs() <= 2 };
+        // Tiles on other floors project diagonally: a tile `dz` floors away
+        // appears shifted by `dz` in x and y (TFS canSee `offsetz = myPos.z - z`,
+        // protocolgame.cpp:756). The map encoder applies the same `center_z - nz`
+        // shift, so visibility must too or cross-floor spectators desync.
         z_ok
-            && (i32::from(viewer.x) - i32::from(target.x)).abs() <= 8
-            && (i32::from(viewer.y) - i32::from(target.y)).abs() <= 6
+            && (i32::from(viewer.x) + dz - i32::from(target.x)).abs() <= 8
+            && (i32::from(viewer.y) + dz - i32::from(target.y)).abs() <= 6
     }
 
     /// Ids of players who can see `pos`, excluding `exclude`.
@@ -321,7 +325,24 @@ impl Game {
             let sees_from = Self::can_see(svpos, from);
             let sees_to = Self::can_see(svpos, to);
             if sees_from && sees_to {
-                self.push(spec, walk::creature_move(id, (to.x, to.y, to.z)));
+                if from.z == 7 && to.z >= 8 {
+                    // Surface->underground boundary: the creature crosses between
+                    // the overground and underground render stacks, so a plain
+                    // 0x6D desyncs the spectator. TFS sendMoveCreature (2633-2649)
+                    // does a clean remove+add here.
+                    let sp = self.map.creature_stackpos(
+                        i32::from(from.x), i32::from(from.y), i32::from(from.z));
+                    self.push(spec, tile_creature::remove_tile_thing((from.x, from.y, from.z), sp));
+                    if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
+                    if let Some(bytes) = self.introduce(spec, id) {
+                        let dsp = self.map.creature_stackpos(
+                            i32::from(to.x), i32::from(to.y), i32::from(to.z));
+                        self.push(spec, tile_creature::add_tile_creature(
+                            (to.x, to.y, to.z), dsp, &bytes));
+                    }
+                } else {
+                    self.push(spec, walk::creature_move(id, (to.x, to.y, to.z)));
+                }
             } else if sees_to {
                 if let Some(bytes) = self.introduce(spec, id) {
                     let sp = self.map.creature_stackpos(
@@ -533,6 +554,20 @@ mod tests {
         assert_eq!(g.players.get(&mover).unwrap().position, Position::new(101, 100, 8));
         let pkt = rx.try_recv().expect("mover gets a packet");
         assert!(pkt.contains(&protocol::walk::OP_FLOOR_CHANGE_UP));
+    }
+
+    #[test]
+    fn spectator_gets_remove_then_add_when_mover_crosses_to_underground() {
+        // A z=8 spectator near the landing sees a mover descend 7->8: the
+        // boundary must produce a clean remove (0x6C) then add (0x6A), not 0x6D.
+        let mut g = Game::new(stair_map());
+        let (mover, _rm) = add_player(&mut g, Position::new(100, 100, 7));
+        let (_spec, mut rx) = add_player(&mut g, Position::new(102, 100, 8));
+        g.do_move(mover, Direction::East); // 100,100,7 -> 101,100,8
+        let p1 = rx.try_recv().expect("spectator gets remove");
+        assert_eq!(p1[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
+        let p2 = rx.try_recv().expect("spectator gets add");
+        assert_eq!(p2[0], protocol::tile_creature::OP_ADD_TILE_CREATURE);
     }
 
     fn walk_map() -> Arc<StaticMap> {
