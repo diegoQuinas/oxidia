@@ -36,6 +36,7 @@ performance-critical or stable stays native Rust.
 | M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ✅ code / live pending |
 | M6.2 | Ladders & holes (use-driven) — **deferred to M11**: the behavior is script-driven (`teleport.lua` `onUse`), not data; ladders/grates carry no `items.xml` attribute. Belongs on the Lua runtime, not hardcoded in Rust. Research: `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⏸️ → M11 |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ✅ code / live pending |
+| M7.1 | Combat polish: death→logout flow (relog at temple, save-on-death), protection-zone client badge (ICON_PIGEON), blood-hit effect fix | ✅ code / live pending |
 | M8 | Persistence + accounts: per-account characters, saved position/stats/outfit (load on login, save on logout via unbounded save channel); outfit change + persist (`0xD2` request → `0xC8` window, `0xD3` set → apply + `0x8E` broadcast); login never stacks on an occupied tile (`free_spawn_near`) | ✅ done |
 | M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⬜ |
 | **B** | **Items & Inventory** | |
@@ -234,6 +235,42 @@ A right-clicks B → B's HP bar drains on both screens; B's own HP digits drop;
 continued attacks kill B → B sees `0x28`, respawns at Thais temple with full
 HP; A sees B vanish + reappear; standing on a PZ tile, A cannot attack
 (status message). Flip M7 to ✅ once this passes.
+
+## M7.1 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-07-m7.1-combat-polish-design.md`,
+`docs/superpowers/plans/2026-06-07-m7.1-combat-polish.md`. Scope: **TFS-faithful
+M7 polish found during live testing.** Built in worktree `m7.1-combat-polish`
+(rebased onto main after M8 landed).
+
+1. ✅ `protocol::enter_world` — blood-hit effect: `EFFECT_DRAWBLOOD` 0→1. TFS
+   `sendMagicEffect` sends the effect byte directly (protocolgame.cpp:2326) and
+   `CONST_ME_DRAWBLOOD = 1`; wire `0` is dropped by the client as "no effect".
+2. ✅ `protocol::enter_world` — `icons(mask: u16)` + `ICON_PIGEON` (`1<<14`, TFS
+   const.h:343), replacing the static `icons()`.
+3. ✅ `world::game` (`do_move`) — push `0xA2` with/without `ICON_PIGEON` when the
+   mover crosses a protection-zone boundary (TFS `getClientIcons`).
+4. ✅ `server::game_service` — the enter-world burst carries `ICON_PIGEON` when the
+   spawn tile is a PZ (`map.is_protection_zone(center)`).
+5. ✅ `world::game` (`do_death`) — **death is now a logout, not an in-world
+   respawn.** Send `0x28`, clear fights, id-form remove at the death tile, then
+   remove the victim from the world and emit a `SaveRecord` at the **temple** with
+   full HP. Dropping the victim's `push_tx` closes the session → the client shows
+   the death window and returns to character select; the relog spawns at the temple
+   (M8 `login` restores the saved position). Mirrors TFS `onDeath` →
+   `sendReLoginWindow` + `removeCreature` (player.cpp:2070, 2197). **Supersedes the
+   M7 in-world respawn** — the W1/W2 respawn-render + known-set prune + `free_spawn_near`
+   are removed (moot once death logs out).
+
+Gate: `cargo test` green (225), `cargo clippy --all-targets -- -D warnings` clean,
+`#![forbid(unsafe_code)]` intact.
+
+**Deferred (confirmed with roadmap owner):** floor blood splat (`ITEM_SMALLSPLASH`
++ decay) → M9; corpse body → M13; PK skull system → M8.1.
+
+**Live acceptance — PENDING (manual gate):** die in PvP → death window → character
+select → relog spawns at the temple with full HP; standing in the temple shows the
+PZ dove badge (clears on leaving); hits draw a visible blood animation.
 
 ## M6.1 plan
 
