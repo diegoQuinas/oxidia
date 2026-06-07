@@ -1242,12 +1242,27 @@ impl Game {
         let args: Vec<&str> = parts.collect();
         match verb {
             "item" => self.gm_item(id, &args),
-            // real subcommands are added in Tasks 4–5
+            "goto" => self.gm_goto(id, &args),
+            // real subcommands are added in Task 5
             other => self.push_status_message(
                 id,
                 format!("Unknown command: /{other}").as_bytes(),
             ),
         }
+    }
+
+    /// `/goto <x> <y> <z>` — teleport the GM to a position.
+    fn gm_goto(&mut self, id: u32, args: &[&str]) {
+        let Some(pos) = parse_pos(args) else {
+            self.push_status_message(id, b"Usage: /goto <x> <y> <z>");
+            return;
+        };
+        if !self.map.has_ground(pos) {
+            self.push_status_message(id, b"There is no tile there.");
+            return;
+        }
+        self.do_teleport(id, pos);
+        self.push_status_message(id, format!("Teleported to {}, {}, {}.", pos.x, pos.y, pos.z).as_bytes());
     }
 
     /// `/item <server_id> [count]` — spawn an item on the GM's own tile.
@@ -1524,6 +1539,80 @@ impl Game {
         }
     }
 
+    /// Relocate creature `id` to `to`, bypassing walkability. Spectators get a
+    /// clean remove/add (a teleport can span any distance, so the incremental
+    /// `0x6D` move is never used). The mover gets `remove_creature_by_id` + a full
+    /// `0x64` map centered on the landing tile, which carries the landing position
+    /// explicitly. Mirrors `do_move` + the teleport branch of `walk::walk_update`.
+    fn do_teleport(&mut self, id: u32, to: Position) {
+        let from = match self.players.get(&id) {
+            Some(p) => p.position,
+            None => return,
+        };
+        if from == to { return; }
+        if let Some(p) = self.players.get_mut(&id) { p.position = to; }
+
+        // PZ badge: resend icons if we crossed a protection-zone boundary.
+        if self.map.is_protection_zone(from) != self.map.is_protection_zone(to) {
+            let mask = if self.map.is_protection_zone(to) { enter_world::ICON_PIGEON } else { 0 };
+            self.push(id, enter_world::icons(mask));
+        }
+
+        // Spectators of either endpoint: clean remove/add.
+        let mut seen: HashSet<u32> = HashSet::new();
+        for s in self.spectators(from, id) { seen.insert(s); }
+        for s in self.spectators(to, id) { seen.insert(s); }
+        for spec in seen {
+            let Some(svpos) = self.players.get(&spec).map(|p| p.position) else { continue };
+            let sees_from = Self::can_see(svpos, from);
+            let sees_to = Self::can_see(svpos, to);
+            if sees_to {
+                if sees_from {
+                    self.push(spec, walk::remove_creature_by_id(id));
+                    if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
+                }
+                if let Some(bytes) = self.introduce(spec, id) {
+                    let sp = self.creature_stackpos_on(to, id);
+                    self.push(spec, tile_creature::add_tile_creature((to.x, to.y, to.z), sp, &bytes));
+                }
+            } else if sees_from {
+                self.push(spec, walk::remove_creature_by_id(id));
+                if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
+            }
+        }
+
+        // Prune the mover's known-set of creatures no longer in view.
+        let left_view: Vec<u32> = self.visible_from(from, id).into_iter()
+            .filter(|oid| self.players.get(oid).is_some_and(|p| !Self::can_see(to, p.position)))
+            .collect();
+        for oid in left_view {
+            if let Some(mover) = self.players.get_mut(&id) { mover.known.remove(&oid); }
+        }
+
+        // Mover's own view: full 0x64 carrying every in-range player plus self.
+        // Build creatures (introduce = &mut self) BEFORE borrowing self.merged().
+        let mut wire_creatures: Vec<PlacedCreature> = self.visible_from(to, id).into_iter()
+            .filter_map(|oid| {
+                let opos = self.players.get(&oid)?.position;
+                let bytes = self.introduce(id, oid)?;
+                Some(PlacedCreature { x: opos.x, y: opos.y, z: opos.z, bytes })
+            })
+            .collect();
+        if let Some(bytes) = self.introduce(id, id) {
+            wire_creatures.push(PlacedCreature { x: to.x, y: to.y, z: to.z, bytes });
+        }
+        let mut pkt = walk::remove_creature_by_id(id);
+        {
+            let merged = self.merged();
+            pkt.extend(protocol::map_description::encode(
+                protocol::map_description::Center { x: to.x, y: to.y, z: to.z },
+                &merged,
+                &wire_creatures,
+            ));
+        }
+        self.push(id, pkt);
+    }
+
     fn do_move(&mut self, id: u32, direction: Direction) {
         let (from, cur_dir) = match self.players.get(&id) {
             Some(p) => (p.position, p.direction),
@@ -1693,6 +1782,15 @@ impl Game {
         );
         self.push(id, pkt);
     }
+}
+
+/// Parse `<x> <y> <z>` from the front of a GM command's args. `None` if any
+/// coordinate is missing or out of range.
+fn parse_pos(args: &[&str]) -> Option<Position> {
+    let x = args.first()?.parse::<u16>().ok()?;
+    let y = args.get(1)?.parse::<u16>().ok()?;
+    let z = args.get(2)?.parse::<u8>().ok()?;
+    Some(Position::new(x, y, z))
 }
 
 enum Command {
