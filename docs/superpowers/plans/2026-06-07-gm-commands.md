@@ -18,14 +18,24 @@
 
 ---
 
-## Task 1: Designate "God Diego" as gamemaster
+## Task 1: Designate "God Diego" as gamemaster (with GM outfit)
 
-The `gamemaster` flag already flows from login into `PlayerState`. We only force it true when the character name is `diego`.
+The `gamemaster` flag already flows from login into `PlayerState`. We force it true when the character name is `diego`, and additionally give any gamemaster the classic Gamemaster outfit (looktype 75 — fixed across all Tibia versions including 10.98).
 
 **Files:**
-- Modify: `crates/server/src/game_service.rs:234`
+- Modify: `crates/server/src/game_service.rs` — looktype constant (near `knight_outfit`, :19) and the GM assignment (:234).
 
-- [ ] **Step 1: Force GM by name**
+- [ ] **Step 1: Add the GM looktype constant**
+
+Near `knight_outfit` (game_service.rs:19), add:
+
+```rust
+/// Classic Gamemaster outfit sprite id (TFS/Tibia `looktype 75`, stable across
+/// versions). Gamemasters are forced into this look so they are visibly GMs.
+const GM_LOOKTYPE: u16 = 75;
+```
+
+- [ ] **Step 2: Force GM by name + GM outfit**
 
 Replace line 234:
 
@@ -39,18 +49,27 @@ with:
     // "God Diego" is always a gamemaster, regardless of the login packet flag.
     // Hardcoded by name (no DB schema for access levels yet — see the GM design spec).
     initial.gamemaster = req.gamemaster || name.eq_ignore_ascii_case("diego");
+    if initial.gamemaster {
+        // Force the visible Gamemaster outfit (looktype 75). Colors are irrelevant
+        // for this fixed-sprite outfit; only look_type matters on the wire.
+        initial.outfit.look_type = GM_LOOKTYPE;
+    }
 ```
 
-- [ ] **Step 2: Build**
+- [ ] **Step 3: Build**
 
 Run: `cargo build -p server`
 Expected: compiles clean.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Manual validation**
+
+Log in as `diego`. Expected: the character renders as the Gamemaster outfit (looktype 75), visible to the GM and to any second observing client. Log in as `test` → normal outfit unchanged.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/game_service.rs
-git commit -m "feat(gm): mark character 'diego' as gamemaster on login"
+git commit -m "feat(gm): mark 'diego' as gamemaster and force the GM outfit (looktype 75)"
 ```
 
 ---

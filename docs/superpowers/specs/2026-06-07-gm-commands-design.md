@@ -30,6 +30,10 @@ change, no in-game promotion flow.
   `initial.gamemaster = name.eq_ignore_ascii_case("diego") || req.gamemaster;`
   so the hardcoded god is always GM, without removing the existing login-packet
   path.
+- GM outfit: any gamemaster is forced into the classic Gamemaster outfit
+  (looktype 75, stable across Tibia versions) at login by overriding
+  `initial.outfit.look_type`. Only `look_type` matters on the wire for this
+  fixed-sprite outfit; colors are irrelevant.
 
 Tiered access levels are explicitly out of scope. The binary `gamemaster` flag is
 the only privilege.
