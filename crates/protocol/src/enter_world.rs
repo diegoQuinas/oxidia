@@ -22,8 +22,12 @@ pub const OP_EXTENDED: u8 = 0x32;
 pub const INVENTORY_SLOTS: u8 = 11;
 /// TFS `CONST_ME_TELEPORT = 11` (const.h); wire value = TFS enum − 1.
 pub const EFFECT_TELEPORT: u8 = 10;
-/// TFS `CONST_ME_DRAWBLOOD = 1` (const.h); wire value = TFS enum − 1.
-pub const EFFECT_DRAWBLOOD: u8 = 0;
+/// TFS `CONST_ME_DRAWBLOOD = 1` (const.h:12). TFS `sendMagicEffect` sends the
+/// effect byte directly (protocolgame.cpp:2326), so the wire value IS the enum
+/// value. Wire `0` is treated as "no effect" by the client and renders nothing.
+/// (Note: `EFFECT_TELEPORT = 10` works live despite TFS `CONST_ME_TELEPORT = 11`;
+/// that anomaly is tracked separately and left as-is.)
+pub const EFFECT_DRAWBLOOD: u8 = 1;
 
 /// Variable stats the client renders; the rest are M3 constants baked in.
 #[derive(Debug, Clone, Copy)]
@@ -273,5 +277,14 @@ mod tests {
         assert_eq!(icons(), [OP_ICONS, 0, 0]);
         assert_eq!(extended_opcode_init(), [OP_EXTENDED, 0, 0, 0]);
         assert_eq!(magic_effect(1000, 1000, 7, EFFECT_TELEPORT).len(), 1 + 2 + 2 + 1 + 1);
+    }
+
+    #[test]
+    fn drawblood_effect_is_nonzero_and_matches_tfs() {
+        // CONST_ME_DRAWBLOOD = 1 (const.h); TFS sends the effect byte directly.
+        // Wire value 0 is dropped by the client (no effect), which is the bug.
+        assert_eq!(EFFECT_DRAWBLOOD, 1);
+        let pkt = magic_effect(100, 100, 7, EFFECT_DRAWBLOOD);
+        assert_eq!(*pkt.last().unwrap(), 1, "drawblood effect byte must be 1");
     }
 }
