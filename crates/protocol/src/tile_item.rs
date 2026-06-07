@@ -11,7 +11,7 @@ const OP_ADD_TILE_THING: u8 = 0x6A;
 const OP_UPDATE_TILE_THING: u8 = 0x6B;
 const MARK_UNMARKED: u8 = 0xFF;
 
-fn write_item(w: &mut MessageWriter, item: &WireItem) {
+pub(crate) fn write_item(w: &mut MessageWriter, item: &WireItem) {
     w.write_u16(item.client_id);
     w.write_u8(MARK_UNMARKED);
     if let Some(subtype) = item.subtype {

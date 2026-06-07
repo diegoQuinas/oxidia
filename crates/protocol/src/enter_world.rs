@@ -163,6 +163,17 @@ pub fn empty_inventory() -> Vec<u8> {
     w.into_bytes()
 }
 
+/// `0x78` set-inventory-slot: place `item` into equipment `slot` (1..=10).
+/// Reuses the tile item wire-form, so equipped stackables (ammo) carry a count
+/// byte and animated items a `0xFE` phase byte — exactly like a tile item.
+pub fn set_inventory_slot(slot: u8, item: &crate::map_description::WireItem) -> Vec<u8> {
+    let mut w = MessageWriter::new();
+    w.write_u8(OP_INVENTORY_SET);
+    w.write_u8(slot);
+    crate::tile_item::write_item(&mut w, item);
+    w.into_bytes()
+}
+
 /// `0x9F` basic data: not premium, knight-ish vocation, 255 placeholder spell ids.
 pub fn basic_data() -> Vec<u8> {
     let mut w = MessageWriter::new();
