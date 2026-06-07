@@ -70,6 +70,12 @@ pub struct ItemXmlAttrs {
     pub weight: u32,
     /// Whether the count prefixes the name for stacks (`showcount`, default true).
     pub show_count: bool,
+    /// Equip slot type (`<attribute key="slotType">`): "head","body","legs",
+    /// "feet","necklace","ring","ammo","backpack","two-handed", or empty.
+    pub slot_type: String,
+    /// Weapon type (`<attribute key="weaponType">`): "sword","axe","club",
+    /// "distance","wand","shield","ammunition", or empty.
+    pub weapon_type: String,
 }
 
 impl Default for ItemXmlAttrs {
@@ -82,6 +88,8 @@ impl Default for ItemXmlAttrs {
             description: String::new(),
             weight: 0,
             show_count: true,
+            slot_type: String::new(),
+            weapon_type: String::new(),
         }
     }
 }
@@ -139,6 +147,10 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
             } else if key.eq_ignore_ascii_case("showcount") {
                 attrs.show_count = !value.eq_ignore_ascii_case("0")
                     && !value.eq_ignore_ascii_case("false");
+            } else if key.eq_ignore_ascii_case("slotType") {
+                attrs.slot_type = value.to_ascii_lowercase();
+            } else if key.eq_ignore_ascii_case("weaponType") {
+                attrs.weapon_type = value.to_ascii_lowercase();
             }
         }
         for id in ids {
@@ -150,6 +162,8 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
             if !attrs.description.is_empty() { entry.description = attrs.description.clone(); }
             if attrs.weight != 0 { entry.weight = attrs.weight; }
             entry.show_count = attrs.show_count;
+            if !attrs.slot_type.is_empty() { entry.slot_type = attrs.slot_type.clone(); }
+            if !attrs.weapon_type.is_empty() { entry.weapon_type = attrs.weapon_type.clone(); }
         }
     }
 
