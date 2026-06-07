@@ -342,7 +342,7 @@ impl Game {
             Command::LookBattle { id, target_id } => self.do_look_battle(id, target_id),
             Command::MoveThing { id, from, from_stackpos, to, count } =>
                 self.do_move_thing(id, from, from_stackpos, to, count),
-            Command::GmCommand { id, text } => self.do_gm_command(id, text),
+            Command::Gm { id, text } => self.do_gm_command(id, text),
             // Intercepted in the actor loop (it must break the loop + ack);
             // never reaches `handle`. Arm kept for match exhaustiveness.
             Command::Shutdown { .. } => {}
@@ -2107,7 +2107,7 @@ enum Command {
     MoveThing { id: u32, from: Position, from_stackpos: u8, to: Position, count: u8 },
     /// Chat text beginning with `/` from a player. The actor gates on
     /// `PlayerState.gamemaster`, parses the verb, and dispatches to a GM primitive.
-    GmCommand { id: u32, text: String },
+    Gm { id: u32, text: String },
     /// Graceful shutdown: persist every online player, ack, then stop the actor.
     /// Dropping the actor drops `save_tx`, closing the save channel so the DB
     /// drain task can finish. Handled in the actor loop, not in `handle`.
@@ -2195,7 +2195,7 @@ impl WorldHandle {
     /// validates that the sender is a gamemaster before doing anything.
     /// Fire-and-forget; feedback is pushed to the sender as a `0xB4` message.
     pub async fn gm_command(&self, id: u32, text: String) {
-        let _ = self.tx.send(Command::GmCommand { id, text }).await;
+        let _ = self.tx.send(Command::Gm { id, text }).await;
     }
 
     /// Persist every online player, then stop the world actor. Resolves once all
