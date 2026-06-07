@@ -1175,9 +1175,9 @@ mod tests {
                 ItemType { group: 5, flags: 0, server_id: 300, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::DOWN },
             ],
         };
-        let g = |x, y, z| MapTile { x, y, z, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }] };
+        let g = |x, y, z| MapTile { x, y, z, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }] };
         let stair = |x, y, z| MapTile { x, y, z, flags: 0, house_id: None,
-            items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 300, contents: vec![] }] };
+            items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 300, count: None, contents: vec![] }] };
         let map = OtbmMap {
             width: 200, height: 200, major_items: 3, minor_items: 57,
             description: String::new(), spawn_file: None, house_file: None,
@@ -1240,10 +1240,10 @@ mod tests {
             width: 200, height: 200, major_items: 3, minor_items: 57,
             description: String::new(), spawn_file: None, house_file: None,
             tiles: vec![
-                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }] },
-                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 300, contents: vec![] }] },
+                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
+                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 300, count: None, contents: vec![] }] },
                 // landing one floor below carries a block-solid item
-                MapTile { x: 101, y: 100, z: 8, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 200, contents: vec![] }] },
+                MapTile { x: 101, y: 100, z: 8, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 200, count: None, contents: vec![] }] },
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
             waypoints: vec![],
@@ -1302,9 +1302,9 @@ mod tests {
             tiles: vec![
                 // raised tile on z=9: ground + 3 height items -> triggers_up
                 MapTile { x: 100, y: 100, z: 9, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 301, contents: vec![] }, MapItem { id: 301, contents: vec![] }, MapItem { id: 301, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }] },
                 // floor above the eastern destination has ground -> climb target
-                MapTile { x: 101, y: 100, z: 8, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }] },
+                MapTile { x: 101, y: 100, z: 8, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
                 // (100,100,8) intentionally absent so the tile above current is open
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 9 }],
@@ -1339,8 +1339,8 @@ mod tests {
             description: String::new(), spawn_file: None, house_file: None,
             tiles: vec![
                 MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 301, contents: vec![] }, MapItem { id: 301, contents: vec![] }, MapItem { id: 301, contents: vec![] }] },
-                MapTile { x: 101, y: 100, z: 6, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }] },
+                MapTile { x: 101, y: 100, z: 6, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
             waypoints: vec![],
@@ -1377,7 +1377,7 @@ mod tests {
             ],
         };
         let ground = |x, y| MapTile { x, y, z: 7, flags: 0, house_id: None,
-            items: vec![MapItem { id: 100, contents: vec![] }] };
+            items: vec![MapItem { id: 100, count: None, contents: vec![] }] };
         let map = OtbmMap {
             width: 200, height: 200, major_items: 3, minor_items: 57,
             description: String::new(), spawn_file: None, house_file: None,
@@ -1385,7 +1385,7 @@ mod tests {
                 ground(95, 117), ground(96, 117), ground(95, 116),
                 // wall to the west of spawn
                 MapTile { x: 94, y: 117, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 200, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 200, count: None, contents: vec![] }] },
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
             waypoints: vec![],
@@ -1730,7 +1730,7 @@ mod tests {
             x, y, z: 7,
             flags: if pz { 1 } else { 0 }, // 1 = OTBM_TILEFLAG_PROTECTIONZONE
             house_id: None,
-            items: vec![MapItem { id: 100, contents: vec![] }],
+            items: vec![MapItem { id: 100, count: None, contents: vec![] }],
         };
         let map = OtbmMap {
             width: 200, height: 200, major_items: 3, minor_items: 57,
@@ -1995,7 +1995,7 @@ mod tests {
             x, y, z: 7,
             flags: if pz { 1 } else { 0 },
             house_id: None,
-            items: vec![MapItem { id: 100, contents: vec![] }],
+            items: vec![MapItem { id: 100, count: None, contents: vec![] }],
         };
         let mut tiles: Vec<MapTile> = (90u16..=116u16)
             .map(|x| ground(x, 117, x == 90))
@@ -2066,8 +2066,8 @@ mod tests {
         for x in x0..=x1 {
             for y in y0..=y1 {
                 tiles.push(MapTile { x, y, z: 8, flags: 0, house_id: None, items: vec![
-                    MapItem { id: 100 + (x - x0), contents: vec![] }, // ground -> client 1000+dx
-                    MapItem { id: 500 + (y - y0), contents: vec![] }, // down   -> client 2000+dy
+                    MapItem { id: 100 + (x - x0), count: None, contents: vec![] }, // ground -> client 1000+dx
+                    MapItem { id: 500 + (y - y0), count: None, contents: vec![] }, // down   -> client 2000+dy
                 ] });
             }
         }
@@ -2232,7 +2232,7 @@ mod tests {
                 for y in y0..=y1 {
                     let id = uid(x, y, z);
                     item_types.push(ItemType { group: 1, flags: 0, server_id: id, client_id: id, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
-                    tiles.push(MapTile { x, y, z, flags: 0, house_id: None, items: vec![MapItem { id, contents: vec![] }] });
+                    tiles.push(MapTile { x, y, z, flags: 0, house_id: None, items: vec![MapItem { id, count: None, contents: vec![] }] });
                 }
             }
         }
@@ -2651,12 +2651,12 @@ mod tests {
                 for y in y0..=y1 {
                     let cid = uid(x, y, z);
                     item_types.push(ItemType { group: 1, flags: 0, server_id: cid, client_id: cid, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
-                    let mut items = vec![MapItem { id: cid, contents: vec![] }];
+                    let mut items = vec![MapItem { id: cid, count: None, contents: vec![] }];
                     if z == 7 && (x, y) == down_stair {
-                        items.push(MapItem { id: SID_DOWN, contents: vec![] });
+                        items.push(MapItem { id: SID_DOWN, count: None, contents: vec![] });
                     }
                     if z == 8 && (x, y) == up_stair {
-                        items.push(MapItem { id: SID_UP, contents: vec![] });
+                        items.push(MapItem { id: SID_UP, count: None, contents: vec![] });
                     }
                     tiles.push(MapTile { x, y, z, flags: 0, house_id: None, items });
                 }
@@ -2899,9 +2899,9 @@ mod tests {
                 for y in y0..=y1 {
                     let cid = uid(x, y, z);
                     item_types.push(ItemType { group: 1, flags: 0, server_id: cid, client_id: cid, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
-                    let mut items = vec![MapItem { id: cid, contents: vec![] }];
+                    let mut items = vec![MapItem { id: cid, count: None, contents: vec![] }];
                     if z == down_z && (x, y) == down_stair {
-                        items.push(MapItem { id: SID_DOWN, contents: vec![] });
+                        items.push(MapItem { id: SID_DOWN, count: None, contents: vec![] });
                     }
                     tiles.push(MapTile { x, y, z, flags: 0, house_id: None, items });
                 }

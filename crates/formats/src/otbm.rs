@@ -30,9 +30,22 @@ const OTBM_WAYPOINT: u8 = 16;
 // Map-data / tile attributes (OTBM_AttrTypes_t).
 const OTBM_ATTR_DESCRIPTION: u8 = 1;
 const OTBM_ATTR_TILE_FLAGS: u8 = 3;
+const OTBM_ATTR_ACTION_ID: u8 = 4;
+const OTBM_ATTR_UNIQUE_ID: u8 = 5;
+const OTBM_ATTR_TEXT: u8 = 6;
+const OTBM_ATTR_DESC: u8 = 7;
+const OTBM_ATTR_TELE_DEST: u8 = 8;
 const OTBM_ATTR_ITEM: u8 = 9;
+const OTBM_ATTR_DEPOT_ID: u8 = 10;
 const OTBM_ATTR_EXT_SPAWN_FILE: u8 = 11;
+const OTBM_ATTR_RUNE_CHARGES: u8 = 12;
 const OTBM_ATTR_EXT_HOUSE_FILE: u8 = 13;
+const OTBM_ATTR_COUNT: u8 = 15;
+const OTBM_ATTR_DURATION: u8 = 16;
+const OTBM_ATTR_DECAYING_STATE: u8 = 17;
+const OTBM_ATTR_WRITTENDATE: u8 = 18;
+const OTBM_ATTR_WRITTENBY: u8 = 19;
+const OTBM_ATTR_CHARGES: u8 = 22;
 
 /// A fully parsed `.otbm` map.
 #[derive(Debug, Clone)]
@@ -76,12 +89,13 @@ pub struct MapTile {
     pub items: Vec<MapItem>,
 }
 
-/// An item on a tile (or inside a container). M2 keeps only the id and any
-/// contained items; full attribute decoding is deferred.
+/// An item on a tile (or inside a container).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapItem {
     /// Server item id.
     pub id: u16,
+    /// Stack count / subtype from `OTBM_ATTR_COUNT` (None if absent).
+    pub count: Option<u8>,
     /// Items contained within (for containers); empty otherwise.
     pub contents: Vec<MapItem>,
 }
@@ -213,7 +227,7 @@ fn parse_tile(node: &Node, base_x: u16, base_y: u16, z: u8) -> Result<MapTile, F
         match attr {
             OTBM_ATTR_TILE_FLAGS => flags = r.read_u32()?,
             // Inline ground item: Item::CreateItem reads exactly a u16 id.
-            OTBM_ATTR_ITEM => items.push(MapItem { id: r.read_u16()?, contents: vec![] }),
+            OTBM_ATTR_ITEM => items.push(MapItem { id: r.read_u16()?, count: None, contents: vec![] }),
             _ => return Err(FormatError::InvalidNode { what: "unknown tile attribute" }),
         }
     }
@@ -229,11 +243,26 @@ fn parse_tile(node: &Node, base_x: u16, base_y: u16, z: u8) -> Result<MapTile, F
     Ok(MapTile { x, y, z, flags, house_id, items })
 }
 
-/// Parse an OTBM_ITEM node: leading u16 id, then (ignored) attributes, then
-/// contained items as child nodes.
+/// Parse an OTBM_ITEM node: leading u16 id, then attributes (we capture COUNT),
+/// then contained items as child nodes. Attribute parsing stops at the first
+/// unknown tag — map stack items carry COUNT and a small set of known attrs.
 fn parse_item(node: &Node) -> Result<MapItem, FormatError> {
     let mut r = PropReader::new(&node.props);
     let id = r.read_u16()?;
+    let mut count = None;
+    while r.remaining() > 0 {
+        let attr = r.read_u8()?;
+        match attr {
+            OTBM_ATTR_COUNT => count = Some(r.read_u8()?),
+            OTBM_ATTR_ACTION_ID | OTBM_ATTR_UNIQUE_ID | OTBM_ATTR_DEPOT_ID
+            | OTBM_ATTR_RUNE_CHARGES | OTBM_ATTR_CHARGES => { r.read_u16()?; }
+            OTBM_ATTR_TELE_DEST => { r.skip(5)?; } // x u16, y u16, z u8
+            OTBM_ATTR_DURATION | OTBM_ATTR_WRITTENDATE => { r.read_u32()?; }
+            OTBM_ATTR_DECAYING_STATE => { r.read_u8()?; }
+            OTBM_ATTR_TEXT | OTBM_ATTR_DESC | OTBM_ATTR_WRITTENBY => { r.read_string()?; }
+            _ => break, // unknown attr: stop (leftover bytes ignored, as before)
+        }
+    }
     let mut contents = Vec::with_capacity(node.children.len());
     for child in &node.children {
         if child.kind != OTBM_ITEM {
@@ -241,7 +270,7 @@ fn parse_item(node: &Node) -> Result<MapItem, FormatError> {
         }
         contents.push(parse_item(child)?);
     }
-    Ok(MapItem { id, contents })
+    Ok(MapItem { id, count, contents })
 }
 
 /// Parse the TOWNS node.
@@ -408,8 +437,8 @@ mod tests {
         assert_eq!(tile.flags, 1);
         assert_eq!(tile.house_id, None);
         assert_eq!(tile.items.len(), 2);
-        assert_eq!(tile.items[0], MapItem { id: 4526, contents: vec![] });
-        assert_eq!(tile.items[1], MapItem { id: 1234, contents: vec![] });
+        assert_eq!(tile.items[0], MapItem { id: 4526, count: None, contents: vec![] });
+        assert_eq!(tile.items[1], MapItem { id: 1234, count: None, contents: vec![] });
     }
 
     #[test]

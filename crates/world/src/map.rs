@@ -331,7 +331,7 @@ mod tests {
                 z: 7,
                 flags: 0,
                 house_id: None,
-                items: vec![MapItem { id: 100, contents: vec![] }],
+                items: vec![MapItem { id: 100, count: None, contents: vec![] }],
             }],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
             waypoints: vec![],
@@ -389,10 +389,10 @@ mod tests {
             tiles: vec![
                 // plain ground -> walkable
                 MapTile { x: 95, y: 117, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
                 // ground + block-solid wall -> not walkable
                 MapTile { x: 96, y: 117, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 200, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 200, count: None, contents: vec![] }] },
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
             waypoints: vec![],
@@ -423,10 +423,10 @@ mod tests {
             tiles: vec![MapTile {
                 x: 95, y: 117, z: 7, flags: 0, house_id: None,
                 items: vec![
-                    MapItem { id: 100, contents: vec![] },
-                    MapItem { id: 200, contents: vec![] },
-                    MapItem { id: 201, contents: vec![] },
-                    MapItem { id: 300, contents: vec![] },
+                    MapItem { id: 100, count: None, contents: vec![] },
+                    MapItem { id: 200, count: None, contents: vec![] },
+                    MapItem { id: 201, count: None, contents: vec![] },
+                    MapItem { id: 300, count: None, contents: vec![] },
                 ],
             }],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
@@ -447,14 +447,14 @@ mod tests {
             group: 1, flags: 0, server_id: 1, client_id: 5000, always_on_top: false, top_order: 0,
             has_height: false, floor_change: formats::items_xml::FloorChange::NONE,
         }];
-        let mut tile_items = vec![MapItem { id: 1, contents: vec![] }];
+        let mut tile_items = vec![MapItem { id: 1, count: None, contents: vec![] }];
         for sid in 2..=12u16 {
             item_defs.push(ItemType {
                 group: 5, flags: 0, server_id: sid, client_id: 6000 + sid,
                 always_on_top: false, top_order: 0,
                 has_height: false, floor_change: formats::items_xml::FloorChange::NONE,
             });
-            tile_items.push(MapItem { id: sid, contents: vec![] });
+            tile_items.push(MapItem { id: sid, count: None, contents: vec![] });
         }
         let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_defs };
         let map = OtbmMap {
@@ -480,14 +480,14 @@ mod tests {
             group: 1, flags: 0, server_id: 1, client_id: 5000, always_on_top: false, top_order: 0,
             has_height: false, floor_change: formats::items_xml::FloorChange::NONE,
         }];
-        let mut tile_items = vec![MapItem { id: 1, contents: vec![] }];
+        let mut tile_items = vec![MapItem { id: 1, count: None, contents: vec![] }];
         for sid in 2..=12u16 {
             item_defs.push(ItemType {
                 group: 5, flags: 1 << 13, server_id: sid, client_id: 6000 + sid,
                 always_on_top: true, top_order: 0,
                 has_height: false, floor_change: formats::items_xml::FloorChange::NONE,
             });
-            tile_items.push(MapItem { id: sid, contents: vec![] });
+            tile_items.push(MapItem { id: sid, count: None, contents: vec![] });
         }
         let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_defs };
         let map = OtbmMap {
@@ -519,10 +519,10 @@ mod tests {
             tiles: vec![
                 // PZ tile: flags = 1 (OTBM_TILEFLAG_PROTECTIONZONE)
                 MapTile { x: 100, y: 100, z: 7, flags: 1, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
                 // Non-PZ tile: flags = 0
                 MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
             waypoints: vec![],
@@ -558,9 +558,9 @@ mod tests {
             description: String::new(), spawn_file: None, house_file: None,
             tiles: vec![
                 MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 300, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 300, count: None, contents: vec![] }] },
                 MapTile { x: 100, y: 100, z: 8, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, contents: vec![] }] },
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
             waypoints: vec![],
@@ -586,7 +586,7 @@ mod tests {
             ],
         };
         let tile = |x, ids: Vec<u16>| MapTile { x, y: 100, z: 7, flags: 0, house_id: None,
-            items: ids.into_iter().map(|id| MapItem { id, contents: vec![] }).collect() };
+            items: ids.into_iter().map(|id| MapItem { id, count: None, contents: vec![] }).collect() };
         let map = OtbmMap {
             width: 200, height: 200, major_items: 3, minor_items: 57,
             description: String::new(), spawn_file: None, house_file: None,
