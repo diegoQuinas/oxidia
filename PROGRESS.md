@@ -8,8 +8,8 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M6 ✅ **chat complete and accepted live** (say/whisper/yell; off-screen yell is chat-only — correct, the speech bubble only renders when the speaker is on your screen). **M6.1 (stairs / floor changes) is code-complete (live acceptance pending)** — merged from branch `m6.1-stairs`. Next is **M7 (combat core + PvP melee)**, the pre-alpha #1 gate. M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) and auto-walk remain deferred.
-- **Build:** `cargo build` clean, `cargo test` green (129 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
+- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) code-complete (live acceptance pending). **M7 (combat core + PvP melee) is code-complete, live acceptance pending** — branch `m7-combat`. M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) and auto-walk remain deferred.
+- **Build:** `cargo build` clean, `cargo test` green (196 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
 - **Accepted (M2):** `cargo run -p formats --example mapinfo` parses the real `items.otb` (v3.57, 26 282 items) and `forgotten.otbm` (2048×2048, 340 594 tiles, 429 031 items, 5 towns) — full tree walk, no unknown nodes/attrs.
@@ -35,7 +35,7 @@ performance-critical or stable stays native Rust.
 | M6 | Chat: say / whisper / yell + default channel | ✅ done |
 | M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ✅ code / live pending |
 | M6.2 | Ladders & holes (use-driven): minimal `useItem 0x82` handler, floor-change-up on use, down-holes; reuses the M6.1 vertical engine | ⬜ |
-| M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
+| M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ✅ code / live pending |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
 | **B** | **Items & Inventory** | |
 | M9 | Ground items, stacks, look-at | ⬜ |
@@ -159,6 +159,74 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m5-presence-design.md`, `docs/
 **Stackpos invariant (critical, found in final holistic review):** `0x6A`/`0x6C` are position+stackpos packets (no id-form for *add*), while `0x6D`/`0x6B` use the id-form. `StaticMap::creature_stackpos` is a *static* per-tile value, so two creatures on one tile would collide on add/remove → desync. Fix: keep **≤1 creature per tile** — `do_move` rejects a creature-occupied destination (collision) and `login` uses `free_spawn()` (nearest free tile when the temple is taken). Under that invariant the static stackpos is always correct. Co-occupancy has no path in M5 (logins serialize through the single actor; movement is blocked both ways; no teleport/summon).
 
 **Deferred (YAGNI):** quadtree/sectored-grid spectators; known-set eviction cap (1300); multi-floor spectator band (±2 underground) — **now done in M6.1**; `0x6A`/`0x6C` stackpos≥10 id-form; proactive socket close on backpressure kick.
+
+## M7 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-07-m7-combat-design.md`,
+`docs/superpowers/plans/2026-06-07-m7-combat.md`. Scope: **PvP melee, end
+to end** — `0xA1` attack target, 2 s auto-swing timer, TFS skill-based
+fist damage, health-bar (`0x8C`) + self-stats (`0xA0`) sync, death window
+(`0x28`), and temple respawn — with protection-zone attack rejection (`0xB4`).
+Architecture: a **single global combat tick** (`CombatTick` command on the
+existing actor mpsc) drives all in-progress fights, preserving the "one
+writer, no locks" model. Pure feeders (wt-data damage math, wt-proto
+combat packets) merged to main ahead of this spine.
+
+1. ✅ `world::map` — `OTBM_TILEFLAG_PROTECTIONZONE` precomputed into a
+   `HashSet` at load (mirrors `blocked`/`floor_change`); `is_protection_zone`
+   and `temple_for` added.
+2. ✅ `world::game` — `PlayerState` gains `health`, `max_health`,
+   `fist_skill`, `attacking: Option<u32>`, `last_attack_ms`; `Command` gains
+   `SetTarget` + `CombatTick`; `Game` gains a `StdRng` (entropy-seeded;
+   seedable in tests). `do_set_target` enforces PZ rejection (push `0xB4`)
+   and self-attack guard. `on_combat_tick` iterates fights, checks
+   Chebyshev ≤ 1 same-floor range + `MELEE_ATTACK_INTERVAL_MS` (2000 ms),
+   rolls `combat::fist_damage`, calls `apply_damage`. `apply_damage` pushes
+   `0x8C` to spectators + `0xA0` to the victim and fires `do_death` on 0 HP.
+   `do_death` pushes `0x28`, clears all fights targeting the victim,
+   teleports the victim to the temple (remove+add pair — preserves M5
+   ≤1-creature-per-tile stackpos invariant), restores HP, and sends a fresh
+   map + `0xA0` to the respawned player. The combat tick task is started
+   in `spawn`.
+3. ✅ `server::game_service` — `reader_loop` intercepts `0xA1` (`parse_attack`
+   → `world.set_target`) and drains `0xA2` (follow, ignored) before the
+   walk/turn `opcode_action` dispatch.
+
+Gate: `cargo test` **196 green** (whole workspace), `cargo clippy --all-targets
+-- -D warnings` clean, `#![forbid(unsafe_code)]` intact.
+
+**Protocol gotchas (M7):**
+- **`0xA1` and `0xA2` are inbound AND outbound opcodes** — `0xA1` inbound =
+  attack; `0xA2` inbound = follow; outbound `0xA1` = skills, `0xA2` = icons.
+  No conflict — namespaced by direction, exactly as `0x6B`/`0x6D` in M4.
+- **`0xB4` text message layout** (`sendTextMessage`, protocolgame.cpp:1411):
+  `[0xB4][u8 type][u16-str text]`. For PZ rejection: `type = 21`
+  (`MESSAGE_STATUS_SMALL`, const.h:190), no extra fields before the string
+  (the switch has no case for this type — it falls through to `addString`).
+- **`0x8C` goes to all spectators including the victim AND attacker** (they
+  are both spectators of the victim's tile at melee range). `0xA0` goes only
+  to the victim.
+- **`last_attack_ms = 0` priming**: a newly set target fires on the first
+  eligible tick whose `now_ms >= MELEE_ATTACK_INTERVAL_MS` (not the very
+  first tick, since the tick task consumes the immediate `tick().await`).
+  This mirrors TFS `player.cpp:3225-3226`.
+- **Death respawn is a remove+add pair** (not a move): the death tile and the
+  temple are almost always out of each other's viewport, so `0x6D` would
+  deref a wrong stackpos on the spectators of the old tile. The remove at
+  the death tile + add at the temple is the same atomic pair as logout/login.
+- **No corpse in M7** — no second tile occupant, so the M5 ≤1-creature-per-tile
+  invariant is untouched. Corpses land in M13 with the M9 ground-item stackpos.
+
+**Deferred:** corpses/loot (M13); XP/skill/death-penalty (M14); mana/spells/
+conditions (M15); monsters (M12); equipped weapons / real `attackValue` (M10);
+fight modes / skulls / frags (M23); auto-walk follow; logout-in-fight block
+(TODO marker already in `reader_loop`); unfair-fight reduction (M23).
+
+**Live acceptance — PENDING (manual gate):** two OTClient Redemption sessions:
+A right-clicks B → B's HP bar drains on both screens; B's own HP digits drop;
+continued attacks kill B → B sees `0x28`, respawns at Thais temple with full
+HP; A sees B vanish + reappear; standing on a PZ tile, A cannot attack
+(status message). Flip M7 to ✅ once this passes.
 
 ## M6.1 plan
 
