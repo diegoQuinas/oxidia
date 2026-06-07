@@ -12,6 +12,7 @@
 pub mod adler;
 pub mod challenge;
 pub mod chat;
+pub mod combat_packets;
 pub mod charlist;
 pub mod creature;
 pub mod enter_world;
