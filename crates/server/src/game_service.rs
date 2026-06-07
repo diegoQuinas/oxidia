@@ -148,11 +148,30 @@ where
 
     // 7. Split: spawned writer task drains the push channel; reader loop stays here.
     let (mut rd, wr) = tokio::io::split(stream);
-    let writer = tokio::spawn(writer_loop(wr, keys, push_rx)); // keys: RoundKeys is Copy
+    let mut writer = tokio::spawn(writer_loop(wr, keys, push_rx)); // keys: RoundKeys is Copy
 
-    let read_result = reader_loop(&mut rd, &keys, world, snapshot.id).await;
-    world.logout(snapshot.id).await; // actor drops push_tx → writer's recv() ends
-    let _ = writer.await;
+    // Reader and writer are independent tasks; whichever ends first tears the
+    // session down. A client EOF ends the reader; a write error (broken pipe,
+    // half-open socket) ends the writer. Selecting on both prevents a dead
+    // writer from leaving the reader blocked on read_frame forever. Cancelling
+    // reader_loop mid-read is safe here: we never resume the stream afterwards,
+    // we tear the session down — so the read_frame cancel-safety hazard (which
+    // only matters when you keep reading) does not apply.
+    let read_result = tokio::select! {
+        res = reader_loop(&mut rd, &keys, world, snapshot.id) => {
+            writer.abort();
+            res
+        }
+        joined = &mut writer => {
+            if let Err(e) = joined {
+                if !e.is_cancelled() {
+                    tracing::warn!(error = ?e, "writer task ended abnormally");
+                }
+            }
+            Ok(())
+        }
+    };
+    world.logout(snapshot.id).await;
     read_result
 }
 
@@ -232,10 +251,16 @@ async fn writer_loop<W>(
                 while let Ok(more) = push_rx.try_recv() {
                     batch.extend_from_slice(&more);
                 }
-                if send_encrypted(&mut wr, &keys, &batch).await.is_err() { break; }
+                if let Err(e) = send_encrypted(&mut wr, &keys, &batch).await {
+                    tracing::debug!(error = ?e, "writer send failed; ending session");
+                    break;
+                }
             }
             _ = ping.tick() => {
-                if send_encrypted(&mut wr, &keys, &[PING_OPCODE]).await.is_err() { break; }
+                if let Err(e) = send_encrypted(&mut wr, &keys, &[PING_OPCODE]).await {
+                    tracing::debug!(error = ?e, "writer ping failed; ending session");
+                    break;
+                }
             }
         }
     }
