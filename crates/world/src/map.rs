@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use formats::items_xml::FloorChange;
+use formats::items_xml::{FloorChange, ItemsXml};
 use formats::otb::ItemsOtb;
 use formats::otbm::OtbmMap;
 use protocol::map_description::{TileSlices, TileSource, WireItem};
@@ -19,23 +19,42 @@ const FLAG_BLOCK_SOLID: u32 = 1 << 0;
 /// Maximum things (items + creature) the client renders per tile.
 const MAX_TILE_THINGS: usize = 10;
 
+/// Look-at metadata for one item type, combining `items.xml` text with the
+/// `items.otb` flags. Keyed by server id in `StaticMap::item_meta`.
+#[derive(Debug, Clone, Default)]
+pub struct ItemMeta {
+    pub name: String,
+    pub article: String,
+    pub plural: String,
+    pub description: String,
+    /// Weight in hundredths of an oz.
+    pub weight: u32,
+    pub show_count: bool,
+    pub stackable: bool,
+    pub pickupable: bool,
+}
+
 /// Wire-ordered items for one tile, split around the creature slot.
 struct TileStack {
     /// `[ground, ...top items (by top_order), ...down items]`, capped at 10.
     items: Vec<WireItem>,
+    /// Server ids parallel to `items` (same order/length) for look-at metadata.
+    server_ids: Vec<u16>,
+    /// OTBM stack counts parallel to `items` (None when unspecified). Drives the
+    /// look-at text ("You see 50 gold coins.") for stackable items.
+    counts: Vec<Option<u8>>,
     /// `items[..pre_creature_len]` render below a creature (ground + top items).
     pre_creature_len: usize,
 }
 
-/// Resolve an `items.otb` entry into its wire form, mirroring TFS
-/// `NetworkMessage::addItem`: stackable items carry a count byte, splash/fluid a
-/// fluid-type byte, animated items a phase byte. Static map items have no OTBM
-/// subtype parsed yet, so count/fluid default to 1/0 (byte-correct on the wire).
-fn wire_item(it: &formats::otb::ItemType) -> WireItem {
+/// Resolve an `items.otb` entry + its OTBM stack count into the wire form,
+/// mirroring TFS `NetworkMessage::addItem`: stackable items carry a count byte,
+/// splash/fluid a fluid-type byte, animated items a phase byte.
+fn wire_item(it: &formats::otb::ItemType, count: Option<u8>) -> WireItem {
     let subtype = if it.is_stackable() {
-        Some(1)
+        Some(count.unwrap_or(1).max(1)) // map stacks default to 1 when unspecified
     } else if it.is_fluid_or_splash() {
-        Some(0)
+        Some(count.unwrap_or(0))
     } else {
         None
     };
@@ -58,6 +77,8 @@ pub struct StaticMap {
     /// at load, mirroring the `blocked` and `floor_change` precompute pattern.
     protection_zone: HashSet<(u16, u16, u8)>,
     spawn: Position,
+    /// Look-at metadata by server id; empty until `load_item_metadata` runs.
+    item_meta: HashMap<u16, ItemMeta>,
 }
 
 impl StaticMap {
@@ -89,30 +110,36 @@ impl StaticMap {
         let mut tile_height = HashMap::new();
         let mut protection_zone = HashSet::new();
         for tile in &map.tiles {
-            let mut ground: Option<WireItem> = None;
-            let mut top: Vec<(u8, WireItem)> = Vec::new(); // (top_order, item)
-            let mut down: Vec<WireItem> = Vec::new();
+            let mut ground: Option<(WireItem, u16, Option<u8>)> = None;
+            let mut top: Vec<(u8, WireItem, u16, Option<u8>)> = Vec::new(); // (top_order, item, sid, count)
+            let mut down: Vec<(WireItem, u16, Option<u8>)> = Vec::new();
             for (i, mi) in tile.items.iter().enumerate() {
                 let Some(it) = by_id.get(&mi.id) else { continue };
-                let wi = wire_item(it);
+                let wi = wire_item(it, mi.count);
                 if i == 0 {
-                    ground = Some(wi);
+                    ground = Some((wi, mi.id, mi.count));
                 } else if it.always_on_top {
-                    top.push((it.top_order, wi));
+                    top.push((it.top_order, wi, mi.id, mi.count));
                 } else {
-                    down.push(wi);
+                    down.push((wi, mi.id, mi.count));
                 }
             }
 
-            if let Some(ground_item) = ground {
-                top.sort_by_key(|(order, _)| *order); // stable: file order on ties
-                let mut stack: Vec<WireItem> = Vec::with_capacity(1 + top.len() + down.len());
-                stack.push(ground_item);
-                stack.extend(top.iter().map(|(_, wi)| *wi));
-                let pre_creature_len = stack.len().min(MAX_TILE_THINGS);
-                stack.extend(down);
-                stack.truncate(MAX_TILE_THINGS);
-                tiles.insert((tile.x, tile.y, tile.z), TileStack { items: stack, pre_creature_len });
+            if let Some((ground_item, ground_sid, ground_count)) = ground {
+                top.sort_by_key(|(order, _, _, _)| *order); // stable: file order on ties
+                let mut items: Vec<WireItem> = Vec::with_capacity(1 + top.len() + down.len());
+                let mut server_ids: Vec<u16> = Vec::with_capacity(items.capacity());
+                let mut counts: Vec<Option<u8>> = Vec::with_capacity(items.capacity());
+                items.push(ground_item);
+                server_ids.push(ground_sid);
+                counts.push(ground_count);
+                for (_, wi, sid, c) in &top { items.push(*wi); server_ids.push(*sid); counts.push(*c); }
+                let pre_creature_len = items.len().min(MAX_TILE_THINGS);
+                for (wi, sid, c) in &down { items.push(*wi); server_ids.push(*sid); counts.push(*c); }
+                items.truncate(MAX_TILE_THINGS);
+                server_ids.truncate(MAX_TILE_THINGS);
+                counts.truncate(MAX_TILE_THINGS);
+                tiles.insert((tile.x, tile.y, tile.z), TileStack { items, server_ids, counts, pre_creature_len });
             }
 
             let solid = tile.items.iter().any(|mi| {
@@ -160,7 +187,46 @@ impl StaticMap {
             .map(|t| Position::new(t.x, t.y, t.z))
             .unwrap_or(FALLBACK_SPAWN);
 
-        Self { tiles, blocked, floor_change, tile_height, protection_zone, spawn }
+        Self { tiles, blocked, floor_change, tile_height, protection_zone, spawn, item_meta: HashMap::new() }
+    }
+
+    /// Populate the look-at metadata catalog from items.otb (flags) + items.xml
+    /// (name/description/weight). Call once at boot, after construction. Tests
+    /// that exercise look-at call this explicitly with a small fixture.
+    pub fn load_item_metadata(&mut self, otb: &ItemsOtb, xml: &ItemsXml) {
+        for it in &otb.items {
+            let x = xml.attrs(it.server_id);
+            self.item_meta.insert(it.server_id, ItemMeta {
+                name: x.map(|a| a.name.clone()).unwrap_or_default(),
+                article: x.map(|a| a.article.clone()).unwrap_or_default(),
+                plural: x.map(|a| a.plural.clone()).unwrap_or_default(),
+                description: x.map(|a| a.description.clone()).unwrap_or_default(),
+                weight: x.map(|a| a.weight).unwrap_or(0),
+                show_count: x.map(|a| a.show_count).unwrap_or(true),
+                stackable: it.is_stackable(),
+                pickupable: it.is_pickupable(),
+            });
+        }
+    }
+
+    /// Look-at metadata for `server_id`, or `None` if not catalogued.
+    pub fn item_meta(&self, server_id: u16) -> Option<&ItemMeta> {
+        self.item_meta.get(&server_id)
+    }
+
+    /// How many of a tile's items render below a creature (ground + top items).
+    pub fn tile_pre_creature_len(&self, pos: Position) -> usize {
+        self.tiles.get(&(pos.x, pos.y, pos.z)).map_or(0, |st| st.pre_creature_len)
+    }
+
+    /// The server id of the item at index `idx` in a tile's stack, or `None`.
+    pub fn tile_item_server_id(&self, pos: Position, idx: usize) -> Option<u16> {
+        self.tiles.get(&(pos.x, pos.y, pos.z)).and_then(|st| st.server_ids.get(idx).copied())
+    }
+
+    /// The OTBM stack count of the item at index `idx` (None if unspecified).
+    pub fn tile_item_count(&self, pos: Position, idx: usize) -> Option<u8> {
+        self.tiles.get(&(pos.x, pos.y, pos.z)).and_then(|st| st.counts.get(idx).copied().flatten())
     }
 
     pub fn spawn(&self) -> Position {
