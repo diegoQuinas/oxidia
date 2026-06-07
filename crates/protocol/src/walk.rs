@@ -69,8 +69,12 @@ pub fn creature_turn(id: u32, direction: u8) -> Vec<u8> {
 }
 
 /// `0x6C` remove, **creature-id form**: `[0x6C][0xFFFF][id u32]`. Used when a
-/// creature leaves the client's view at the overground->underground boundary.
-fn remove_creature_by_id(id: u32) -> Vec<u8> {
+/// creature leaves the client's view (viewport scroll, logout, or the
+/// overground->underground boundary). The `0xFFFF` makes the client locate the
+/// creature via `getCreatureById` rather than `(pos, stackpos)`, so it removes
+/// the right thing even when several creatures co-occupy the tile (stair/height
+/// landings) — a position+stackpos remove would be ambiguous there.
+pub fn remove_creature_by_id(id: u32) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u8(OP_REMOVE_TILE_THING);
     w.write_u16(0xFFFF);
@@ -183,6 +187,30 @@ pub fn walk_update<S: TileSource>(
     let (nx, ny) = (i32::from(new.0), i32::from(new.1));
     let (oz, nz) = (i32::from(old.2), i32::from(new.2));
 
+    // Stair/ladder jumps that change floor AND leap more than one tile
+    // horizontally cannot be represented by OTClient's incremental floor-change
+    // handling: `parseFloorChangeDown`/`Up` derive the new view-center from a
+    // fixed projection shift (`-1,-1` / `+1,+1`) plus the single ±1 correction
+    // slice — never from the packet. A sloped stair that lands +2 tiles away (the
+    // lower tile's NORTH/SOUTH_ALT redirect in `resolve_floor_change`) leaves the
+    // client's central position offset from the player, so every later step
+    // anchors its slices on the wrong center and the map tears (and eventually
+    // cleanTile detaches the player -> "unable to remove creature"). Send a
+    // teleport instead: a clean id-form remove + a full map description, which
+    // carries the landing position explicitly (`parseMapDescription` sets the
+    // central position from the 0x64 header). Mirrors TFS sendMoveCreature's
+    // `teleport` branch (protocolgame.cpp:2591-2593). `creatures` already carries
+    // the mover at `new`, so the full map re-adds it on its landing tile.
+    if nz != oz && ((nx - ox).abs() > 1 || (ny - oy).abs() > 1) {
+        let mut out = remove_creature_by_id(id);
+        out.extend(map_description::encode(
+            map_description::Center { x: new.0, y: new.1, z: new.2 },
+            src,
+            creatures,
+        ));
+        return out;
+    }
+
     // Header: id-form remove at the surface->underground boundary, else 0x6D move.
     let mut out = if oz == 7 && nz >= 8 {
         remove_creature_by_id(id)
@@ -215,6 +243,22 @@ pub fn walk_update<S: TileSource>(
         out.extend(map_description::encode_slice(
             SLICE_WEST, nx - VIEW_X, ny - VIEW_Y, nz, 1, SLICE_H, src, creatures,
         ));
+    }
+
+    // Slice geometry trace: the floor band (z-2..=z+2 underground) and which
+    // directional stripes were emitted. Correlate with the world-side "move ok"
+    // log to see if the wire slices match the intended step.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let (band_lo, band_hi) = if nz > 7 { (nz - 2, (nz + 2).min(15)) } else { (0, 7) };
+        tracing::debug!(
+            id, old = ?old, new = ?new,
+            floor_change = nz != oz, underground = nz > 7,
+            band_lo, band_hi,
+            slice_n = oy > ny, slice_s = oy < ny,
+            slice_e = ox < nx, slice_w = ox > nx,
+            pkt_len = out.len(),
+            "walk_update slices"
+        );
     }
     out
 }
@@ -306,6 +350,25 @@ mod tests {
         // the down correction slices (east 0x66 + south 0x67) are appended.
         assert!(out.contains(&SLICE_EAST));
         assert!(out.contains(&SLICE_SOUTH));
+    }
+
+    #[test]
+    fn teleport_like_floor_jump_emits_full_map_with_mover() {
+        // A sloped stair/ladder that changes floor AND leaps >1 tile (here dy=2)
+        // can't be followed by the client's incremental floor-change handling, so
+        // it goes out as a teleport: id-form remove + a full 0x64 map centered on
+        // the landing, carrying the mover so it re-attaches to its tile.
+        let mut m = HashMap::new();
+        m.insert((100, 102, 8), WireItem::plain(4526)); // landing tile must exist
+        let stub = MapStub(m);
+        let mover = PlacedCreature { x: 100, y: 102, z: 8, bytes: vec![0x62, 0x00, 0x01, 0x00, 0x00, 0x10] };
+        let out = walk_update(0x1000_0000, (100, 100, 7), (100, 102, 8), &stub, std::slice::from_ref(&mover));
+        assert_eq!(out[0], OP_REMOVE_TILE_THING); // id-form remove header
+        assert_eq!(u16::from_le_bytes([out[1], out[2]]), 0xFFFF);
+        assert_eq!(u32::from_le_bytes([out[3], out[4], out[5], out[6]]), 0x1000_0000);
+        assert_eq!(out[7], map_description::OPCODE_MAP_DESCRIPTION); // full 0x64 map, not 0xBF
+        assert!(!out.contains(&OP_FLOOR_CHANGE_DOWN), "teleport replaces the incremental floor block");
+        assert!(out.windows(mover.bytes.len()).any(|w| w == mover.bytes), "mover re-added in teleport map");
     }
 
     #[test]
