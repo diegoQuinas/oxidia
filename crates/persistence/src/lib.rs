@@ -87,6 +87,9 @@ pub struct PlayerSave {
     pub look_addons: u8,
     /// Mount id (0 = no mount).
     pub look_mount: u16,
+    /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
+    /// Controls which outfit catalog is offered in the 0xC8 window.
+    pub sex: u8,
 }
 
 /// Handle to the account/player database.
@@ -190,7 +193,8 @@ impl Store {
                 look_legs  = ?,
                 look_feet  = ?,
                 look_addons = ?,
-                look_mount = ?
+                look_mount = ?,
+                sex        = ?
             WHERE name = ?
             "#,
         )
@@ -210,6 +214,7 @@ impl Store {
         .bind(i64::from(state.look_feet))
         .bind(i64::from(state.look_addons))
         .bind(i64::from(state.look_mount))
+        .bind(i64::from(state.sex))
         .bind(&state.name)
         .execute(&self.pool)
         .await
@@ -241,7 +246,8 @@ impl Store {
                    health, health_max, mana, mana_max,
                    direction,
                    look_type, look_head, look_body, look_legs, look_feet,
-                   look_addons, look_mount
+                   look_addons, look_mount,
+                   sex
             FROM players
             WHERE name = ?
             "#,
@@ -268,6 +274,7 @@ impl Store {
             look_feet: r.get::<i64, _>("look_feet") as u8,
             look_addons: r.get::<i64, _>("look_addons") as u8,
             look_mount: r.get::<i64, _>("look_mount") as u16,
+            sex: r.get::<i64, _>("sex") as u8,
         }))
     }
 
@@ -350,6 +357,7 @@ mod tests {
             look_feet: 40,
             look_addons: 1,
             look_mount: 0,
+            sex: 1, // male (default)
         }
     }
 
@@ -389,6 +397,17 @@ mod tests {
         assert_eq!(loaded.look_feet, save.look_feet);
         assert_eq!(loaded.look_addons, save.look_addons);
         assert_eq!(loaded.look_mount, save.look_mount);
+        assert_eq!(loaded.sex, save.sex);
+    }
+
+    #[tokio::test]
+    async fn sex_field_round_trips_female_value() {
+        // RED: sex=0 (female) must survive save→load unchanged.
+        let store = seeded().await;
+        let save = PlayerSave { sex: 0, ..default_save("Test Knight") };
+        store.save_player(&save).await.unwrap();
+        let loaded = store.load_player("Test Knight").await.unwrap().expect("should be Some");
+        assert_eq!(loaded.sex, 0, "sex=0 (female) must round-trip through the DB");
     }
 
     #[tokio::test]
@@ -415,6 +434,7 @@ mod tests {
             look_feet: 8,
             look_addons: 3,
             look_mount: 42,
+            sex: 1,
         };
         store.save_player(&second).await.unwrap();
 
