@@ -3915,4 +3915,294 @@ mod tests {
         g.do_look(looker, 150, 100, 7, 0);
         assert!(rx.try_recv().is_err(), "look outside viewport must push nothing");
     }
+
+    // -------------------------------------------------------------------------
+    // M10.1 do_move_thing tests
+    // -------------------------------------------------------------------------
+
+    /// FLAG_MOVEABLE = bit 6, FLAG_STACKABLE = bit 7, FLAG_PICKUPABLE = bit 5.
+    const FLAG_MOVEABLE_OTB: u32 = 1 << 6;
+
+    /// Build a map ready for move-thing tests:
+    ///
+    /// Items:
+    ///   server 100 / client 4526 — ground (group 1, no flags)
+    ///   server 200 / client 1987 — moveable stone (non-stackable)
+    ///   server 300 / client 2148 — moveable gold coin (stackable)
+    ///   server 400 / client 999  — non-moveable decoration (no FLAG_MOVEABLE)
+    ///
+    /// Tiles (all z=7):
+    ///   (100,100) — spawn / player start (ground only)
+    ///   (101,100) — ground + stone (sid 200, stackpos 1)
+    ///   (102,100) — ground + 10 gold coins (sid 300, count 10, stackpos 1)
+    ///   (103,100) — ground + non-moveable deco (sid 400, stackpos 1)
+    ///   (104,100) — empty (no tile — invalid dest)
+    ///   (105,100) — ground only (valid empty dest)
+    fn move_map() -> Arc<StaticMap> {
+        use formats::items_xml::{FloorChange, ItemsXml, parse_items_xml};
+        use formats::otb::{ItemType as OtbItemType, ItemsOtb};
+        use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
+
+        let otb = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                OtbItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
+                    always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                // stone: moveable, not stackable, not pickupable
+                OtbItemType { group: 5, flags: FLAG_MOVEABLE_OTB, server_id: 200, client_id: 1987,
+                    always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                // gold coin: moveable + stackable + pickupable
+                OtbItemType { group: 5, flags: FLAG_MOVEABLE_OTB | FLAG_STACKABLE_OTB | FLAG_PICKUPABLE_OTB,
+                    server_id: 300, client_id: 2148,
+                    always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                // decoration: NOT moveable (no FLAG_MOVEABLE)
+                OtbItemType { group: 5, flags: 0, server_id: 400, client_id: 999,
+                    always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            ],
+        };
+
+        let xml_str = r#"<items>
+          <item id="200" name="stone" article="a" plural="stones"><attribute key="weight" value="110"/></item>
+          <item id="300" name="gold coin" article="a" plural="gold coins"><attribute key="weight" value="10"/><attribute key="showcount" value="1"/></item>
+          <item id="400" name="decoration" article="a" plural="decorations"/>
+        </items>"#;
+        let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
+
+        let g = |x: u16| formats::otbm::MapTile { x, y: 100, z: 7, flags: 0, house_id: None,
+            items: vec![MapItem { id: 100, count: None, contents: vec![] }] };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                g(100), // spawn
+                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] },
+                                MapItem { id: 200, count: None, contents: vec![] }] }, // stone
+                MapTile { x: 102, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] },
+                                MapItem { id: 300, count: Some(10), contents: vec![] }] }, // 10 coins
+                MapTile { x: 103, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] },
+                                MapItem { id: 400, count: None, contents: vec![] }] }, // deco (non-moveable)
+                // (104,100) deliberately absent — no tile → invalid dest
+                g(105), // valid empty-item dest
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        let mut sm = StaticMap::from_formats(&map, &otb);
+        sm.load_item_metadata(&otb, &xml);
+        Arc::new(sm)
+    }
+
+    /// Helper: drain ALL pending packets from `rx` and return them.
+    fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(p) = rx.try_recv() { out.push(p); }
+        out
+    }
+
+    /// Helper: assert a packet list contains at least one packet whose first byte is `op`.
+    fn has_op(packets: &[Vec<u8>], op: u8) -> bool {
+        packets.iter().any(|p| p.first() == Some(&op))
+    }
+
+    #[test]
+    fn do_move_thing_from_eq_to_is_noop() {
+        // from == to must be an early return with no overlay change and no packet.
+        let mut g = Game::new(move_map());
+        // Player at (100,100,7) (spawn), source at (101,100,7) — adjacent.
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        let pos = Position::new(101, 100, 7);
+        drain(&mut rx); // discard any login-related packets
+        g.do_move_thing(player, pos, 1, pos, 1);
+        let pkts = drain(&mut rx);
+        assert!(pkts.is_empty(), "from==to must produce no packet");
+    }
+
+    #[test]
+    fn do_move_thing_non_moveable_is_rejected_with_status_push() {
+        // sid 400 has no FLAG_MOVEABLE → must be rejected.
+        // Player at (102,100,7), source deco at (103,100,7) — adjacent (dx=1).
+        // stackpos for the item: pre_creature_len for (103,100,7) = 1 (ground),
+        // no creatures on that tile → item is at stackpos 1.
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(102, 100, 7));
+        drain(&mut rx);
+
+        let from = Position::new(103, 100, 7);
+        let to   = Position::new(105, 100, 7); // valid dest, 2 tiles away (within range)
+        g.do_move_thing(player, from, 1, to, 1);
+
+        let pkts = drain(&mut rx);
+        // Must receive a status push (0xB4 MSG_STATUS_SMALL = 21).
+        assert!(has_op(&pkts, 0xB4), "non-moveable rejection must push 0xB4; got {:?}", pkts);
+        let status_pkt = pkts.iter().find(|p| p.first() == Some(&0xB4)).unwrap();
+        assert_eq!(status_pkt[1], MSG_STATUS_SMALL, "must be MSG_STATUS_SMALL (21)");
+
+        // The overlay for the from tile must be absent or unmodified (item still there).
+        let overlay_count = g.dynamic.get(&(103, 100, 7))
+            .map(|st| st.server_ids.iter().filter(|&&sid| sid == 400).count())
+            .unwrap_or(1); // static map still has the item
+        assert!(overlay_count >= 1, "non-moveable item must remain on source tile");
+    }
+
+    #[test]
+    fn do_move_thing_out_of_reach_is_rejected() {
+        // Player at (100,100,7), source at (103,100,7) — dx=3 > 1 → too far.
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx);
+
+        let from = Position::new(103, 100, 7);
+        let to   = Position::new(105, 100, 7);
+        g.do_move_thing(player, from, 1, to, 1);
+
+        let pkts = drain(&mut rx);
+        // Must get a status push (too far away).
+        assert!(has_op(&pkts, 0xB4), "out-of-reach rejection must push 0xB4; got {:?}", pkts);
+        // Source overlay for 103,100,7 must not exist (no mutation attempted).
+        assert!(
+            !g.dynamic.contains_key(&(103, 100, 7)),
+            "overlay must not be materialized for an out-of-reach source"
+        );
+    }
+
+    #[test]
+    fn do_move_thing_full_move_removes_item_from_source() {
+        // Move the stone (non-stackable) from (101,100,7) to (105,100,7).
+        // Player at (100,100,7) — adjacent to source (dx=1), not ON the source tile
+        // so creature stackpos does not interfere with the item's stackpos.
+        // pre_creature_len for (101,100,7) = 1 (ground), no creatures on that tile
+        // → stone is at item index 1 → wire stackpos 1.
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx);
+
+        let from = Position::new(101, 100, 7);
+        let to   = Position::new(102, 100, 7); // adjacent valid tile
+        g.do_move_thing(player, from, 1, to, 1);
+
+        // Source overlay: stone (sid 200) must no longer be present.
+        let src_st = g.dynamic.get(&(101, 100, 7))
+            .expect("source must have been materialized");
+        assert!(
+            !src_st.server_ids.contains(&200),
+            "stone must be gone from source overlay; sids: {:?}", src_st.server_ids
+        );
+
+        // Destination overlay: stone (sid 200) must be present.
+        let dst_st = g.dynamic.get(&(102, 100, 7))
+            .expect("destination must have been materialized");
+        assert!(
+            dst_st.server_ids.contains(&200),
+            "stone must appear on destination overlay; sids: {:?}", dst_st.server_ids
+        );
+
+        // Spectator / mover receives a 0x6A add-tile-item for the destination.
+        let pkts = drain(&mut rx);
+        assert!(
+            has_op(&pkts, 0x6A),
+            "player must receive 0x6A (add tile item) for destination; pkts: {:?}",
+            pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
+        // And a removal (0x6C) or update (0x6B) for the source.
+        assert!(
+            has_op(&pkts, 0x6C) || has_op(&pkts, 0x6B),
+            "player must receive 0x6C or 0x6B for source; pkts: {:?}",
+            pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn do_move_thing_stackable_split_source_keeps_remainder() {
+        // Move 3 of 10 gold coins from (102,100,7).
+        // Player at (101,100,7) — adjacent to source (dx=1), not ON it.
+        // pre_creature_len for (102,100,7) = 1 (ground), no creatures on it
+        // → coins at item index 1 → wire stackpos 1.
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(101, 100, 7));
+        drain(&mut rx);
+
+        let from = Position::new(102, 100, 7);
+        let to   = Position::new(103, 100, 7); // adjacent
+        g.do_move_thing(player, from, 1, to, 3);
+
+        // Source must have 7 coins left.
+        let src_st = g.dynamic.get(&(102, 100, 7))
+            .expect("source materialized");
+        let coin_idx = src_st.server_ids.iter().position(|&s| s == 300)
+            .expect("sid 300 still on source");
+        let remaining = src_st.counts[coin_idx].unwrap_or(0);
+        assert_eq!(remaining, 7, "source must retain 7 coins after moving 3; got {remaining}");
+
+        // Destination must have 3 coins.
+        let dst_st = g.dynamic.get(&(103, 100, 7))
+            .expect("destination materialized");
+        let dst_idx = dst_st.server_ids.iter().position(|&s| s == 300)
+            .expect("sid 300 on destination");
+        let moved = dst_st.counts[dst_idx].unwrap_or(0);
+        assert_eq!(moved, 3, "destination must have 3 coins; got {moved}");
+
+        // Partial split → source gets 0x6B (update, not 0x6C remove).
+        let pkts = drain(&mut rx);
+        assert!(
+            has_op(&pkts, 0x6B),
+            "partial split must produce 0x6B for source; pkts: {:?}",
+            pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn do_move_thing_stackable_clamps_to_available() {
+        // Attempt to move 20 of 10 coins — must clamp to 10 (no duplication).
+        // Player at (101,100,7), coins at (102,100,7).
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(101, 100, 7));
+        drain(&mut rx);
+
+        let from = Position::new(102, 100, 7);
+        let to   = Position::new(103, 100, 7);
+        g.do_move_thing(player, from, 1, to, 20); // request 20, only 10 available
+
+        // Source must be fully removed (clamped to 10 = all of them).
+        let src_st = g.dynamic.get(&(102, 100, 7))
+            .expect("source materialized");
+        assert!(
+            !src_st.server_ids.contains(&300),
+            "all coins moved → source must no longer have sid 300; sids: {:?}", src_st.server_ids
+        );
+
+        // Destination must have exactly 10.
+        let dst_st = g.dynamic.get(&(103, 100, 7))
+            .expect("destination materialized");
+        let dst_idx = dst_st.server_ids.iter().position(|&s| s == 300)
+            .expect("sid 300 on destination");
+        let moved = dst_st.counts[dst_idx].unwrap_or(0);
+        assert_eq!(moved, 10, "destination must have exactly 10 coins (clamped); got {moved}");
+
+        drain(&mut rx);
+    }
+
+    #[test]
+    fn do_move_thing_spectator_receives_tile_update() {
+        // A spectator near both tiles must receive the add-tile-item packet.
+        // Player at (100,100,7), stone at (101,100,7), spectator also at (100,100,7).
+        let mut g = Game::new(move_map());
+        let (player, mut rx_player) = add_player(&mut g, Position::new(100, 100, 7));
+        let (_spec, mut rx_spec) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx_player);
+        drain(&mut rx_spec);
+
+        let from = Position::new(101, 100, 7);
+        let to   = Position::new(102, 100, 7);
+        g.do_move_thing(player, from, 1, to, 1);
+
+        let spec_pkts = drain(&mut rx_spec);
+        assert!(
+            has_op(&spec_pkts, 0x6A) || has_op(&spec_pkts, 0x6B) || has_op(&spec_pkts, 0x6C),
+            "spectator must receive at least one tile-update packet; got {:?}",
+            spec_pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
+    }
 }

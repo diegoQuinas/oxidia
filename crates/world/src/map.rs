@@ -861,4 +861,113 @@ mod tests {
         assert!(!sm.triggers_up(Position::new(100, 100, 7)), "height 2 does not trigger");
         assert!(sm.triggers_up(Position::new(101, 100, 7)), "height 3 triggers");
     }
+
+    // -------------------------------------------------------------------------
+    // M10.1 can_throw_object_to tests
+    // -------------------------------------------------------------------------
+
+    /// Build a map for LOS / throw tests:
+    ///
+    /// z=7 tiles:
+    ///   (100,100,7) — plain ground
+    ///   (101,100,7) — ground + block-projectile wall
+    ///   (102,100,7) — plain ground
+    ///
+    /// z=6 tiles (closing the floor-below loophole):
+    ///   (100,100,6) — plain ground (makes floor-below check fail at from)
+    ///   (102,100,6) — plain ground (makes floor-below check fail at to)
+    ///
+    /// The TFS `isSightClear` fallback checks z-1 only when the direct line is
+    /// blocked AND both `from` and `to` are open on z-1. Adding ground on z-6
+    /// at both endpoints prevents the fallback from bypassing the wall.
+    fn throw_map() -> StaticMap {
+        // server 100 = ground, server 200 = block-projectile wall
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1,
+                    always_on_top: false, top_order: 0, has_height: false,
+                    floor_change: formats::items_xml::FloorChange::NONE },
+                // FLAG_BLOCK_PROJECTILE = bit 1
+                ItemType { group: 5, flags: 1 << 1, server_id: 200, client_id: 2,
+                    always_on_top: false, top_order: 0, has_height: false,
+                    floor_change: formats::items_xml::FloorChange::NONE },
+            ],
+        };
+        let ground = |x: u16, y: u16, z: u8| MapTile { x, y, z, flags: 0, house_id: None,
+            items: vec![MapItem { id: 100, count: None, contents: vec![] }] };
+        let wall = |x: u16, y: u16| MapTile { x, y, z: 7, flags: 0, house_id: None,
+            items: vec![
+                MapItem { id: 100, count: None, contents: vec![] },
+                MapItem { id: 200, count: None, contents: vec![] },
+            ] };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                ground(100, 100, 7),
+                wall(101, 100),          // block-projectile tile between (100,100) and (102,100)
+                ground(102, 100, 7),
+                // z=6 floors at both endpoints close the floor-below loophole:
+                // isSightClear falls back to z-1 only when BOTH endpoints are clear
+                // (no ground) on z-1; adding ground there makes is_tile_clear return
+                // false (block_floor=true) so the fallback also fails → throw blocked.
+                ground(100, 100, 6),
+                ground(102, 100, 6),
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        StaticMap::from_formats(&map, &items)
+    }
+
+    #[test]
+    fn can_throw_blocked_through_block_projectile_tile() {
+        // (100,100,7)→(102,100,7): wall at (101,100,7) blocks sight, and the
+        // floor-below fallback is closed by ground tiles on z=6 at both endpoints.
+        let sm = throw_map();
+        let from = Position::new(100, 100, 7);
+        let to   = Position::new(102, 100, 7);
+        assert!(
+            !sm.can_throw_object_to(from, to),
+            "throw must be blocked by block-projectile wall with closed floor-below loophole"
+        );
+    }
+
+    #[test]
+    fn can_throw_true_on_clear_adjacent_line() {
+        let sm = throw_map();
+        let from = Position::new(100, 100, 7);
+        let to   = Position::new(101, 100, 7); // the wall tile itself — adjacent
+        // Adjacency (ddx < 2, ddy < 2) is always clear per is_sight_clear fast-path.
+        assert!(
+            sm.can_throw_object_to(from, to),
+            "adjacent throw must be clear (fast-path ddx<2 && ddy<2)"
+        );
+    }
+
+    #[test]
+    fn adjacency_is_always_clear_regardless_of_block_projectile() {
+        let sm = throw_map();
+        // from == wall tile itself is never useful, but from neighbour to wall:
+        let from = Position::new(100, 100, 7);
+        let wall = Position::new(101, 100, 7); // block-projectile tile
+        // ddx=1, ddy=0 → adjacent → always clear even though the dest tile has the block
+        assert!(
+            sm.can_throw_object_to(from, wall),
+            "adjacent (ddx<2, ddy<2) must always be sight-clear"
+        );
+    }
+
+    #[test]
+    fn can_throw_false_when_dx_exceeds_range() {
+        let sm = throw_map();
+        // dx = 9 > RANGE_X=8 → out of range → false, regardless of sight
+        let from = Position::new(100, 100, 7);
+        let to   = Position::new(109, 100, 7); // dx = 9
+        assert!(
+            !sm.can_throw_object_to(from, to),
+            "dx > 8 must return false (out of throw range)"
+        );
+    }
 }

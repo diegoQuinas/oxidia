@@ -288,6 +288,47 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // M10.1 flag tests
+    // -------------------------------------------------------------------------
+
+    fn item_type_with_flags(flags: u32) -> ItemType {
+        ItemType {
+            group: 5,
+            flags,
+            server_id: 1,
+            client_id: 1,
+            always_on_top: false,
+            top_order: 0,
+            has_height: false,
+            floor_change: FloorChange::NONE,
+        }
+    }
+
+    #[test]
+    fn is_moveable_returns_true_when_flag_bit_set() {
+        // FLAG_MOVEABLE = bit 6
+        let it = item_type_with_flags(FLAG_MOVEABLE);
+        assert!(it.is_moveable(), "item with FLAG_MOVEABLE must report is_moveable()");
+        assert!(!it.is_block_projectile(), "FLAG_MOVEABLE must not set is_block_projectile()");
+    }
+
+    #[test]
+    fn is_block_projectile_returns_true_when_flag_bit_set() {
+        // FLAG_BLOCK_PROJECTILE = bit 1
+        let it = item_type_with_flags(FLAG_BLOCK_PROJECTILE);
+        assert!(it.is_block_projectile(), "item with FLAG_BLOCK_PROJECTILE must report is_block_projectile()");
+        assert!(!it.is_moveable(), "FLAG_BLOCK_PROJECTILE must not set is_moveable()");
+    }
+
+    #[test]
+    fn neither_flag_reports_both_false() {
+        // An item with no relevant flags must report both false.
+        let it = item_type_with_flags(0);
+        assert!(!it.is_moveable(), "no flags → is_moveable() is false");
+        assert!(!it.is_block_projectile(), "no flags → is_block_projectile() is false");
+    }
+
     #[test]
     fn extracts_has_height_flag() {
         let mut v = vec![0x00, 0x00, 0x00, 0x00];
