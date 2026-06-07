@@ -1299,6 +1299,9 @@ impl Game {
     /// channels yet, but console text is private to the session and scrollable,
     /// which is what `/help` needs. Iterates [`GmVerb::ALL`], so newly added
     /// commands appear automatically.
+    ///
+    /// TODO(future): real chat channels (0xB2/0xAB/0xAC handshake) for richer GM
+    /// output — see docs/superpowers/backlog.md.
     fn gm_help(&mut self, id: u32) {
         self.push_console_blue(id, "Gamemaster commands:");
         for &cmd in GmVerb::ALL {
@@ -1345,6 +1348,9 @@ impl Game {
     /// `/temple <id>` — teleport to the temple of the town with that id.
     /// (No per-character home town exists yet, so the no-arg form uses the
     /// server's spawn temple — see `StaticMap::temple_for`.)
+    ///
+    /// TODO(future): per-character home town so no-arg /temple targets the char's
+    /// own town — see docs/superpowers/backlog.md.
     fn gm_temple(&mut self, id: u32, args: &[&str]) {
         let temple = match args.first() {
             None => self.map.spawn(),
