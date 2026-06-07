@@ -1243,12 +1243,21 @@ impl Game {
         match verb {
             "item" => self.gm_item(id, &args),
             "goto" => self.gm_goto(id, &args),
-            // real subcommands are added in Task 5
+            "teleport" => self.gm_teleport(id, &args),
+            "teleportto" => self.gm_teleportto(id, &args),
+            "bring" => self.gm_bring(id, &args),
             other => self.push_status_message(
                 id,
                 format!("Unknown command: /{other}").as_bytes(),
             ),
         }
+    }
+
+    /// Find an online player's creature id by name (case-insensitive).
+    fn find_player_by_name(&self, name: &str) -> Option<u32> {
+        self.players.iter()
+            .find(|(_, p)| p.name.eq_ignore_ascii_case(name))
+            .map(|(&id, _)| id)
     }
 
     /// `/goto <x> <y> <z>` — teleport the GM to a position.
@@ -1274,6 +1283,58 @@ impl Game {
         let count = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
         let Some(pos) = self.players.get(&id).map(|p| p.position) else { return };
         self.do_spawn_item(id, pos, server_id, count);
+    }
+
+    /// `/teleport <name> <x> <y> <z>` — teleport another player to a position.
+    fn gm_teleport(&mut self, id: u32, args: &[&str]) {
+        let Some(name) = args.first() else {
+            self.push_status_message(id, b"Usage: /teleport <name> <x> <y> <z>");
+            return;
+        };
+        let Some(pos) = parse_pos(&args[1..]) else {
+            self.push_status_message(id, b"Usage: /teleport <name> <x> <y> <z>");
+            return;
+        };
+        let Some(target) = self.find_player_by_name(name) else {
+            self.push_status_message(id, format!("Player '{name}' not found.").as_bytes());
+            return;
+        };
+        if !self.map.has_ground(pos) {
+            self.push_status_message(id, b"There is no tile there.");
+            return;
+        }
+        self.do_teleport(target, pos);
+        self.push_status_message(id, format!("Teleported {} to {}, {}, {}.", name, pos.x, pos.y, pos.z).as_bytes());
+    }
+
+    /// `/teleportto <name>` — teleport the GM to another player's tile.
+    fn gm_teleportto(&mut self, id: u32, args: &[&str]) {
+        let Some(name) = args.first() else {
+            self.push_status_message(id, b"Usage: /teleportto <name>");
+            return;
+        };
+        let Some(target) = self.find_player_by_name(name) else {
+            self.push_status_message(id, format!("Player '{name}' not found.").as_bytes());
+            return;
+        };
+        let Some(pos) = self.players.get(&target).map(|p| p.position) else { return };
+        self.do_teleport(id, pos);
+        self.push_status_message(id, format!("Teleported to {name}.").as_bytes());
+    }
+
+    /// `/bring <name>` — teleport another player to the GM's tile.
+    fn gm_bring(&mut self, id: u32, args: &[&str]) {
+        let Some(name) = args.first() else {
+            self.push_status_message(id, b"Usage: /bring <name>");
+            return;
+        };
+        let Some(target) = self.find_player_by_name(name) else {
+            self.push_status_message(id, format!("Player '{name}' not found.").as_bytes());
+            return;
+        };
+        let Some(pos) = self.players.get(&id).map(|p| p.position) else { return };
+        self.do_teleport(target, pos);
+        self.push_status_message(id, format!("Brought {name} to you.").as_bytes());
     }
 
     /// Place a fresh item on `pos` and broadcast a `0x6A` add to spectators.
