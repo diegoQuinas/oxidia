@@ -19,6 +19,59 @@ const FLAG_BLOCK_SOLID: u32 = 1 << 0;
 /// Maximum things (items + creature) the client renders per tile.
 const MAX_TILE_THINGS: usize = 10;
 
+/// Which equipment slot(s) an item may occupy, derived from items.xml
+/// slotType/weaponType. Slot numbers are TFS `CONST_SLOT_*` (head=1 … ammo=10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EquipSlot {
+    Head,     // 1
+    Necklace, // 2
+    Backpack, // 3
+    Armor,    // 4  (slotType "body")
+    Hand,     // 5 (right) or 6 (left): weapons, shields, two-handed
+    Legs,     // 7
+    Feet,     // 8
+    Ring,     // 9
+    Ammo,     // 10
+}
+
+impl EquipSlot {
+    /// Map an items.xml `slotType` / `weaponType` pair to an equip slot.
+    /// `None` → the item is not equippable.
+    pub fn from_xml(slot_type: &str, weapon_type: &str) -> Option<Self> {
+        match slot_type {
+            "head" => Some(Self::Head),
+            "necklace" => Some(Self::Necklace),
+            "backpack" => Some(Self::Backpack),
+            "body" => Some(Self::Armor),
+            "legs" => Some(Self::Legs),
+            "feet" => Some(Self::Feet),
+            "ring" => Some(Self::Ring),
+            "ammo" => Some(Self::Ammo),
+            "two-handed" => Some(Self::Hand),
+            _ => match weapon_type {
+                "sword" | "axe" | "club" | "distance" | "wand" | "shield" => Some(Self::Hand),
+                "ammunition" => Some(Self::Ammo),
+                _ => None,
+            },
+        }
+    }
+
+    /// True if this item may be placed in the given 1-based inventory slot.
+    pub fn admits(self, slot: u8) -> bool {
+        match self {
+            Self::Head => slot == 1,
+            Self::Necklace => slot == 2,
+            Self::Backpack => slot == 3,
+            Self::Armor => slot == 4,
+            Self::Hand => slot == 5 || slot == 6,
+            Self::Legs => slot == 7,
+            Self::Feet => slot == 8,
+            Self::Ring => slot == 9,
+            Self::Ammo => slot == 10,
+        }
+    }
+}
+
 /// Look-at metadata for one item type, combining `items.xml` text with the
 /// `items.otb` flags. Keyed by server id in `StaticMap::item_meta`.
 #[derive(Debug, Clone, Default)]
@@ -38,6 +91,8 @@ pub struct ItemMeta {
     pub animated: bool,
     /// Whether the item may be picked up / moved by a player.
     pub moveable: bool,
+    /// Which equipment slot this item admits, or `None` if not equippable.
+    pub equip_slot: Option<EquipSlot>,
 }
 
 /// Wire-ordered items for one tile, split around the creature slot.
@@ -223,6 +278,7 @@ impl StaticMap {
                 client_id: it.client_id,
                 animated: it.is_animated(),
                 moveable: it.is_moveable(),
+                equip_slot: x.and_then(|a| EquipSlot::from_xml(&a.slot_type, &a.weapon_type)),
             });
         }
     }
