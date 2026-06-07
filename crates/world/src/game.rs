@@ -707,7 +707,7 @@ impl Game {
             return;
         }
 
-        let pre = self.map.tile_pre_creature_len(pos);
+        let pre = self.merged_pre_creature_len(pos);
         let creatures = self.creatures_on(pos);
 
         let sp = stackpos as usize;
@@ -793,6 +793,22 @@ impl Game {
             return st.server_ids.get(idx).copied();
         }
         self.map.tile_item_server_id(pos, idx)
+    }
+
+    /// Stack count at overlay/static stack index `idx` on `pos` (overlay wins).
+    fn merged_count(&self, pos: Position, idx: usize) -> Option<u8> {
+        if let Some(st) = self.dynamic.get(&(pos.x, pos.y, pos.z)) {
+            return st.counts.get(idx).copied().flatten();
+        }
+        self.map.tile_item_count(pos, idx)
+    }
+
+    /// Items below a creature on `pos`, overlay-aware (overlay wins over static).
+    fn merged_pre_creature_len(&self, pos: Position) -> usize {
+        self.dynamic
+            .get(&(pos.x, pos.y, pos.z))
+            .map(|st| st.pre_creature_len)
+            .unwrap_or_else(|| self.map.tile_pre_creature_len(pos))
     }
 
     /// COW the source tile and remove (or split) `want` units of the item at stack
@@ -1097,9 +1113,9 @@ impl Game {
         looker_pos: Position,
         gm: bool,
     ) -> Option<String> {
-        let sid = self.map.tile_item_server_id(pos, idx)?;
+        let sid = self.merged_server_id(pos, idx)?;
         let meta = self.map.item_meta(sid)?;
-        let count = u32::from(self.map.tile_item_count(pos, idx).unwrap_or(1).max(1));
+        let count = u32::from(self.merged_count(pos, idx).unwrap_or(1).max(1));
 
         let mut dist = (i32::from(looker_pos.x) - i32::from(pos.x))
             .abs()
@@ -1242,16 +1258,30 @@ impl Game {
         let tokens = tokenize_args(line);
         let Some((verb, rest)) = tokens.split_first() else { return };
         let args: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
-        match verb.as_str() {
-            "item" => self.gm_item(id, &args),
-            "goto" => self.gm_goto(id, &args),
-            "teleport" => self.gm_teleport(id, &args),
-            "teleportto" => self.gm_teleportto(id, &args),
-            "bring" => self.gm_bring(id, &args),
-            other => self.push_status_message(
-                id,
-                format!("Unknown command: /{other}").as_bytes(),
-            ),
+        let Some(cmd) = GmVerb::from_word(verb) else {
+            self.push_status_message(id, format!("Unknown command: /{verb}. Type /help.").as_bytes());
+            return;
+        };
+        match cmd {
+            GmVerb::Help => self.gm_help(id),
+            GmVerb::Item => self.gm_item(id, &args),
+            GmVerb::Goto => self.gm_goto(id, &args),
+            GmVerb::Temple => self.gm_temple(id, &args),
+            GmVerb::Teleport => self.gm_teleport(id, &args),
+            GmVerb::TeleportTo => self.gm_teleportto(id, &args),
+            GmVerb::Bring => self.gm_bring(id, &args),
+        }
+    }
+
+    /// `/help` — list every gamemaster command with a short description. Sent as
+    /// `0xB4` console messages to the requester only: this server has no chat
+    /// channels yet, but console text is private to the session and scrollable,
+    /// which is what `/help` needs. Iterates [`GmVerb::ALL`], so newly added
+    /// commands appear automatically.
+    fn gm_help(&mut self, id: u32) {
+        self.push_info_descr(id, "Gamemaster commands:");
+        for &cmd in GmVerb::ALL {
+            self.push_info_descr(id, &format!("{} — {}", cmd.usage(), cmd.description()));
         }
     }
 
@@ -1262,18 +1292,60 @@ impl Game {
             .map(|(&id, _)| id)
     }
 
-    /// `/goto <x> <y> <z>` — teleport the GM to a position.
+    /// `/goto <x> <y> <z>` — teleport the GM to coordinates.
+    /// `/goto <player>` — teleport the GM to that online player's tile.
     fn gm_goto(&mut self, id: u32, args: &[&str]) {
-        let Some(pos) = parse_pos(args) else {
-            self.push_status_message(id, b"Usage: /goto <x> <y> <z>");
-            return;
-        };
-        if !self.map.has_ground(pos) {
-            self.push_status_message(id, b"There is no tile there.");
+        // Coordinate form: three numeric args.
+        if let Some(pos) = parse_pos(args) {
+            if !self.map.has_ground(pos) {
+                self.push_status_message(id, b"There is no tile there.");
+                return;
+            }
+            self.do_teleport(id, pos);
+            self.push_status_message(id, format!("Teleported to {}, {}, {}.", pos.x, pos.y, pos.z).as_bytes());
             return;
         }
-        self.do_teleport(id, pos);
-        self.push_status_message(id, format!("Teleported to {}, {}, {}.", pos.x, pos.y, pos.z).as_bytes());
+        // Player form: a single name argument (quote multi-word names).
+        if let [name] = args {
+            let Some(target) = self.find_player_by_name(name) else {
+                self.push_status_message(id, format!("Player '{name}' not found.").as_bytes());
+                return;
+            };
+            let Some(pos) = self.players.get(&target).map(|p| p.position) else { return };
+            self.do_teleport(id, pos);
+            self.push_status_message(id, format!("Teleported to {name}.").as_bytes());
+            return;
+        }
+        self.push_status_message(id, b"Usage: /goto <x> <y> <z> | /goto \"player\"");
+    }
+
+    /// `/temple` — teleport to the default (spawn) town temple.
+    /// `/temple <name>` — teleport to the named town's temple.
+    /// `/temple <id>` — teleport to the temple of the town with that id.
+    /// (No per-character home town exists yet, so the no-arg form uses the
+    /// server's spawn temple — see `StaticMap::temple_for`.)
+    fn gm_temple(&mut self, id: u32, args: &[&str]) {
+        let temple = match args.first() {
+            None => self.map.spawn(),
+            Some(arg) => match arg.parse::<u32>() {
+                Ok(town_id) => match self.map.town_temple_by_id(town_id) {
+                    Some(p) => p,
+                    None => {
+                        self.push_status_message(id, format!("No town with id {town_id}.").as_bytes());
+                        return;
+                    }
+                },
+                Err(_) => match self.map.town_temple_by_name(arg) {
+                    Some(p) => p,
+                    None => {
+                        self.push_status_message(id, format!("No town named '{arg}'.").as_bytes());
+                        return;
+                    }
+                },
+            },
+        };
+        self.do_teleport(id, temple);
+        self.push_status_message(id, format!("Teleported to temple ({}, {}, {}).", temple.x, temple.y, temple.z).as_bytes());
     }
 
     /// `/item <id|"name"> [count]` — spawn an item on the GM's own tile. The first
@@ -1856,6 +1928,80 @@ impl Game {
             "walk_update pushed to mover"
         );
         self.push(id, pkt);
+    }
+}
+
+/// Every gamemaster command. This enum is the single source of truth: the
+/// exhaustive `usage`/`description` matches force any new variant to declare its
+/// help text (it won't compile otherwise), and the dispatch `match` in
+/// `do_gm_command` forces it to be wired. `/help` iterates [`GmVerb::ALL`], so it
+/// can never drift out of sync — the only manual step when adding a command is to
+/// list its variant in `ALL`.
+#[derive(Clone, Copy)]
+enum GmVerb {
+    Help,
+    Item,
+    Goto,
+    Temple,
+    Teleport,
+    TeleportTo,
+    Bring,
+}
+
+impl GmVerb {
+    /// All commands, in the order `/help` lists them.
+    const ALL: &'static [GmVerb] = &[
+        Self::Help,
+        Self::Item,
+        Self::Goto,
+        Self::Temple,
+        Self::Teleport,
+        Self::TeleportTo,
+        Self::Bring,
+    ];
+
+    /// Accepted command words (first is canonical; the rest are aliases).
+    fn words(self) -> &'static [&'static str] {
+        match self {
+            Self::Help => &["help"],
+            Self::Item => &["item", "i"],
+            Self::Goto => &["goto"],
+            Self::Temple => &["temple"],
+            Self::Teleport => &["teleport"],
+            Self::TeleportTo => &["teleportto"],
+            Self::Bring => &["bring"],
+        }
+    }
+
+    /// One-line usage syntax shown by `/help`.
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Help => "/help",
+            Self::Item => "/item <id|\"name\"> [count]",
+            Self::Goto => "/goto <x> <y> <z> | /goto \"player\"",
+            Self::Temple => "/temple [\"name\"|id]",
+            Self::Teleport => "/teleport \"player\" <x> <y> <z>",
+            Self::TeleportTo => "/teleportto \"player\"",
+            Self::Bring => "/bring \"player\"",
+        }
+    }
+
+    /// Short description shown by `/help`.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Help => "List all gamemaster commands.",
+            Self::Item => "Spawn an item on your tile, by id or name.",
+            Self::Goto => "Teleport yourself to coordinates or to a player.",
+            Self::Temple => "Teleport to a town temple (default, by name, or by id).",
+            Self::Teleport => "Teleport another player to coordinates.",
+            Self::TeleportTo => "Teleport yourself next to another player.",
+            Self::Bring => "Teleport another player to you.",
+        }
+    }
+
+    /// Resolve a command word (verb or alias) to its variant.
+    fn from_word(word: &str) -> Option<GmVerb> {
+        GmVerb::ALL.iter().copied().find(|v| v.words().contains(&word))
     }
 }
 

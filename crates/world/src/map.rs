@@ -142,6 +142,8 @@ pub struct StaticMap {
     /// at load, mirroring the `blocked` and `floor_change` precompute pattern.
     protection_zone: HashSet<(u16, u16, u8)>,
     spawn: Position,
+    /// Towns and their temple positions, retained for GM `/temple` lookups.
+    towns: Vec<formats::otbm::Town>,
     /// Look-at metadata by server id; empty until `load_item_metadata` runs.
     item_meta: HashMap<u16, ItemMeta>,
 }
@@ -257,7 +259,7 @@ impl StaticMap {
             .map(|t| Position::new(t.x, t.y, t.z))
             .unwrap_or(FALLBACK_SPAWN);
 
-        Self { tiles, blocked, block_projectile, floor_change, tile_height, protection_zone, spawn, item_meta: HashMap::new() }
+        Self { tiles, blocked, block_projectile, floor_change, tile_height, protection_zone, spawn, towns: map.towns.clone(), item_meta: HashMap::new() }
     }
 
     /// Populate the look-at metadata catalog from items.otb (flags) + items.xml
@@ -286,6 +288,20 @@ impl StaticMap {
     /// Look-at metadata for `server_id`, or `None` if not catalogued.
     pub fn item_meta(&self, server_id: u16) -> Option<&ItemMeta> {
         self.item_meta.get(&server_id)
+    }
+
+    /// Temple position of the town with the given case-insensitive name, if any.
+    pub fn town_temple_by_name(&self, name: &str) -> Option<Position> {
+        self.towns.iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+            .map(|t| Position::new(t.x, t.y, t.z))
+    }
+
+    /// Temple position of the town with the given id, if any.
+    pub fn town_temple_by_id(&self, id: u32) -> Option<Position> {
+        self.towns.iter()
+            .find(|t| t.id == id)
+            .map(|t| Position::new(t.x, t.y, t.z))
     }
 
     /// Find an item's server id by case-insensitive name (singular or plural).
