@@ -156,7 +156,7 @@ pub fn build_enter_world_burst(
     burst.extend(enter_world::world_light(215, 215));
     burst.extend(enter_world::creature_light(snapshot_id, 0, 0));
     burst.extend(enter_world::basic_data());
-    burst.extend(enter_world::icons());
+    burst.extend(enter_world::icons(0));
     burst
 }
 

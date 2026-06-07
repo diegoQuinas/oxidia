@@ -20,6 +20,8 @@ pub const OP_MAGIC_EFFECT: u8 = 0x83;
 pub const OP_EXTENDED: u8 = 0x32;
 
 pub const INVENTORY_SLOTS: u8 = 11;
+/// `ICON_PIGEON = 1 << 14` (TFS const.h:343): the protection-zone "dove" badge.
+pub const ICON_PIGEON: u16 = 1 << 14;
 /// TFS `CONST_ME_TELEPORT = 11` (const.h); wire value = TFS enum − 1.
 pub const EFFECT_TELEPORT: u8 = 10;
 /// TFS `CONST_ME_DRAWBLOOD = 1` (const.h:12). TFS `sendMagicEffect` sends the
@@ -175,11 +177,11 @@ pub fn basic_data() -> Vec<u8> {
     w.into_bytes()
 }
 
-/// `0xA2` status icons bitmask (none active).
-pub fn icons() -> Vec<u8> {
+/// `0xA2` status-icons bitmask. `mask` is the OR of active `ICON_*` bits.
+pub fn icons(mask: u16) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u8(OP_ICONS);
-    w.write_u16(0);
+    w.write_u16(mask);
     w.into_bytes()
 }
 
@@ -274,9 +276,16 @@ mod tests {
         assert_eq!(basic[0], OP_BASIC_DATA);
         // 1 + 1 + 4 + 1 + 2 + 255 = 264
         assert_eq!(basic.len(), 264);
-        assert_eq!(icons(), [OP_ICONS, 0, 0]);
+        assert_eq!(icons(0), [OP_ICONS, 0, 0]);
         assert_eq!(extended_opcode_init(), [OP_EXTENDED, 0, 0, 0]);
         assert_eq!(magic_effect(1000, 1000, 7, EFFECT_TELEPORT).len(), 1 + 2 + 2 + 1 + 1);
+    }
+
+    #[test]
+    fn icons_encodes_pigeon_bit_little_endian() {
+        // ICON_PIGEON = 1<<14 = 0x4000 -> LE bytes 0x00 0x40.
+        assert_eq!(icons(ICON_PIGEON), [OP_ICONS, 0x00, 0x40]);
+        assert_eq!(icons(0), [OP_ICONS, 0x00, 0x00]);
     }
 
     #[test]
