@@ -48,6 +48,7 @@ fn player_save_to_initial(save: &PlayerSave) -> InitialState {
             addons: save.look_addons,
             mount: save.look_mount,
         },
+        sex: save.sex,
         health: save.health,
         max_health: save.health_max,
     }
@@ -76,6 +77,7 @@ pub fn save_record_to_player_save(rec: &SaveRecord) -> PlayerSave {
         look_feet: rec.outfit.feet,
         look_addons: rec.outfit.addons,
         look_mount: rec.outfit.mount,
+        sex: rec.sex,
     }
 }
 
@@ -221,6 +223,7 @@ where
             position: None,
             direction: Direction::South,
             outfit: knight_outfit(),
+            sex: 1, // new character defaults to male, matching the default look_type 128
             health: 150,
             max_health: 150,
         },
@@ -700,6 +703,7 @@ mod tests {
             look_feet: 40,
             look_addons: 1,
             look_mount: 0,
+            sex: 0, // female
         };
         let initial = player_save_to_initial(&save);
         assert_eq!(initial.position, Some(world::Position::new(200, 300, 8)));
@@ -713,6 +717,7 @@ mod tests {
         assert_eq!(initial.outfit.feet, 40);
         assert_eq!(initial.outfit.addons, 1);
         assert_eq!(initial.outfit.mount, 0);
+        assert_eq!(initial.sex, 0);
     }
 
     #[test]
@@ -738,6 +743,7 @@ mod tests {
             outfit: creature::Outfit { look_type: 128, head: 1, body: 2, legs: 3, feet: 4, addons: 0, mount: 5 },
             health: 80,
             max_health: 160,
+            sex: 0, // female
         };
         let save = save_record_to_player_save(&rec);
         assert_eq!(save.name, "Hero");
@@ -758,6 +764,7 @@ mod tests {
         assert_eq!(save.level, 1);
         assert_eq!(save.mana, 0);
         assert_eq!(save.mana_max, 0);
+        assert_eq!(save.sex, 0);
     }
 
     /// A one-tile StaticMap at (100,100,7) with the PZ flag set (flags: 1).
