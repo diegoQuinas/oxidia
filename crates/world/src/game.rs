@@ -2411,6 +2411,7 @@ mod tests {
         /// Decode ONE floor's tile stream (the 0xBF/0xBE revealed-floor reveals,
         /// which the server emits via `floor_description` per floor — NOT a band).
         /// `nz` is the floor and `offset` the projection shift the server used.
+        #[allow(clippy::too_many_arguments)]
         fn decode_floor(
             &mut self, bytes: &[u8], pos: &mut usize, skip: &mut i32,
             anchor_x: i32, anchor_y: i32, nz: i32, offset: i32, width: i32, height: i32,
@@ -2833,6 +2834,7 @@ mod tests {
     /// This is DIAGNOSTIC: it prints each scenario's landings + divergence so we
     /// can see WHICH geometry actually breaks. Does NOT fix anything.
     #[test]
+    #[allow(clippy::type_complexity, clippy::assertions_on_constants)]
     fn floorchange_geometry_battery_reports_first_divergence() {
         use formats::items_xml::FloorChange as FC;
         let start = Position::new(32027, 32196, 7);
