@@ -1829,9 +1829,17 @@ mod tests {
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
         g.players.get_mut(&b).unwrap().health = 1;
-        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
-        // Drain all packets
-        while rb.try_recv().is_ok() {}
+        // `fist_damage` rolls in 0..=max (TFS `normal_random`), so a single swing
+        // can deal 0. Tick until the kill lands (mirrors the run-until-death sibling
+        // test) instead of assuming one swing kills — otherwise a 0-roll leaves the
+        // fight uncleared and the assertion flakes (~5%). Death clears `attacking`.
+        for tick in 1..=200u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            while rb.try_recv().is_ok() {} // drain packets
+            if g.players[&a].attacking.is_none() {
+                break;
+            }
+        }
         // After death+respawn: A's fight must be cleared.
         assert_eq!(g.players[&a].attacking, None, "attacker's fight must be cleared on target death");
         // No two players on the same tile.
@@ -1947,13 +1955,20 @@ mod tests {
         let (b, mut rb) = add_player(&mut g, Position::new(113, 117, 7));
         g.do_set_target(a, b);
         g.players.get_mut(&b).unwrap().health = 1;
-        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
 
-        // Drain all packets until we find the 0x64 map description sent on respawn.
+        // `fist_damage` can roll 0 (TFS `normal_random`), so tick until the kill
+        // lands instead of assuming one swing kills (~5% flake otherwise). The
+        // respawn 0x64 map description is captured on whichever tick lands the kill.
         let mut map_desc: Option<Vec<u8>> = None;
-        while let Ok(pkt) = rb.try_recv() {
-            if pkt[0] == protocol::map_description::OPCODE_MAP_DESCRIPTION {
-                map_desc = Some(pkt);
+        for tick in 1..=200u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            while let Ok(pkt) = rb.try_recv() {
+                if pkt[0] == protocol::map_description::OPCODE_MAP_DESCRIPTION {
+                    map_desc = Some(pkt);
+                }
+            }
+            if map_desc.is_some() {
+                break;
             }
         }
         let map_bytes = map_desc.expect("respawned victim must receive a 0x64 map description");
@@ -1990,8 +2005,16 @@ mod tests {
         let (a, _ra) = add_player(&mut g, Position::new(112, 117, 7));
         g.do_set_target(a, b);
         g.players.get_mut(&b).unwrap().health = 1;
-        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
-        while rb.try_recv().is_ok() {} // drain
+        // `fist_damage` can roll 0 (TFS `normal_random`), so tick until B actually
+        // dies and respawns (full health restored) instead of assuming one swing
+        // kills (~5% flake otherwise).
+        for tick in 1..=200u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            while rb.try_recv().is_ok() {} // drain
+            if g.players[&b].health > 1 {
+                break;
+            }
+        }
 
         // B respawned at temple (95,117). X is at (110,117): dx=15 > VIEW_RIGHT(9).
         // B must have forgotten X — otherwise a re-encounter sends the short 0x62
