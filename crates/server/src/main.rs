@@ -91,10 +91,10 @@ async fn main() -> Result<()> {
             let rsa = Arc::clone(&rsa);
             let world = world.clone();
             async move {
-                let mut stream = stream;
+                let stream = stream;
                 let ts: u32 = 0x5EED_0000;
                 let rnd: u8 = 0x2A;
-                if let Err(error) = handle_game(&mut stream, &rsa, &world, ts, rnd).await {
+                if let Err(error) = handle_game(stream, &rsa, &world, ts, rnd).await {
                     warn!(%peer, %error, "game handler failed");
                 }
             }

@@ -4,10 +4,10 @@
 use anyhow::Result;
 use protocol::map_description::{self, Center, PlacedCreature};
 use protocol::rsa::RsaPrivateKey;
-use protocol::{creature, enter_world, frame, game_login, walk, xtea};
+use protocol::{creature, enter_world, frame, game_login, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
-use world::game::{MoveOutcome, WorldHandle};
-use world::{Direction, Position};
+use world::game::WorldHandle;
+use world::Direction;
 
 pub const CLIENT_VERSION_MIN: u16 = 1097;
 pub const CLIENT_VERSION_MAX: u16 = 1098;
@@ -39,6 +39,7 @@ pub fn build_enter_world_burst(
     center: Center,
     direction: u8,
     name: &[u8],
+    others: &[PlacedCreature],
     map: &impl map_description::TileSource,
 ) -> Vec<u8> {
     let stats = enter_world::Stats {
@@ -57,12 +58,13 @@ pub fn build_enter_world_burst(
         base_speed: 220,
     };
 
-    let placed = [PlacedCreature {
+    let mut placed: Vec<PlacedCreature> = others.to_vec();
+    placed.push(PlacedCreature {
         x: center.x,
         y: center.y,
         z: center.z,
         bytes: player_creature_bytes(snapshot_id, name, direction),
-    }];
+    });
 
     let mut burst = Vec::new();
     burst.extend(enter_world::self_info(snapshot_id));
@@ -87,14 +89,14 @@ pub fn build_enter_world_burst(
 
 /// Handle one game connection.
 pub async fn handle_game<S>(
-    stream: &mut S,
+    mut stream: S,
     rsa: &RsaPrivateKey,
     world: &WorldHandle,
     challenge_timestamp: u32,
     challenge_random: u8,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // 1. Send the challenge (checksummed, NOT XTEA). Every TFS message carries an
     // inner `[u16 payload length]` (TFS `onConnect`, protocolgame.cpp:429 writes
@@ -106,10 +108,10 @@ where
     message.extend_from_slice(&(challenge.len() as u16).to_le_bytes());
     message.extend_from_slice(&challenge);
     let inner = frame::checksummed(&message);
-    net::frame::write_frame(stream, &inner).await?;
+    net::frame::write_frame(&mut stream, &inner).await?;
 
     // 2. Read the client's first packet (the game-login).
-    let Some(raw) = net::frame::read_frame(stream).await? else {
+    let Some(raw) = net::frame::read_frame(&mut stream).await? else {
         return Ok(()); // client closed before sending the login
     };
     let payload = frame::verify(&raw)?;
@@ -121,91 +123,63 @@ where
     }
     let keys = xtea::expand_key(&req.xtea_key);
     if !(CLIENT_VERSION_MIN..=CLIENT_VERSION_MAX).contains(&req.version) {
-        return send_disconnect(stream, &keys, "Only protocol 10.98 is supported.").await;
+        return send_disconnect(&mut stream, &keys, "Only protocol 10.98 is supported.").await;
     }
 
     // 4. OTClient extended-opcode init.
     if req.os >= OS_OTCLIENT_LINUX {
-        send_encrypted(stream, &keys, &enter_world::extended_opcode_init()).await?;
+        send_encrypted(&mut stream, &keys, &enter_world::extended_opcode_init()).await?;
     }
 
-    // 5. "Player load": register in the world.
+    // 5. "Player load": register in the world with this session's push channel.
     let name = String::from_utf8_lossy(&req.character_name).to_string();
-    let Some(snapshot) = world.login(name.clone()).await else {
-        return send_disconnect(stream, &keys, "Your character could not be loaded.").await;
+    let (push_tx, push_rx) = world::game::push_channel();
+    let Some(ack) = world.login(name.clone(), knight_outfit(), push_tx).await else {
+        return send_disconnect(&mut stream, &keys, "Your character could not be loaded.").await;
     };
+    let snapshot = ack.snapshot;
 
     // 6. Build + send the enter-world burst as one encrypted frame.
-    let center =
-        Center { x: snapshot.position.x, y: snapshot.position.y, z: snapshot.position.z };
+    let center = Center { x: snapshot.position.x, y: snapshot.position.y, z: snapshot.position.z };
     let burst = build_enter_world_burst(
-        snapshot.id,
-        center,
-        snapshot.direction.to_byte(),
-        name.as_bytes(),
-        world.map.as_ref(),
-    );
-    send_encrypted(stream, &keys, &burst).await?;
+        snapshot.id, center, snapshot.direction.to_byte(), name.as_bytes(), &ack.others, world.map.as_ref());
+    send_encrypted(&mut stream, &keys, &burst).await?;
     tracing::info!(character = %name, id = snapshot.id, ?center, "player entered game");
 
-    let session = Session { id: snapshot.id, pos: snapshot.position, facing: snapshot.direction };
-    run_session(stream, &keys, world, session).await
+    // 7. Split: spawned writer task drains the push channel; reader loop stays here.
+    let (mut rd, wr) = tokio::io::split(stream);
+    let mut writer = tokio::spawn(writer_loop(wr, keys, push_rx)); // keys: RoundKeys is Copy
+
+    // Reader and writer are independent tasks; whichever ends first tears the
+    // session down. A client EOF ends the reader; a write error (broken pipe,
+    // half-open socket) ends the writer. Selecting on both prevents a dead
+    // writer from leaving the reader blocked on read_frame forever. Cancelling
+    // reader_loop mid-read is safe here: we never resume the stream afterwards,
+    // we tear the session down — so the read_frame cancel-safety hazard (which
+    // only matters when you keep reading) does not apply.
+    let read_result = tokio::select! {
+        res = reader_loop(&mut rd, &keys, world, snapshot.id) => {
+            writer.abort();
+            res
+        }
+        joined = &mut writer => {
+            if let Err(e) = joined {
+                if !e.is_cancelled() {
+                    tracing::warn!(error = ?e, "writer task ended abnormally");
+                }
+            }
+            Ok(())
+        }
+    };
+    world.logout(snapshot.id).await;
+    read_result
 }
 
 /// Game opcode `0x1D` — ping. TFS sends it to keep the connection alive.
 const PING_OPCODE: u8 = 0x1D;
+/// Game opcode `0x14` — client logout request (Ctrl+L / window-close "Logout").
+const OPCODE_CLIENT_LOGOUT: u8 = 0x14;
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Per-connection mutable player state the dispatcher walks/turns.
-struct Session {
-    id: u32,
-    pos: Position,
-    facing: Direction,
-}
-
-/// Keep a connected session alive, dispatching client walk/turn packets.
-async fn run_session<S>(
-    stream: &mut S,
-    keys: &xtea::RoundKeys,
-    world: &WorldHandle,
-    mut session: Session,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    loop {
-        match tokio::time::timeout(PING_INTERVAL, net::frame::read_frame(stream)).await {
-            Ok(frame) => {
-                let Some(raw) = frame? else {
-                    break; // client disconnected
-                };
-                // A single corrupt frame must not tear down a healthy session:
-                // a bad checksum or undecryptable body is logged and dropped.
-                let body = match frame::verify(&raw) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::debug!(?e, "dropping frame with bad checksum");
-                        continue;
-                    }
-                };
-                let payload = match xtea::decrypt_message(body, keys) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::debug!(?e, "dropping undecryptable frame");
-                        continue;
-                    }
-                };
-                if let Some(&opcode) = payload.first() {
-                    handle_client_packet(stream, keys, world, &mut session, opcode).await?;
-                }
-            }
-            Err(_elapsed) => {
-                send_encrypted(stream, keys, &[PING_OPCODE]).await?;
-            }
-        }
-    }
-    Ok(())
-}
 
 /// Map an incoming opcode to a (direction, is_turn) action, or `None` to drain.
 fn opcode_action(opcode: u8) -> Option<(Direction, bool)> {
@@ -222,61 +196,94 @@ fn opcode_action(opcode: u8) -> Option<(Direction, bool)> {
         0x70 => Some((Direction::East, true)),
         0x71 => Some((Direction::South, true)),
         0x72 => Some((Direction::West, true)),
-        _ => None, // pong (0x1E), unknown -> drain; logout handled by EOF
+        _ => None, // pong (0x1E), unknown -> drain; logout (0x14) handled in reader_loop
     }
 }
 
-async fn handle_client_packet<S>(
-    stream: &mut S,
+/// The connection-task reader loop: decode inbound walk/turn into fire-and-forget
+/// world commands. Not inside a `select!`, so `read_frame` is never cancelled.
+async fn reader_loop<R>(
+    rd: &mut R,
     keys: &xtea::RoundKeys,
     world: &WorldHandle,
-    session: &mut Session,
-    opcode: u8,
+    id: u32,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
 {
-    let Some((direction, is_turn)) = opcode_action(opcode) else {
-        return Ok(());
-    };
-
-    if is_turn {
-        // `None` means the world rejected the turn (unknown id) — no packet sent.
-        // The turn is addressed by creature id, so no stackpos is needed.
-        if let Some(facing) = world.turn_player(session.id, direction).await {
-            session.facing = facing;
-            let pkt = walk::creature_turn(session.id, facing.to_byte());
-            send_encrypted(stream, keys, &pkt).await?;
-        }
-        return Ok(());
-    }
-
-    if let Some(res) = world.move_player(session.id, direction).await {
-        session.facing = res.facing;
-        match res.outcome {
-            MoveOutcome::Moved { from, to } => {
-                session.pos = to;
-                let pkt = walk::walk_update(
-                    session.id,
-                    (from.x, from.y, from.z),
-                    (to.x, to.y, to.z),
-                    world.map.as_ref(),
-                    &[],
-                );
-                send_encrypted(stream, keys, &pkt).await?;
+    loop {
+        let Some(raw) = net::frame::read_frame(rd).await? else { break };
+        let body = match frame::verify(&raw) {
+            Ok(b) => b,
+            Err(e) => { tracing::debug!(?e, "dropping frame with bad checksum"); continue; }
+        };
+        let payload = match xtea::decrypt_message(body, keys) {
+            Ok(p) => p,
+            Err(e) => { tracing::debug!(?e, "dropping undecryptable frame"); continue; }
+        };
+        if let Some(&opcode) = payload.first() {
+            // 0x14 — client "safe logout": the client sends this and waits for the
+            // server to close the connection (unlike a force-exit, which just drops
+            // the socket and arrives here as EOF). Ending the loop tears the session
+            // down (writer.abort + world.logout), which closes the socket and lets
+            // the client's safe-logout complete.
+            //
+            // TODO(combat): real Tibia refuses logout while in a fight — when combat
+            // state exists, check it here and, instead of breaking, push a status
+            // message ("You may not logout during or immediately after a fight.")
+            // and keep the session open.
+            if opcode == OPCODE_CLIENT_LOGOUT {
+                break;
             }
-            MoveOutcome::Blocked => {
-                let pkt = walk::cancel_walk(res.facing.to_byte());
-                send_encrypted(stream, keys, &pkt).await?;
+            let Some((direction, is_turn)) = opcode_action(opcode) else { continue };
+            if is_turn {
+                world.turn_player(id, direction).await;
+            } else {
+                world.move_player(id, direction).await;
             }
         }
     }
     Ok(())
 }
 
-async fn send_encrypted<S>(stream: &mut S, keys: &xtea::RoundKeys, payload: &[u8]) -> Result<()>
+/// The spawned writer task: greedily coalesce queued payloads into one XTEA
+/// frame, and ping on idle. `select!` here is cancel-safe — both arms
+/// (`recv`, `tick`) are cancel-safe and the actual write is awaited inside the arm.
+async fn writer_loop<W>(
+    mut wr: W,
+    keys: xtea::RoundKeys,
+    mut push_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            maybe = push_rx.recv() => {
+                let Some(first) = maybe else { break }; // channel closed → session ended
+                let mut batch = first;
+                while let Ok(more) = push_rx.try_recv() {
+                    batch.extend_from_slice(&more);
+                }
+                if let Err(e) = send_encrypted(&mut wr, &keys, &batch).await {
+                    tracing::debug!(error = ?e, "writer send failed; ending session");
+                    break;
+                }
+            }
+            _ = ping.tick() => {
+                if let Err(e) = send_encrypted(&mut wr, &keys, &[PING_OPCODE]).await {
+                    tracing::debug!(error = ?e, "writer ping failed; ending session");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn send_encrypted<W>(stream: &mut W, keys: &xtea::RoundKeys, payload: &[u8]) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
 {
     let body = xtea::encrypt_message(payload, keys);
     let inner = frame::checksummed(&body);
@@ -290,7 +297,7 @@ async fn send_disconnect<S>(
     message: &str,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin,
 {
     let mut w = protocol::message::MessageWriter::new();
     w.write_u8(0x14);
@@ -303,6 +310,7 @@ mod tests {
     use super::*;
     use formats::otb::{ItemType, ItemsOtb};
     use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
+    use protocol::walk;
     use std::sync::Arc;
     use world::map::StaticMap;
 
@@ -351,13 +359,13 @@ mod tests {
         let ts = 0x1234_5678;
         let rnd = 0x42;
 
-        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
 
         let server_task = {
             let world = world.clone();
             tokio::spawn(async move {
                 let rsa = RsaPrivateKey::open_tibia();
-                handle_game(&mut server, &rsa, &world, ts, rnd).await.unwrap();
+                handle_game(server, &rsa, &world, ts, rnd).await.unwrap();
             })
         };
 
@@ -412,9 +420,39 @@ mod tests {
         let move_pkt = xtea::decrypt_message(frame::verify(&move_raw).unwrap(), &keys).unwrap();
         assert_eq!(move_pkt[0], walk::OP_CREATURE_MOVE);
 
-        // Closing the client makes `run_session` see EOF and return; without this
+        // Closing the client makes `reader_loop` see EOF and return; without this
         // the handler would hold the session open (pinging) until timeout.
         drop(client);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_opcode_ends_reader_loop_without_eof() {
+        // A client "safe logout" (window dialog or Ctrl+L safeLogout) sends the
+        // 0x14 logout opcode and then WAITS for the server to close the socket —
+        // it does not send EOF itself. The reader loop must return on 0x14 so the
+        // session tears down (writer.abort + world.logout) and the socket closes.
+        let world = test_world();
+        let keys = xtea::expand_key(&[1u32, 2, 3, 4]);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (mut rd, _wr) = tokio::io::split(server);
+
+        // Send a logout (0x14) frame, then keep `client` open — no EOF.
+        let mut pkt = protocol::message::MessageWriter::new();
+        pkt.write_u8(0x14);
+        let body = xtea::encrypt_message(&pkt.into_bytes(), &keys);
+        let inner = frame::checksummed(&body);
+        net::frame::write_frame(&mut client, &inner).await.unwrap();
+
+        // With the fix, reader_loop returns promptly on 0x14. Without it, it would
+        // drain the opcode and block on the next read_frame forever (timeout).
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader_loop(&mut rd, &keys, &world, 1),
+        )
+        .await;
+        assert!(res.is_ok(), "reader_loop must return on 0x14 without waiting for EOF");
+        res.unwrap().unwrap();
     }
 }

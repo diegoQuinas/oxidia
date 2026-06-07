@@ -8,8 +8,8 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M4 ✅ **core walk complete and accepted live** → next is **M5 (multiplayer presence)**. Floor changes / underground (z≥8) and auto-walk are deferred; multiplayer presence is M5.
-- **Build:** `cargo build` clean, `cargo test` green (77 tests), `cargo clippy --all-targets -- -D warnings` clean.
+- **Milestone:** M5 ✅ **multiplayer presence complete and accepted live** (two OTClients see each other spawn, walk, turn, and poof out on logout) → next is **M6 (chat)**. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) and auto-walk remain deferred.
+- **Build:** `cargo build` clean, `cargo test` green (112 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
 - **Accepted (M2):** `cargo run -p formats --example mapinfo` parses the real `items.otb` (v3.57, 26 282 items) and `forgotten.otbm` (2048×2048, 340 594 tiles, 429 031 items, 5 towns) — full tree walk, no unknown nodes/attrs.
@@ -31,7 +31,7 @@ performance-critical or stable stays native Rust.
 | M3 | Enter game: game handshake (challenge), player load, initial packet sequence, render map | ✅ done |
 | **A** | **Living World → pre-alpha #1** | |
 | M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | ✅ done |
-| M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ⬜ |
+| M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ✅ done |
 | M6 | Chat: say / whisper / yell + default channel | ⬜ |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
@@ -144,6 +144,27 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m4-walk-design.md`, `docs/supe
 8. ✅ **Accepted live** — real OTClient renders the Test Knight with its outfit on the Thais temple ground and walks it around with arrow keys; walls stop it. Fixed during review: a bad-checksum frame now drops instead of killing the session.
 
 **Deferred (later slice):** floor changes / stairs / underground (z≥8) walk; auto-walk / click-to-move pathfinding; diagonal corner-cut blocking; real player persistence; walkthrough byte fidelity (self currently `0x00`).
+
+## M5 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-06-m5-presence-design.md`, `docs/superpowers/plans/2026-06-06-m5-presence.md`. Scope: **full presence** — login appear, walk/turn broadcast, logout/disconnect remove, viewport in/out. Architecture chosen after verifying TFS 1.4.2 and improving on it (see README "Why Rust over a C++ port").
+
+1. ✅ `protocol::tile_creature` — `add_tile_creature 0x6A` (`[0x6A][pos][stackpos][creature thing]`) and `remove_tile_thing 0x6C` (`[0x6C][pos][stackpos]`), byte-faithful round-trip tests.
+2. ✅ `world::game` rewritten to **unified push**: the actor is the single builder of all outbound packets. `PlayerState` gains `outfit`, `push_tx: mpsc::Sender<Vec<u8>>`, `known: HashSet<u32>`. `Command` drops the Move/Turn reply channels and gains `Logout`; `Login` returns `LoginAck { snapshot, others }`. Spectators = iterate-all behind `spectators(pos, exclude)` (swappable to a quadtree later). `introduce()` owns the 0x61-full/0x62-short decision via the known-set. `push()` is non-blocking (`try_send` + reap) so the loop never stalls on a slow client.
+3. ✅ `server::game_service` — per-session push pipeline: `handle_game` takes the stream **by value** (`Send + 'static`), splits it, **spawns a writer task** that greedily coalesces queued plaintext payloads into one XTEA frame and pings; a plain **reader loop** decodes inbound walk/turn into fire-and-forget commands. Reader/writer race via `select!` so a dead writer can't strand a blocked reader. (A single `select!` over `read_frame` + the channel was rejected as a cancel-safety bug.)
+4. ✅ **Accepted live** — two OTClients: each sees the other spawn (teleport puff), walk, turn, and poof out on logout; no desync. Spectators get the teleport effect on both login and logout (the logout puff is a deliberate polish over TFS, which removes silently).
+
+**Stackpos invariant (critical, found in final holistic review):** `0x6A`/`0x6C` are position+stackpos packets (no id-form for *add*), while `0x6D`/`0x6B` use the id-form. `StaticMap::creature_stackpos` is a *static* per-tile value, so two creatures on one tile would collide on add/remove → desync. Fix: keep **≤1 creature per tile** — `do_move` rejects a creature-occupied destination (collision) and `login` uses `free_spawn()` (nearest free tile when the temple is taken). Under that invariant the static stackpos is always correct. Co-occupancy has no path in M5 (logins serialize through the single actor; movement is blocked both ways; no teleport/summon).
+
+**Deferred (YAGNI):** quadtree/sectored-grid spectators; known-set eviction cap (1300); multi-floor spectator band (±2 underground); `0x6A`/`0x6C` stackpos≥10 id-form; proactive socket close on backpressure kick.
+
+## Protocol gotchas (M5 presence)
+
+- **`0x6A` add-tile-creature wraps the creature thing**: `[0x6A][pos x:u16 y:u16 z:u8][stackpos:u8]` then the `AddCreature` bytes (`0x61`/`0x62`). The raw creature thing alone is not enough — the client needs the tile + stackpos. (`protocolgame.cpp:2517`)
+- **`0x6C` short form is `[0x6C][pos][stackpos:u8]`** for stackpos < 10 (`protocolgame.cpp:3101`); the id-form (`0xFFFF`+id) is only for stackpos ≥ 10 and is deferred.
+- **Walk broadcast transition matrix** (spectator union of `from`+`to`): sees both → `0x6D` move; only `to` → `0x6A` appear; only `from` → `0x6C` remove (and drop the id from that spectator's known-set so re-entry re-introduces with `0x61`).
+- **The mover's own view** still uses `walk_update` (0x6D + revealed slices); other in-range players are spliced into the new slices via `PlacedCreature`. The client auto-culls creatures that scroll off the edge, so the mover gets no explicit removes.
+- **Coalescing multiple game packets into one XTEA frame is legal** — the client decrypts the whole body and parses opcodes sequentially (TFS coalesces into one `OutputMessage` too). The writer drains the channel greedily, so batching happens under load with zero added latency when idle (vs TFS's fixed 10 ms autosend tick).
 
 ## Protocol gotchas (M4 walk)
 

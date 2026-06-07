@@ -226,3 +226,23 @@ sees the other spawn, walk, turn, and disappear on logout, with no desync.
   TFS-style out-of-viewport eviction is a trivial later addition.
 - **Multi-floor spectator band** — M5 broadcasts same-floor; the floor band
   (`±2` underground) lands when it visibly matters.
+
+## Addendum (post-implementation): the stackpos invariant
+
+The final holistic review surfaced a desync the unified-push design glossed over:
+`0x6A`/`0x6C` carry **position + stackpos** (no id-form for *add*), while `0x6D`/`0x6B`
+use the id-form. `StaticMap::creature_stackpos` is a *static* per-tile value, so two
+creatures sharing a tile would collide on add/remove → "no thing at pos" desync
+(the ISSUE-1b class of bug). A "creature-aware stackpos" fix is fragile because the
+id-form move lets the client choose stack order on the destination tile.
+
+Resolution (implemented): keep **≤1 creature per tile** so the static stackpos is
+always correct. Two additions, both authentic Tibia behavior:
+1. **Creature collision** — `do_move` rejects a destination occupied by another
+   creature (blocked → `cancel_walk`).
+2. **Free-tile login placement** — `Game::free_spawn()` places a joining player on
+   the nearest walkable, unoccupied tile when the temple spawn is taken.
+
+Under this invariant (and with no teleport/summon in M5, plus logins serialized by
+the single actor) co-occupancy has no path, so every `0x6A`/`0x6C` stackpos is
+correct. This is a small, intended scope addition over the original design.

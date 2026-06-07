@@ -27,8 +27,8 @@ against TFS; the table notes what already ships vs. what the design lands in M5.
 |---|---|---|---|
 | **Shared mutable state** | Single dispatcher thread, manual discipline to stay lock-free | One `tokio` actor owns all world state; the type system *enforces* single-writer — no `Arc<Mutex>`, no torn reads possible | ✅ ships (M4) |
 | **Memory safety** | C++; manual lifetimes, raw pointers in the quadtree/spectator paths | `#![forbid(unsafe_code)]` in every crate; no segfault/UAF class exists | ✅ ships |
-| **Outbound latency** | Per-connection buffer flushed on a fixed **10 ms** tick (`outputmessage.cpp:25-38`) — up to 10 ms added to every packet, even with one player online | Per-session writer task **greedily drains** its channel: batches under load exactly like TFS, but writes immediately when idle — **no fixed-tick latency** | 🚧 design (M5) |
-| **Slow-client safety** | Per-connection send queue grows unbounded (`connection.h:98`) — a stalled socket is a memory-pressure vector | Bounded channel + non-blocking `try_send`; a client that can't keep up is **kicked**, never buffered without limit, and **never stalls the game loop** | 🚧 design (M5) |
+| **Outbound latency** | Per-connection buffer flushed on a fixed **10 ms** tick (`outputmessage.cpp:25-38`) — up to 10 ms added to every packet, even with one player online | Per-session writer task **greedily drains** its channel: batches under load exactly like TFS, but writes immediately when idle — **no fixed-tick latency** | ✅ ships (M5) |
+| **Slow-client safety** | Per-connection send queue grows unbounded (`connection.h:98`) — a stalled socket is a memory-pressure vector | Bounded channel + non-blocking `try_send`; a client that can't keep up is **reaped**, never buffered without limit, and **never stalls the game loop** | ✅ ships (M5) |
 | **Packet correctness** | Byte layouts maintained by hand across the codebase | Every wire packet has a **byte-faithful round-trip test** against an OTClient-faithful decoder | ✅ ships |
 
 The throughline: properties TFS holds by *convention and care* (lock-free game
@@ -58,8 +58,8 @@ embedded Lua (mlua)** for mutable content. Full plan in
 | M2 | Formats: `.otb` + `.otbm` parsers | ✅ |
 | M3 | Enter game: handshake, player load, render the real map | ✅ |
 | **Phase A — Living World → pre-alpha #1** | | |
-| M4 | Walk: movement, tile updates, floor changes, collision | 🚧 |
-| M5 | Multiplayer presence: spectators, see others walk | ⬜ |
+| M4 | Walk: movement, tile updates, floor changes, collision | ✅ |
+| M5 | Multiplayer presence: spectators, see others walk | ✅ |
 | M6 | Chat: say / whisper / yell + default channel | ⬜ |
 | M7 | Combat core + PvP melee: damage, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved progress | ⬜ |
