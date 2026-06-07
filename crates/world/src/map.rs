@@ -107,8 +107,14 @@ impl StaticMap {
             }
         }
 
-        let spawn = spawn_town
-            .and_then(|name| map.towns.iter().find(|t| t.name == name))
+        let named = spawn_town.and_then(|name| {
+            let found = map.towns.iter().find(|t| t.name == name);
+            if found.is_none() {
+                tracing::warn!(town = name, "spawn_town not found in map; using first town");
+            }
+            found
+        });
+        let spawn = named
             .or_else(|| map.towns.first())
             .map(|t| Position::new(t.x, t.y, t.z))
             .unwrap_or(FALLBACK_SPAWN);

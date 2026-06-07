@@ -128,4 +128,16 @@ mod tests {
         let err = Config::from_toml("[server]\nworld_name = \"x\"\nhost = \"y\"\n");
         assert!(err.is_err(), "config without [network] must fail");
     }
+
+    #[test]
+    fn rejects_config_without_world_section() {
+        // [world] is required (no serde default on the field); a config that omits
+        // it entirely must fail, guarding against a future accidental default.
+        let cfg = Config::from_toml(
+            "[server]\nworld_name=\"x\"\nhost=\"y\"\nmotd=\"z\"\n\
+             [network]\nlogin_port=1\ngame_port=2\nbind=\"0.0.0.0\"\n\
+             [database]\npath=\"d\"\n[log]\nfilter=\"info\"\n",
+        );
+        assert!(cfg.is_err(), "config without [world] must fail");
+    }
 }
