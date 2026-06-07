@@ -48,29 +48,40 @@ inbound packet, encode the outbound `0xB4`); the **text assembly lives in
 
 ## A. Data layer (`formats`)
 
-### `ItemType` (otb.rs) gains
+**Where the metadata lives (decided during planning):** the look-at fields all
+come from `items.xml`, so they go in **`ItemXmlAttrs`** — NOT on `ItemType`.
+`ItemType` has ~30 struct-literal construction sites across the test suite;
+adding fields there would force churn on every one and break the build mid-edit.
+The only `ItemType` addition is an `is_pickupable()` **method** over the existing
+`flags` word (no new field, no churn), mirroring `is_stackable()`.
+
+### `ItemXmlAttrs` (items_xml.rs) gains
 
 | Field | Source | Notes |
 |---|---|---|
-| `name: String` | `items.xml` `<item name=…>` | empty → look falls back to `"an item of type <id>"` |
-| `article: String` | `items.xml` `<item article=…>` | `"a"` / `"an"`; omitted for stackable>1 |
-| `plural: String` | `items.xml` `<item plural=…>` | used when stackable & count>1 |
-| `description: String` | `items.xml` `<attribute key="description">` | shown only at lookDistance ≤ 1 |
-| `weight: u32` | `items.xml` `<attribute key="weight">` | **hundredths of an oz** (TFS stores ×100) |
-| `pickupable: bool` | `items.otb` `FLAG_PICKUPABLE` | weight shown only if pickupable |
-| `show_count: bool` | `items.xml` `<attribute key="showcount">` | default `true`; gold-style "N name" |
+| `name: String` | `<item name=…>` element attr | empty → look falls back to `"an item of type <id>"` |
+| `article: String` | `<item article=…>` element attr | `"a"` / `"an"`; omitted for stackable>1 |
+| `plural: String` | `<item plural=…>` element attr | used when stackable & count>1 |
+| `description: String` | `<attribute key="description">` child | shown only at lookDistance ≤ 1 |
+| `weight: u32` | `<attribute key="weight">` child | **hundredths of an oz** (TFS stores ×100) |
+| `show_count: bool` | `<attribute key="showcount">` child | default `true`; gold-style "N name" |
 
-`is_stackable()` / `group` already exist.
+`name`/`article`/`plural` are **element attributes** on `<item>`; `description`/
+`weight`/`showcount` are `<attribute key=… value=…>` children. `weight` in
+`items.xml` is already in hundredths — store the raw integer.
+
+### `ItemType::is_pickupable()` (otb.rs)
+
+Add `FLAG_PICKUPABLE = 1 << 5` and `pub fn is_pickupable(&self) -> bool` (weight
+is shown in look only for pickupable items). `is_stackable()` / `group` already
+exist.
 
 ### `items_xml` loader (items_xml.rs)
 
-Today it only reads `floorchange`. Extend it to:
-- read the `<item>` element attributes `name`, `article`, `plural`, `showcount`;
-- read `<attribute key="description">` and `<attribute key="weight">` children;
-- merge all of the above into `ItemType` by `fromid/toid` range (same merge path
-  as `floor_change`).
-
-`weight` in `items.xml` is already in hundredths — store the raw integer.
+Extend `parse_items_xml` to read the `<item>` element attributes `name`,
+`article`, `plural` and the `<attribute>` children `description`, `weight`,
+`showcount`, storing them per server-id alongside `floor_change`. No `merge`
+change is needed — the catalog (§B) reads `ItemsXml` directly.
 
 ### OTBM count (otbm.rs)
 
@@ -84,17 +95,23 @@ loop, matching the existing tile-attr pattern.)
 
 ### Tile identity + count threading (map.rs)
 
-Each stacked tile item must remember its **`server_id`** so look-at can index the
-metadata catalog unambiguously (client_id is not 1:1 with server_id). Extend the
-per-item stored data (parallel to `WireItem`) with `server_id: u16`. Thread the
-parsed `MapItem.count` into `WireItem.subtype` for stackable items (replacing the
-current hard-coded `1`); splash/fluid stay `0` until M10/M15.
+Each `TileStack` keeps a **`server_ids: Vec<u16>`** parallel to its `items`
+(`Vec<WireItem>`), populated in `from_formats_with_spawn` — the build loop
+already has each `MapItem.id` (= server id) in hand, so no signature change is
+needed. Look-at indexes this to fetch metadata unambiguously (client_id is not
+1:1 with server_id). Thread the parsed `MapItem.count` into `WireItem.subtype`
+for stackable items (replacing the current hard-coded `1`); splash/fluid stay
+`0` until M10/M15.
 
-### `ItemCatalog` (new, map.rs or a sibling)
+### `ItemMeta` catalog in `StaticMap` (map.rs)
 
-An `Arc`-shared lookup `server_id -> &ItemMeta { name, article, plural,
-description, weight, pickupable, show_count, stackable }`, built once at load from
-the merged `ItemType` table. The actor (`Game`) holds it alongside the map.
+`StaticMap` gains `item_meta: HashMap<u16, ItemMeta>` (empty by default).
+`ItemMeta { name, article, plural, description, weight, show_count, stackable,
+pickupable }` combines `items.xml` text with the `items.otb` flags. It is
+populated by a **new chainable method** `load_item_metadata(&mut self, otb:
+&ItemsOtb, xml: &ItemsXml)` so `from_formats_with_spawn`'s signature (84 call
+sites) is untouched — only `main` calls it at boot; look-at tests call it
+explicitly with a small fixture. The actor reads it via `self.map.item_meta(sid)`.
 
 ### `Command::LookAt` + `do_look` (game.rs)
 
