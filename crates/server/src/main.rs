@@ -87,12 +87,24 @@ async fn main() -> Result<()> {
         &items,
         cfg.world.spawn_town.as_deref(),
     ));
-    let world_handle = world::game::spawn(static_map);
+    let (world_handle, mut save_rx) = world::game::spawn(static_map);
     info!(spawn = ?world_handle.map.spawn(), "world loaded");
 
+    // Background save worker: drains save records emitted by the world actor on
+    // logout and persists them. Fields the world doesn't track (mana, level)
+    // default to 0/0/1 — real progression lands in a later milestone.
+    let save_store = Arc::clone(&store);
+    tokio::spawn(async move {
+        while let Some(rec) = save_rx.recv().await {
+            let save = game_service::save_record_to_player_save(&rec);
+            let _ = save_store.save_player(&save).await;
+        }
+    });
+
+    let store_for_login = Arc::clone(&store);
     let rsa_for_login = Arc::clone(&rsa);
     let login_handler = move |stream, peer| {
-        let store = Arc::clone(&store);
+        let store = Arc::clone(&store_for_login);
         let rsa = Arc::clone(&rsa_for_login);
         let login_cfg = Arc::clone(&login_cfg);
         async move {
@@ -106,14 +118,16 @@ async fn main() -> Result<()> {
     let game_handler = {
         let rsa = Arc::clone(&rsa);
         let world = world_handle.clone();
+        let store_for_game = Arc::clone(&store);
         move |stream, peer| {
             let rsa = Arc::clone(&rsa);
             let world = world.clone();
+            let store = Arc::clone(&store_for_game);
             async move {
                 let stream = stream;
                 let ts: u32 = 0x5EED_0000;
                 let rnd: u8 = 0x2A;
-                if let Err(error) = handle_game(stream, &rsa, &world, ts, rnd).await {
+                if let Err(error) = handle_game(stream, &rsa, &world, &store, ts, rnd).await {
                     warn!(%peer, %error, "game handler failed");
                 }
             }

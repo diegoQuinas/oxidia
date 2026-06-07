@@ -2,30 +2,90 @@
 //! enableXTEA -> enter-world burst. Mirrors `login_service` but for ProtocolGame.
 
 use anyhow::Result;
+use persistence::{PlayerSave, Store};
 use protocol::map_description::{self, Center, PlacedCreature};
 use protocol::rsa::RsaPrivateKey;
 use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
-use world::game::WorldHandle;
+use world::game::{InitialState, SaveRecord, WorldHandle};
 use world::Direction;
 
 pub const CLIENT_VERSION_MIN: u16 = 1097;
 pub const CLIENT_VERSION_MAX: u16 = 1098;
 const OS_OTCLIENT_LINUX: u16 = 10;
 
-/// Fixed outfit for the M4 Test Knight (a visible male citizen look).
+/// Default outfit for a new character (Test Knight look).
 fn knight_outfit() -> creature::Outfit {
     creature::Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
 }
 
+/// Convert a direction byte (0=N,1=E,2=S,3=W) to the `Direction` enum.
+/// Unknown bytes fall back to `South` (the TFS default).
+fn direction_from_byte(b: u8) -> Direction {
+    match b {
+        0 => Direction::North,
+        1 => Direction::East,
+        2 => Direction::South,
+        3 => Direction::West,
+        _ => Direction::South,
+    }
+}
+
+/// Map a `PlayerSave` loaded from the DB into a world `InitialState`.
+/// The position is always `Some(...)` because we only call this when a save row
+/// exists — the caller falls back to `None` when `load_player` returns `None`.
+fn player_save_to_initial(save: &PlayerSave) -> InitialState {
+    InitialState {
+        position: Some(world::Position::new(save.pos_x, save.pos_y, save.pos_z)),
+        direction: direction_from_byte(save.direction),
+        outfit: creature::Outfit {
+            look_type: save.look_type,
+            head: save.look_head,
+            body: save.look_body,
+            legs: save.look_legs,
+            feet: save.look_feet,
+            addons: save.look_addons,
+            mount: save.look_mount,
+        },
+        health: save.health,
+        max_health: save.health_max,
+    }
+}
+
+/// Map a world `SaveRecord` (emitted on logout) into a `PlayerSave` for the DB.
+///
+/// Fields the world actor doesn't track (mana, mana_max, level) default to
+/// 0/0/1 — real progression lands in a later milestone.
+pub fn save_record_to_player_save(rec: &SaveRecord) -> PlayerSave {
+    PlayerSave {
+        name: rec.name.clone(),
+        pos_x: rec.position.x,
+        pos_y: rec.position.y,
+        pos_z: rec.position.z,
+        level: 1,   // stub: real level comes with M14 progression
+        health: rec.health,
+        health_max: rec.max_health,
+        mana: 0,    // stub: world doesn't track mana yet
+        mana_max: 0,
+        direction: rec.direction.to_byte(),
+        look_type: rec.outfit.look_type,
+        look_head: rec.outfit.head,
+        look_body: rec.outfit.body,
+        look_legs: rec.outfit.legs,
+        look_feet: rec.outfit.feet,
+        look_addons: rec.outfit.addons,
+        look_mount: rec.outfit.mount,
+    }
+}
+
 /// Serialize the player as an (unknown) creature thing for the initial 0x64.
-fn player_creature_bytes(id: u32, name: &[u8], direction: u8) -> Vec<u8> {
+fn player_creature_bytes(id: u32, name: &[u8], direction: u8, outfit: creature::Outfit) -> Vec<u8> {
     let view = creature::CreatureView {
         id,
         name,
         health_percent: 100,
         direction,
-        outfit: knight_outfit(),
+        outfit,
         light_level: 0,
         light_color: 0,
         speed: 220,
@@ -33,18 +93,31 @@ fn player_creature_bytes(id: u32, name: &[u8], direction: u8) -> Vec<u8> {
     creature::add_creature(&view, false, 0)
 }
 
+/// Player-specific data needed to build the enter-world burst.
+pub struct EnterWorldPlayer<'a> {
+    pub id: u32,
+    pub name: &'a [u8],
+    pub direction: u8,
+    pub outfit: creature::Outfit,
+    pub health: u16,
+    pub max_health: u16,
+}
+
 /// Build the full enter-world burst payload, in order, for a fresh login.
 pub fn build_enter_world_burst(
-    snapshot_id: u32,
+    player: &EnterWorldPlayer<'_>,
     center: Center,
-    direction: u8,
-    name: &[u8],
     others: &[PlacedCreature],
     map: &impl map_description::TileSource,
 ) -> Vec<u8> {
+    let snapshot_id = player.id;
+    let direction = player.direction;
+    let outfit = player.outfit;
+    let health = player.health;
+    let max_health = player.max_health;
     let stats = enter_world::Stats {
-        health: 150,
-        max_health: 150,
+        health,
+        max_health,
         free_capacity: 40_000,
         total_capacity: 40_000,
         experience: 0,
@@ -63,7 +136,7 @@ pub fn build_enter_world_burst(
         x: center.x,
         y: center.y,
         z: center.z,
-        bytes: player_creature_bytes(snapshot_id, name, direction),
+        bytes: player_creature_bytes(snapshot_id, player.name, direction, outfit),
     });
 
     let mut burst = Vec::new();
@@ -92,6 +165,7 @@ pub async fn handle_game<S>(
     mut stream: S,
     rsa: &RsaPrivateKey,
     world: &WorldHandle,
+    store: &Store,
     challenge_timestamp: u32,
     challenge_random: u8,
 ) -> Result<()>
@@ -131,18 +205,37 @@ where
         send_encrypted(&mut stream, &keys, &enter_world::extended_opcode_init()).await?;
     }
 
-    // 5. "Player load": register in the world with this session's push channel.
+    // 5. "Player load": resolve saved state (if any), build InitialState, register
+    // in the world with this session's push channel.
     let name = String::from_utf8_lossy(&req.character_name).to_string();
+    let save = store.load_player(&name).await.ok().flatten();
+    let initial = match &save {
+        Some(ps) => player_save_to_initial(ps),
+        None => InitialState {
+            position: None,
+            direction: Direction::South,
+            outfit: knight_outfit(),
+            health: 150,
+            max_health: 150,
+        },
+    };
     let (push_tx, push_rx) = world::game::push_channel();
-    let Some(ack) = world.login(name.clone(), knight_outfit(), push_tx).await else {
+    let Some(ack) = world.login(name.clone(), initial, push_tx).await else {
         return send_disconnect(&mut stream, &keys, "Your character could not be loaded.").await;
     };
     let snapshot = ack.snapshot;
 
     // 6. Build + send the enter-world burst as one encrypted frame.
     let center = Center { x: snapshot.position.x, y: snapshot.position.y, z: snapshot.position.z };
-    let burst = build_enter_world_burst(
-        snapshot.id, center, snapshot.direction.to_byte(), name.as_bytes(), &ack.others, world.map.as_ref());
+    let player_info = EnterWorldPlayer {
+        id: snapshot.id,
+        name: name.as_bytes(),
+        direction: snapshot.direction.to_byte(),
+        outfit: snapshot.outfit,
+        health: snapshot.health,
+        max_health: snapshot.max_health,
+    };
+    let burst = build_enter_world_burst(&player_info, center, &ack.others, world.map.as_ref());
     send_encrypted(&mut stream, &keys, &burst).await?;
     tracing::info!(character = %name, id = snapshot.id, ?center, "player entered game");
 
@@ -377,12 +470,16 @@ mod tests {
             towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
             waypoints: vec![],
         };
-        world::game::spawn(Arc::new(StaticMap::from_formats(&map, &items)))
+        let (handle, _save_rx) = world::game::spawn(Arc::new(StaticMap::from_formats(&map, &items)));
+        handle
     }
 
     #[tokio::test]
     async fn handshake_emits_burst_in_order() {
         let world = test_world();
+        // Use an empty in-memory store: the character name won't have a saved row,
+        // so load_player returns None and the new-player spawn path is taken.
+        let store = persistence::Store::open_in_memory().await.unwrap();
         let ts = 0x1234_5678;
         let rnd = 0x42;
 
@@ -390,9 +487,10 @@ mod tests {
 
         let server_task = {
             let world = world.clone();
+            let store = store.clone();
             tokio::spawn(async move {
                 let rsa = RsaPrivateKey::open_tibia();
-                handle_game(server, &rsa, &world, ts, rnd).await.unwrap();
+                handle_game(server, &rsa, &world, &store, ts, rnd).await.unwrap();
             })
         };
 
@@ -552,5 +650,92 @@ mod tests {
         .await;
         assert!(res.is_ok(), "reader_loop must return on 0x14 without waiting for EOF");
         res.unwrap().unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // M8: mapping function tests — PlayerSave <-> world types
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn player_save_maps_to_initial_state_correctly() {
+        // RED: player_save_to_initial maps every field from a PlayerSave into an
+        // InitialState: position, direction, outfit, health/max_health.
+        use persistence::PlayerSave;
+        let save = PlayerSave {
+            name: "Test Knight".into(),
+            pos_x: 200,
+            pos_y: 300,
+            pos_z: 8,
+            level: 5,
+            health: 77,
+            health_max: 150,
+            mana: 10,
+            mana_max: 50,
+            direction: 1, // East
+            look_type: 75,
+            look_head: 10,
+            look_body: 20,
+            look_legs: 30,
+            look_feet: 40,
+            look_addons: 1,
+            look_mount: 0,
+        };
+        let initial = player_save_to_initial(&save);
+        assert_eq!(initial.position, Some(world::Position::new(200, 300, 8)));
+        assert_eq!(initial.direction, world::Direction::East);
+        assert_eq!(initial.health, 77);
+        assert_eq!(initial.max_health, 150);
+        assert_eq!(initial.outfit.look_type, 75);
+        assert_eq!(initial.outfit.head, 10);
+        assert_eq!(initial.outfit.body, 20);
+        assert_eq!(initial.outfit.legs, 30);
+        assert_eq!(initial.outfit.feet, 40);
+        assert_eq!(initial.outfit.addons, 1);
+        assert_eq!(initial.outfit.mount, 0);
+    }
+
+    #[test]
+    fn direction_from_byte_roundtrips() {
+        // RED: direction_from_byte converts 0=N,1=E,2=S,3=W correctly.
+        assert_eq!(direction_from_byte(0), world::Direction::North);
+        assert_eq!(direction_from_byte(1), world::Direction::East);
+        assert_eq!(direction_from_byte(2), world::Direction::South);
+        assert_eq!(direction_from_byte(3), world::Direction::West);
+        // Unknown falls back to South.
+        assert_eq!(direction_from_byte(99), world::Direction::South);
+    }
+
+    #[test]
+    fn save_record_maps_to_player_save_correctly() {
+        // RED: save_record_to_player_save maps SaveRecord into PlayerSave.
+        use world::game::SaveRecord;
+        use world::Position;
+        let rec = SaveRecord {
+            name: "Hero".into(),
+            position: Position::new(100, 200, 7),
+            direction: world::Direction::West,
+            outfit: creature::Outfit { look_type: 128, head: 1, body: 2, legs: 3, feet: 4, addons: 0, mount: 5 },
+            health: 80,
+            max_health: 160,
+        };
+        let save = save_record_to_player_save(&rec);
+        assert_eq!(save.name, "Hero");
+        assert_eq!(save.pos_x, 100);
+        assert_eq!(save.pos_y, 200);
+        assert_eq!(save.pos_z, 7);
+        assert_eq!(save.direction, 3); // West = 3
+        assert_eq!(save.health, 80);
+        assert_eq!(save.health_max, 160);
+        assert_eq!(save.look_type, 128);
+        assert_eq!(save.look_head, 1);
+        assert_eq!(save.look_body, 2);
+        assert_eq!(save.look_legs, 3);
+        assert_eq!(save.look_feet, 4);
+        assert_eq!(save.look_addons, 0);
+        assert_eq!(save.look_mount, 5);
+        // Fields world doesn't track default to their M8 stubs.
+        assert_eq!(save.level, 1);
+        assert_eq!(save.mana, 0);
+        assert_eq!(save.mana_max, 0);
     }
 }
