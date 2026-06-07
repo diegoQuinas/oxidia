@@ -21,6 +21,7 @@ pub mod game_login;
 pub mod login;
 pub mod map_description;
 pub mod message;
+pub mod outfit;
 pub mod rsa;
 pub mod tile_creature;
 pub mod walk;
