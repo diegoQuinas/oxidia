@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M5 ✅ **multiplayer presence complete and accepted live** (two OTClients see each other spawn, walk, turn, and poof out on logout) → next is **M6 (chat)**. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) are now scoped as **M6.1 (stairs, walk-driven)** + **M6.2 (ladders/holes, use-driven)**; auto-walk remains deferred.
+- **Milestone:** M5 ✅ **multiplayer presence complete and accepted live** (two OTClients see each other spawn, walk, turn, and poof out on logout) → next is **M6 (chat)**. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) are scoped as **M6.1 (stairs, walk-driven)** + **M6.2 (ladders/holes, use-driven)**; **M6.1 is code-complete (live acceptance pending)** on branch `m6.1-stairs`; auto-walk remains deferred.
 - **Build:** `cargo build` clean, `cargo test` green (112 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -33,7 +33,7 @@ performance-critical or stable stays native Rust.
 | M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | ✅ done |
 | M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ✅ done |
 | M6 | Chat: say / whisper / yell + default channel | ⬜ |
-| M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ⬜ |
+| M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ✅ code / live pending |
 | M6.2 | Ladders & holes (use-driven): minimal `useItem 0x82` handler, floor-change-up on use, down-holes; reuses the M6.1 vertical engine | ⬜ |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
@@ -158,7 +158,37 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m5-presence-design.md`, `docs/
 
 **Stackpos invariant (critical, found in final holistic review):** `0x6A`/`0x6C` are position+stackpos packets (no id-form for *add*), while `0x6D`/`0x6B` use the id-form. `StaticMap::creature_stackpos` is a *static* per-tile value, so two creatures on one tile would collide on add/remove → desync. Fix: keep **≤1 creature per tile** — `do_move` rejects a creature-occupied destination (collision) and `login` uses `free_spawn()` (nearest free tile when the temple is taken). Under that invariant the static stackpos is always correct. Co-occupancy has no path in M5 (logins serialize through the single actor; movement is blocked both ways; no teleport/summon).
 
-**Deferred (YAGNI):** quadtree/sectored-grid spectators; known-set eviction cap (1300); multi-floor spectator band (±2 underground); `0x6A`/`0x6C` stackpos≥10 id-form; proactive socket close on backpressure kick.
+**Deferred (YAGNI):** quadtree/sectored-grid spectators; known-set eviction cap (1300); multi-floor spectator band (±2 underground) — **now done in M6.1**; `0x6A`/`0x6C` stackpos≥10 id-form; proactive socket close on backpressure kick.
+
+## M6.1 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-06-m6.1-stairs-design.md`,
+`docs/superpowers/plans/2026-06-06-m6.1-stairs.md`. Scope: **walk-driven vertical
+movement** — stairs up/down, underground (z≥8), multi-floor presence. Built in an
+isolated worktree (`m6.1-stairs` branch) via subagent-driven TDD. Two TFS-verified
+mechanics: **height slopes** (`game.cpp:792-820`, `hasHeight(3)` from the `.otb`)
+and **`floorChange` staircase tiles** (`tile.cpp::queryDestination`, direction from
+`items.xml`).
+
+1. ✅ `formats::items_xml` — `FloorChange` bitmask + `ItemType.has_height`/`floor_change`; `FLAG_HAS_HEIGHT` (bit 3) from the `.otb`.
+2. ✅ `formats::items_xml` — complete `items.xml` loader (`roxmltree`), `floorChange` string→flags, `fromid/toid` ranges, `merge_items_xml` into `ItemType`. Real-file parse tested.
+3. ✅ `world::map` — per-tile `floor_change`/`tile_height` precomputed at load; `resolve_floor_change` (faithful `queryDestination` port — verified line-by-line) + `triggers_up`.
+4. ✅ `protocol::map_description` — `get_map_description` refactored into per-floor `floor_description` (shared `skip`) + the underground `z-2..=z+2` band (`floor_range`). Overground stays byte-identical.
+5. ✅ `protocol::walk` — `0xBE` move-up / `0xBF` move-down (faithful `MoveUpCreature`/`MoveDownCreature` ports, byte-verified) + z-aware `walk_update` (id-form remove at the 7→8 boundary).
+6. ✅ `world::game` — vertical `do_move`: height mechanic A then floorChange mechanic B; stair/height landings reached with TFS `FLAG_NOLIMIT` semantics (block-solid on the landing is ignored; the ≤1-creature-per-tile invariant kept).
+7. ✅ `world::game` — multi-floor presence: `can_see` ±2 band **with the per-floor `offsetz` x/y projection** (matches the encoder), plus a remove+add at the 7→8 boundary for other-creature broadcasts (TFS `sendMoveCreature` 2633-2649).
+8. ✅ `server::main` — load + `merge_items_xml` at boot; the live world has real floor-change data.
+
+Gate: `cargo test` **129 green**, `cargo clippy --all-targets -- -D warnings` clean, `#![forbid(unsafe_code)]` intact.
+
+**Final holistic review** caught two integration gaps the per-task reviews missed (both fixed): `can_see` lacked the floor `offsetz` (cross-floor spectator desync), and the spectator broadcast lacked the 7→8 remove+add. Solo mechanics + the mover's own camera were verified TFS-faithful throughout.
+
+**Live acceptance — PENDING (manual gate):** real OTClient descends the Thais
+temple staircase into the underground and climbs back, rendering correctly; a
+second client one floor away sees the crossing — no desync. Flip M6.1 to ✅ once
+this passes. **Known untested-in-prod:** full underground map description
+(`encode` with z>7) has no live path yet (login always spawns at z=7); it's
+unit-tested but not exercised until relog/teleport-underground exists.
 
 ## Protocol gotchas (M5 presence)
 
