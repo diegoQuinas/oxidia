@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M5 (multiplayer presence) **code-complete — live acceptance pending** (run two OTClients). M4 ✅ core walk accepted live. Floor changes / underground (z≥8) and auto-walk remain deferred.
+- **Milestone:** M5 ✅ **multiplayer presence complete and accepted live** (two OTClients see each other spawn, walk, turn, and poof out on logout) → next is **M6 (chat)**. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) and auto-walk remain deferred.
 - **Build:** `cargo build` clean, `cargo test` green (112 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -31,7 +31,7 @@ performance-critical or stable stays native Rust.
 | M3 | Enter game: game handshake (challenge), player load, initial packet sequence, render map | ✅ done |
 | **A** | **Living World → pre-alpha #1** | |
 | M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | ✅ done |
-| M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | 🚧 code-complete, live pending |
+| M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ✅ done |
 | M6 | Chat: say / whisper / yell + default channel | ⬜ |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
@@ -152,7 +152,7 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m5-presence-design.md`, `docs/
 1. ✅ `protocol::tile_creature` — `add_tile_creature 0x6A` (`[0x6A][pos][stackpos][creature thing]`) and `remove_tile_thing 0x6C` (`[0x6C][pos][stackpos]`), byte-faithful round-trip tests.
 2. ✅ `world::game` rewritten to **unified push**: the actor is the single builder of all outbound packets. `PlayerState` gains `outfit`, `push_tx: mpsc::Sender<Vec<u8>>`, `known: HashSet<u32>`. `Command` drops the Move/Turn reply channels and gains `Logout`; `Login` returns `LoginAck { snapshot, others }`. Spectators = iterate-all behind `spectators(pos, exclude)` (swappable to a quadtree later). `introduce()` owns the 0x61-full/0x62-short decision via the known-set. `push()` is non-blocking (`try_send` + reap) so the loop never stalls on a slow client.
 3. ✅ `server::game_service` — per-session push pipeline: `handle_game` takes the stream **by value** (`Send + 'static`), splits it, **spawns a writer task** that greedily coalesces queued plaintext payloads into one XTEA frame and pings; a plain **reader loop** decodes inbound walk/turn into fire-and-forget commands. Reader/writer race via `select!` so a dead writer can't strand a blocked reader. (A single `select!` over `read_frame` + the channel was rejected as a cancel-safety bug.)
-4. 🚧 **Live acceptance pending** — two OTClients: each sees the other spawn, walk, turn, and vanish on logout; no desync.
+4. ✅ **Accepted live** — two OTClients: each sees the other spawn (teleport puff), walk, turn, and poof out on logout; no desync. Spectators get the teleport effect on both login and logout (the logout puff is a deliberate polish over TFS, which removes silently).
 
 **Stackpos invariant (critical, found in final holistic review):** `0x6A`/`0x6C` are position+stackpos packets (no id-form for *add*), while `0x6D`/`0x6B` use the id-form. `StaticMap::creature_stackpos` is a *static* per-tile value, so two creatures on one tile would collide on add/remove → desync. Fix: keep **≤1 creature per tile** — `do_move` rejects a creature-occupied destination (collision) and `login` uses `free_spawn()` (nearest free tile when the temple is taken). Under that invariant the static stackpos is always correct. Co-occupancy has no path in M5 (logins serialize through the single actor; movement is blocked both ways; no teleport/summon).
 
