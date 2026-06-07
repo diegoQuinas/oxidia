@@ -51,6 +51,7 @@ fn player_save_to_initial(save: &PlayerSave) -> InitialState {
         sex: save.sex,
         health: save.health,
         max_health: save.health_max,
+        gamemaster: false,
     }
 }
 
@@ -226,8 +227,11 @@ where
             sex: 1, // new character defaults to male, matching the default look_type 128
             health: 150,
             max_health: 150,
+            gamemaster: false,
         },
     };
+    let mut initial = initial;
+    initial.gamemaster = req.gamemaster;
     let (push_tx, push_rx) = world::game::push_channel();
     let Some(ack) = world.login(name.clone(), initial, push_tx).await else {
         return send_disconnect(&mut stream, &keys, "Your character could not be loaded.").await;
@@ -376,6 +380,20 @@ where
             if opcode == outfit_packets::OP_SET_OUTFIT {
                 if let Some(outfit) = outfit_packets::parse_set_outfit(&payload[1..]) {
                     world.change_outfit(id, outfit).await;
+                }
+                continue;
+            }
+            // 0x8C — client look-at (parseLookAt). Body: [pos][spriteId u16][stackpos u8].
+            if opcode == 0x8C {
+                if let Some((x, y, z, stackpos)) = protocol::look::parse_look(&payload[1..]) {
+                    world.look(id, x, y, z, stackpos).await;
+                }
+                continue;
+            }
+            // 0x8D — client look-in-battle-list. Body: [creatureId u32].
+            if opcode == 0x8D {
+                if let Some(target_id) = protocol::look::parse_look_battle(&payload[1..]) {
+                    world.look_battle(id, target_id).await;
                 }
                 continue;
             }

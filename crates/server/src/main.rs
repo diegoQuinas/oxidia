@@ -82,11 +82,13 @@ async fn main() -> Result<()> {
     })?;
     let map = formats::otbm::parse(&map_bytes)
         .with_context(|| format!("parsing map file '{map_path}'"))?;
-    let static_map = std::sync::Arc::new(world::map::StaticMap::from_formats_with_spawn(
+    let mut static_map = world::map::StaticMap::from_formats_with_spawn(
         &map,
         &items,
         cfg.world.spawn_town.as_deref(),
-    ));
+    );
+    static_map.load_item_metadata(&items, &items_xml);
+    let static_map = std::sync::Arc::new(static_map);
     let (world_handle, mut save_rx) = world::game::spawn(static_map);
     info!(spawn = ?world_handle.map.spawn(), "world loaded");
 
