@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use formats::items_xml::FloorChange;
 use formats::otb::ItemsOtb;
 use formats::otbm::OtbmMap;
 use protocol::map_description::{TileSlices, TileSource, WireItem};
@@ -44,6 +45,10 @@ fn wire_item(it: &formats::otb::ItemType) -> WireItem {
 pub struct StaticMap {
     tiles: HashMap<(u16, u16, u8), TileStack>,
     blocked: HashSet<(u16, u16, u8)>,
+    /// Per-tile floor-change flags (union of the tile's items), for stairs.
+    floor_change: HashMap<(u16, u16, u8), FloorChange>,
+    /// Per-tile cumulative item height (count of `has_height` items).
+    tile_height: HashMap<(u16, u16, u8), u8>,
     spawn: Position,
 }
 
@@ -57,6 +62,8 @@ impl StaticMap {
 
         let mut tiles = HashMap::new();
         let mut blocked = HashSet::new();
+        let mut floor_change = HashMap::new();
+        let mut tile_height = HashMap::new();
         for tile in &map.tiles {
             let mut ground: Option<WireItem> = None;
             let mut top: Vec<(u8, WireItem)> = Vec::new(); // (top_order, item)
@@ -90,6 +97,26 @@ impl StaticMap {
             if solid {
                 blocked.insert((tile.x, tile.y, tile.z));
             }
+
+            // Vertical metadata: union of floor-change flags + summed item heights.
+            let mut fc = FloorChange::NONE;
+            let mut height: u8 = 0;
+            for mi in &tile.items {
+                if let Some(it) = by_id.get(&mi.id) {
+                    if !it.floor_change.is_empty() {
+                        fc.insert(it.floor_change);
+                    }
+                    if it.has_height {
+                        height = height.saturating_add(1);
+                    }
+                }
+            }
+            if !fc.is_empty() {
+                floor_change.insert((tile.x, tile.y, tile.z), fc);
+            }
+            if height > 0 {
+                tile_height.insert((tile.x, tile.y, tile.z), height);
+            }
         }
 
         let spawn = map
@@ -98,7 +125,7 @@ impl StaticMap {
             .map(|t| Position::new(t.x, t.y, t.z))
             .unwrap_or(FALLBACK_SPAWN);
 
-        Self { tiles, blocked, spawn }
+        Self { tiles, blocked, floor_change, tile_height, spawn }
     }
 
     pub fn spawn(&self) -> Position {
@@ -111,6 +138,63 @@ impl StaticMap {
             && !self.blocked.contains(&(pos.x, pos.y, pos.z))
     }
 
+    /// Floor-change flags on a tile (NONE if absent / out of range).
+    pub fn floor_change_at(&self, x: i32, y: i32, z: i32) -> FloorChange {
+        Self::key(x, y, z)
+            .and_then(|k| self.floor_change.get(&k).copied())
+            .unwrap_or(FloorChange::NONE)
+    }
+
+    /// Cumulative item height on a tile (0 if none).
+    pub fn tile_height(&self, pos: Position) -> u8 {
+        self.tile_height.get(&(pos.x, pos.y, pos.z)).copied().unwrap_or(0)
+    }
+
+    /// TFS `Tile::hasHeight(3)`: does this tile raise enough to step up onto?
+    pub fn triggers_up(&self, pos: Position) -> bool {
+        self.tile_height(pos) >= 3
+    }
+
+    /// Port of TFS `Tile::queryDestination` (`tile.cpp:732-811`). Given a tile
+    /// carrying floor-change flags, compute the landing position one floor down
+    /// (DOWN) or up (plain directional). `None` for a non-stair tile or when the
+    /// coordinates leave range.
+    pub fn resolve_floor_change(&self, from: Position) -> Option<Position> {
+        let fc = self.floor_change_at(i32::from(from.x), i32::from(from.y), i32::from(from.z));
+        if fc.is_empty() {
+            return None;
+        }
+        let (mut dx, mut dy) = (i32::from(from.x), i32::from(from.y));
+
+        if fc.contains(FloorChange::DOWN) {
+            let dz = i32::from(from.z) + 1;
+            // Adjacent-alt lookups first (two-tile-wide stairs).
+            if self.floor_change_at(dx, dy - 1, dz).contains(FloorChange::SOUTH_ALT) {
+                dy -= 2;
+            } else if self.floor_change_at(dx - 1, dy, dz).contains(FloorChange::EAST_ALT) {
+                dx -= 2;
+            } else {
+                let down = self.floor_change_at(dx, dy, dz);
+                if down.contains(FloorChange::NORTH) { dy += 1; }
+                if down.contains(FloorChange::SOUTH) { dy -= 1; }
+                if down.contains(FloorChange::SOUTH_ALT) { dy -= 2; }
+                if down.contains(FloorChange::EAST) { dx -= 1; }
+                if down.contains(FloorChange::EAST_ALT) { dx -= 2; }
+                if down.contains(FloorChange::WEST) { dx += 1; }
+            }
+            return to_position(dx, dy, dz);
+        }
+
+        // Plain directional (no DOWN) -> ascend one floor.
+        let dz = i32::from(from.z) - 1;
+        if fc.contains(FloorChange::NORTH) { dy -= 1; }
+        if fc.contains(FloorChange::SOUTH) { dy += 1; }
+        if fc.contains(FloorChange::EAST) { dx += 1; }
+        if fc.contains(FloorChange::WEST) { dx -= 1; }
+        if fc.contains(FloorChange::SOUTH_ALT) { dy += 2; }
+        if fc.contains(FloorChange::EAST_ALT) { dx += 2; }
+        to_position(dx, dy, dz)
+    }
 }
 
 impl StaticMap {
@@ -140,6 +224,19 @@ impl TileSource for StaticMap {
         Self::key(x, y, z)
             .and_then(|k| self.tiles.get(&k))
             .map_or(1, |st| st.pre_creature_len as u8)
+    }
+}
+
+/// Clamp an `(i32, i32, i32)` world coordinate into a `Position`, or `None` if it
+/// leaves the valid range.
+fn to_position(x: i32, y: i32, z: i32) -> Option<Position> {
+    if (0..=i32::from(u16::MAX)).contains(&x)
+        && (0..=i32::from(u16::MAX)).contains(&y)
+        && (0..=i32::from(u8::MAX)).contains(&z)
+    {
+        Some(Position::new(x as u16, y as u16, z as u8))
+    } else {
+        None
     }
 }
 
@@ -326,5 +423,65 @@ mod tests {
         assert_eq!(cids(slices.pre_creature), vec![5000, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
         assert!(slices.post_creature.is_empty());
         assert_eq!(sm.creature_stackpos(95, 117, 7), 10);
+    }
+
+    #[test]
+    fn floor_change_down_resolves_one_floor_below() {
+        use formats::items_xml::FloorChange;
+        // server 100 = ground; server 300 = a floorchange-down stair item.
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                ItemType { group: 5, flags: 0, server_id: 300, client_id: 2, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::DOWN },
+            ],
+        };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 300, contents: vec![] }] },
+                MapTile { x: 100, y: 100, z: 8, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, contents: vec![] }] },
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        let sm = StaticMap::from_formats(&map, &items);
+        assert_eq!(sm.floor_change_at(100, 100, 7), FloorChange::DOWN);
+        assert_eq!(
+            sm.resolve_floor_change(Position::new(100, 100, 7)),
+            Some(Position::new(100, 100, 8))
+        );
+        assert_eq!(sm.resolve_floor_change(Position::new(100, 100, 8)), None);
+    }
+
+    #[test]
+    fn triggers_up_needs_height_three() {
+        use formats::items_xml::FloorChange;
+        let h = |sid| ItemType { group: 5, flags: 1 << 3, server_id: sid, client_id: sid, always_on_top: false, top_order: 0, has_height: true, floor_change: FloorChange::NONE };
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                h(301), h(302), h(303),
+            ],
+        };
+        let tile = |x, ids: Vec<u16>| MapTile { x, y: 100, z: 7, flags: 0, house_id: None,
+            items: ids.into_iter().map(|id| MapItem { id, contents: vec![] }).collect() };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                tile(100, vec![100, 301, 302]),       // height 2 -> no
+                tile(101, vec![100, 301, 302, 303]),  // height 3 -> yes
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        let sm = StaticMap::from_formats(&map, &items);
+        assert!(!sm.triggers_up(Position::new(100, 100, 7)), "height 2 does not trigger");
+        assert!(sm.triggers_up(Position::new(101, 100, 7)), "height 3 triggers");
     }
 }
