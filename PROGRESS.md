@@ -8,8 +8,8 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M5 ✅ **multiplayer presence complete and accepted live** (two OTClients see each other spawn, walk, turn, and poof out on logout) → next is **M6 (chat)**. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) and auto-walk remain deferred.
-- **Build:** `cargo build` clean, `cargo test` green (112 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
+- **Milestone:** M6 (chat) **code-complete — live acceptance pending** (two OTClients: say/whisper/yell). M5 ✅ multiplayer presence accepted live. M4 ✅ core walk accepted live. Floor changes / underground (z≥8) and auto-walk remain deferred.
+- **Build:** `cargo build` clean, `cargo test` green (121 tests across the workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
 - **Accepted (M2):** `cargo run -p formats --example mapinfo` parses the real `items.otb` (v3.57, 26 282 items) and `forgotten.otbm` (2048×2048, 340 594 tiles, 429 031 items, 5 towns) — full tree walk, no unknown nodes/attrs.
@@ -32,7 +32,7 @@ performance-critical or stable stays native Rust.
 | **A** | **Living World → pre-alpha #1** | |
 | M4 | Walk (core): visible creature, directional + diagonal walk, map slices, collision, turn (floor changes & auto-walk deferred) | ✅ done |
 | M5 | Multiplayer presence: spectator / known-creatures system, broadcast movement | ✅ done |
-| M6 | Chat: say / whisper / yell + default channel | ⬜ |
+| M6 | Chat: say / whisper / yell + default channel | 🚧 code-complete, live pending |
 | M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ⬜ |
 | M8 | Persistence + accounts: per-friend characters, saved position/stats | ⬜ |
 | **B** | **Items & Inventory** | |
@@ -157,6 +157,27 @@ Design + plan: `docs/superpowers/specs/2026-06-06-m5-presence-design.md`, `docs/
 **Stackpos invariant (critical, found in final holistic review):** `0x6A`/`0x6C` are position+stackpos packets (no id-form for *add*), while `0x6D`/`0x6B` use the id-form. `StaticMap::creature_stackpos` is a *static* per-tile value, so two creatures on one tile would collide on add/remove → desync. Fix: keep **≤1 creature per tile** — `do_move` rejects a creature-occupied destination (collision) and `login` uses `free_spawn()` (nearest free tile when the temple is taken). Under that invariant the static stackpos is always correct. Co-occupancy has no path in M5 (logins serialize through the single actor; movement is blocked both ways; no teleport/summon).
 
 **Deferred (YAGNI):** quadtree/sectored-grid spectators; known-set eviction cap (1300); multi-floor spectator band (±2 underground); `0x6A`/`0x6C` stackpos≥10 id-form; proactive socket close on backpressure kick.
+
+## M6 plan
+
+Design + plan: `docs/superpowers/specs/2026-06-06-m6-chat-design.md`, `docs/superpowers/plans/2026-06-06-m6-chat.md`. Scope: **TFS-faithful local chat** — say/whisper/yell, position-based. The roadmap's "default channel" = local positional speech (OTClient Local Chat tab); NO joinable-channel system. Cheap because it reuses the M5 spectator + push machinery.
+
+1. ✅ `protocol::chat` — `parse_say(body) -> Option<(SpeakType, String)>` (inbound `0x96` = `[type u8][msg str]`; rejects unsupported types / empty / malformed) and `creature_say` (outbound `0xAA` = `[stmt u32][name str][level u16][type u8][x u16][y u16][z u8][msg str]`). `SpeakType { Say=1, Whisper=2, Yell=3 }`.
+2. ✅ `world::game` — `Command::Say` + `do_say`. The actor (single packet builder) reads the speaker's current pos+name, allocates a statement id, and broadcasts `0xAA`. `spectators` generalized to `spectators_in_range(pos, exclude, rx, ry)`. Ranges: say ±8/±6, yell ±18/±14 + UPPERCASE, whisper ±8/±6 with full text to Chebyshev ≤1 and `"pspsps"` to in-view-but-far. Speaker always hears own (pushed explicitly, since `spectators` excludes self).
+3. ✅ `server::game_service` — `reader_loop` intercepts `0x96` before the walk/turn dispatch, `chat::parse_say(&payload[1..])` → `world.say(...)`; unsupported/malformed dropped.
+4. 🚧 **Live acceptance pending** — two OTClients: say heard nearby (not when far); whisper full only to the adjacent client (far-in-view sees `pspsps`); yell heard far away in UPPERCASE.
+
+**Key seam (confirmed clean in final holistic review):** chat depends on **no** M5 presence state. `0xAA` carries the speaker NAME (string) + POSITION, not a creature id — so a yell reaching a player who never had the speaker introduced (off their viewport, not in their known-set) still renders. `do_say` only READS positions; it never touches stackpos, the known-set, or the ≤1-creature-per-tile invariant.
+
+**Deferred (YAGNI):** joinable channels (`0x97`/`0x98`/`0xAB`/`0xAC`); private messages (`TALKTYPE_PRIVATE_*`); yell cooldown + anti-spam; multi-floor yell; real speaker level (sent as `1` until M14); NPC/monster speech (M12). Over-255 messages are truncated (TFS drops them) — a deliberate, documented divergence.
+
+## Protocol gotchas (M6 chat)
+
+- **Inbound `0x96` body for say/whisper/yell is just `[type u8][msg str]`** (`parseSay`, protocolgame.cpp:922). Private (5/16) carries a receiver-name string and channel (7/14) a `channelId u16` BEFORE the message — M6 rejects those in `parse_say`.
+- **Outbound `0xAA` is name+position based, not creature-id based** (`sendCreatureSay`, protocolgame.cpp:2199). It does not depend on the client knowing the creature, so far yells and off-screen speech render fine.
+- **`sendToChannel` is the same `0xAA` but with a `channelId u16` instead of the position** — that's the joinable-channel path, deferred.
+- **Ranges (game.cpp):** say/whisper query = client viewport ±8/±6; whisper full text only within Chebyshev 1 (3×3), else literal `"pspsps"` (same WHISPER type); yell = ±18/±14 (TFS multifloor; we are same-floor) and text uppercased.
+- **One statement id per utterance**, shared by all recipients (TFS `lastStatementId`); ours is a `u32` `wrapping_add` counter starting at 1.
 
 ## Protocol gotchas (M5 presence)
 
