@@ -75,6 +75,11 @@ pub struct PlayerSnapshot {
 pub struct LoginAck {
     pub snapshot: PlayerSnapshot,
     pub others: Vec<PlacedCreature>,
+    /// Pre-encoded enter-world map slice, built from the MERGED view (static map
+    /// plus the dynamic overlay) so a returning player sees items dropped on the
+    /// ground by others. The server layer splices these bytes verbatim into the
+    /// burst instead of re-encoding from the pristine `StaticMap`.
+    pub map_description: Vec<u8>,
 }
 
 /// Initial state supplied to `Game::login`. When a `PlayerSave` exists for the
@@ -476,6 +481,42 @@ impl Game {
             }
         }
 
+        // Build the enter-world map slice from the MERGED view (static + dynamic
+        // overlay) so a returning player sees items dropped on the ground while
+        // they were away — not the pristine OTBM tile. Online spectators already
+        // get the overlay via `merged()`; previously the login burst was encoded
+        // from the raw `StaticMap` in the server layer, leaving the relogging
+        // player blind to dynamic ground items.
+        //
+        // Self is rendered in full (unknown) form WITHOUT touching its known-set,
+        // identical to the legacy server-layer path. Routing self through
+        // `introduce(id, id)` here would mark self as known and desync the next
+        // teleport's full-form rebuild, which relies on self being unknown.
+        let self_name = self.players.get(&id).map(|p| p.name.clone()).unwrap_or_default();
+        let mut placed = others.clone();
+        let self_view = CreatureView {
+            id,
+            name: self_name.as_bytes(),
+            health_percent: 100,
+            direction: direction.to_byte(),
+            outfit,
+            light_level: 0,
+            light_color: 0,
+            speed: 220,
+        };
+        placed.push(PlacedCreature {
+            x: position.x, y: position.y, z: position.z,
+            bytes: creature::add_creature(&self_view, false, 0),
+        });
+        let map_description = {
+            let merged = self.merged();
+            protocol::map_description::encode(
+                protocol::map_description::Center { x: position.x, y: position.y, z: position.z },
+                &merged,
+                &placed,
+            )
+        };
+
         LoginAck {
             snapshot: PlayerSnapshot {
                 id, position, direction, outfit,
@@ -483,6 +524,7 @@ impl Game {
                 max_health: initial.max_health,
             },
             others,
+            map_description,
         }
     }
 
@@ -2689,6 +2731,42 @@ mod tests {
         let (tx_b, _rx_b) = push_channel();
         let ack_b = world.login("B".into(), default_initial(knight()), tx_b).await.unwrap();
         assert_eq!(ack_b.others.len(), 1, "B's enter-world includes A");
+    }
+
+    #[test]
+    fn relogin_map_description_includes_dynamic_ground_items() {
+        // Regression: a player logging in must see items dropped on the ground
+        // (the dynamic overlay), not the pristine OTBM tile. The enter-world map
+        // slice is encoded from the MERGED view inside `Game::login`; before the
+        // fix it was encoded from the raw `StaticMap` in the server layer, so the
+        // relogging client was blind to dynamic ground items while online
+        // spectators (fed by `merged()`) still saw them.
+        let mut g = Game::new(walk_map());
+        let drop_pos = Position::new(96, 117, 7); // adjacent to spawn, in viewport
+        // A client id absent from the static encoding (ground 4526, wall 1059) so
+        // its presence proves the dynamic item — not a coincidence — leaked in.
+        const DROP_CID: u16 = 0x7777;
+
+        // Baseline: a login BEFORE any drop must NOT carry the item.
+        let (tx0, _rx0) = mpsc::channel(super::PUSH_CAPACITY);
+        let initial0 = InitialState { position: Some(Position::new(95, 117, 7)), ..default_initial(knight()) };
+        let ack0 = g.login("Before".into(), initial0, tx0);
+        assert!(
+            !ack0.map_description.windows(2).any(|w| w == DROP_CID.to_le_bytes()),
+            "baseline login must not contain an item that was never dropped"
+        );
+
+        // Drop a non-stackable item on the ground next to spawn.
+        let _ = g.add_to_ground_front(drop_pos, 999, DROP_CID, 1, false, false);
+
+        // A fresh login near the same spot must now carry the dropped item.
+        let (tx1, _rx1) = mpsc::channel(super::PUSH_CAPACITY);
+        let initial1 = InitialState { position: Some(Position::new(95, 117, 7)), ..default_initial(knight()) };
+        let ack1 = g.login("After".into(), initial1, tx1);
+        assert!(
+            ack1.map_description.windows(2).any(|w| w == DROP_CID.to_le_bytes()),
+            "relogin map slice must include the dynamic ground item"
+        );
     }
 
     #[tokio::test]

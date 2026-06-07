@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use persistence::{PlayerSave, Store};
-use protocol::map_description::{self, Center, PlacedCreature};
+use protocol::map_description::Center;
 use protocol::rsa::RsaPrivateKey;
 use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, outfit as outfit_packets, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -89,26 +89,9 @@ pub fn save_record_to_player_save(rec: &SaveRecord) -> PlayerSave {
 }
 
 /// Serialize the player as an (unknown) creature thing for the initial 0x64.
-fn player_creature_bytes(id: u32, name: &[u8], direction: u8, outfit: creature::Outfit) -> Vec<u8> {
-    let view = creature::CreatureView {
-        id,
-        name,
-        health_percent: 100,
-        direction,
-        outfit,
-        light_level: 0,
-        light_color: 0,
-        speed: 220,
-    };
-    creature::add_creature(&view, false, 0)
-}
-
 /// Player-specific data needed to build the enter-world burst.
 pub struct EnterWorldPlayer<'a> {
     pub id: u32,
-    pub name: &'a [u8],
-    pub direction: u8,
-    pub outfit: creature::Outfit,
     pub health: u16,
     pub max_health: u16,
     /// Equipped items to render in the paperdoll: `(slot, server_id, count)`.
@@ -119,12 +102,10 @@ pub struct EnterWorldPlayer<'a> {
 pub fn build_enter_world_burst(
     player: &EnterWorldPlayer<'_>,
     center: Center,
-    others: &[PlacedCreature],
+    map_description: &[u8],
     map: &StaticMap,
 ) -> Vec<u8> {
     let snapshot_id = player.id;
-    let direction = player.direction;
-    let outfit = player.outfit;
     let health = player.health;
     let max_health = player.max_health;
     let stats = enter_world::Stats {
@@ -143,19 +124,13 @@ pub fn build_enter_world_burst(
         base_speed: 220,
     };
 
-    let mut placed: Vec<PlacedCreature> = others.to_vec();
-    placed.push(PlacedCreature {
-        x: center.x,
-        y: center.y,
-        z: center.z,
-        bytes: player_creature_bytes(snapshot_id, player.name, direction, outfit),
-    });
-
     let mut burst = Vec::new();
     burst.extend(enter_world::self_info(snapshot_id));
     burst.extend(enter_world::pending_state());
     burst.extend(enter_world::enter_world());
-    burst.extend(map_description::encode(center, map, &placed));
+    // Map slice is pre-encoded by the world actor from the merged (static +
+    // dynamic) view — see `Game::login`. Splice it verbatim.
+    burst.extend_from_slice(map_description);
     burst.extend(enter_world::magic_effect(
         center.x,
         center.y,
@@ -280,14 +255,11 @@ where
     let center = Center { x: snapshot.position.x, y: snapshot.position.y, z: snapshot.position.z };
     let player_info = EnterWorldPlayer {
         id: snapshot.id,
-        name: name.as_bytes(),
-        direction: snapshot.direction.to_byte(),
-        outfit: snapshot.outfit,
         health: snapshot.health,
         max_health: snapshot.max_health,
         inventory: &login_inventory,
     };
-    let burst = build_enter_world_burst(&player_info, center, &ack.others, world.map.as_ref());
+    let burst = build_enter_world_burst(&player_info, center, &ack.map_description, world.map.as_ref());
     send_encrypted(&mut stream, &keys, &burst).await?;
     tracing::info!(character = %name, id = snapshot.id, ?center, "player entered game");
 
@@ -642,7 +614,7 @@ mod tests {
         let self_len = 29;
         assert_eq!(burst[self_len], enter_world::OP_PENDING_STATE);
         assert_eq!(burst[self_len + 1], enter_world::OP_ENTER_WORLD);
-        assert_eq!(burst[self_len + 2], map_description::OPCODE_MAP_DESCRIPTION);
+        assert_eq!(burst[self_len + 2], protocol::map_description::OPCODE_MAP_DESCRIPTION);
 
         // Send a walk-east (0x66) and expect a 0x6D creature move back.
         let mut walk_pkt = protocol::message::MessageWriter::new();
@@ -917,14 +889,12 @@ mod tests {
         let center = Center { x: 100, y: 100, z: 7 };
         let player = EnterWorldPlayer {
             id: 0x1000_0000,
-            name: b"Tester",
-            direction: Direction::South.to_byte(),
-            outfit: creature::Outfit { look_type: 128, head: 0, body: 0, legs: 0, feet: 0, addons: 0, mount: 0 },
             health: 150,
             max_health: 150,
             inventory: &[],
         };
         let burst = build_enter_world_burst(&player, center, &[], map.as_ref());
+        // (map_description is empty here; this test only asserts the PZ icon.)
         // The icons packet [0xA2, lo, hi] for ICON_PIGEON (0x4000) must be present.
         assert!(
             burst.windows(3).any(|w| w == [enter_world::OP_ICONS, 0x00, 0x40]),
