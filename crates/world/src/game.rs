@@ -69,18 +69,26 @@ impl Game {
     }
 
     /// Can a viewer at `viewer` see tile `target`? Mirrors TFS
-    /// `ProtocolGame::canSee` (`protocolgame.cpp:756`) exactly. The client renders
-    /// an 18x14 map description anchored at center-8 / center-6, so the viewport
-    /// is ASYMMETRIC — one extra column east, one extra row south (dx in -8..=9,
-    /// dy in -6..=7). Overground (z <= 7) is strictly same-floor; underground
-    /// (z >= 8) spans the `±2` floor band, and other floors project diagonally by
+    /// `ProtocolGame::canSee` (`protocolgame.cpp:734-758`) exactly. The client
+    /// renders an 18x14 map description anchored at center-8 / center-6, so the
+    /// viewport is ASYMMETRIC — one extra column east, one extra row south
+    /// (dx in -8..=9, dy in -6..=7). An OVERGROUND viewer (z <= 7) sees every
+    /// floor 7→0 (only underground z>7 is hidden); an UNDERGROUND viewer (z >= 8)
+    /// sees the `±2` floor band. Either way other floors project diagonally by
     /// `offsetz = viewer.z - target.z` (the same shift the map encoder applies via
-    /// `center_z - nz`), so the x/y window slides with the floor delta.
+    /// `center_z - nz`), so the x/y window slides with the floor delta. (The M5
+    /// "strict same-floor overground" rule was a simplification that broke
+    /// cross-floor presence on stairs — a viewer on z7 DOES see a creature climb
+    /// to z6.)
     fn can_see(viewer: Position, target: Position) -> bool {
-        let dz = i32::from(viewer.z) - i32::from(target.z);
-        let z_ok = if viewer.z <= 7 { dz == 0 } else { dz.abs() <= 2 };
-        let dx = i32::from(target.x) - i32::from(viewer.x) - dz;
-        let dy = i32::from(target.y) - i32::from(viewer.y) - dz;
+        let z_ok = if viewer.z <= 7 {
+            target.z <= 7
+        } else {
+            (i32::from(viewer.z) - i32::from(target.z)).abs() <= 2
+        };
+        let offsetz = i32::from(viewer.z) - i32::from(target.z);
+        let dx = i32::from(target.x) - i32::from(viewer.x) - offsetz;
+        let dy = i32::from(target.y) - i32::from(viewer.y) - offsetz;
         z_ok && (-VIEW_LEFT..=VIEW_RIGHT).contains(&dx) && (-VIEW_UP..=VIEW_DOWN).contains(&dy)
     }
 
@@ -675,6 +683,41 @@ mod tests {
     }
 
     #[test]
+    fn same_floor_spectator_sees_climb_as_move_not_remove() {
+        // Regression (live bug): when a creature climbs z7->z6, a spectator still
+        // on z7 must get a creature_move (0x6D) — TFS canSee lets an overground
+        // viewer see the floor above, so the creature is relocated, not left as a
+        // ghost. The old "strict same-floor" can_see sent a (failing) remove.
+        use formats::items_xml::FloorChange;
+        let h = |sid| ItemType { group: 5, flags: 1 << 3, server_id: sid, client_id: sid, always_on_top: false, top_order: 0, has_height: true, floor_change: FloorChange::NONE };
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![
+                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                h(301),
+            ],
+        };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, contents: vec![] }, MapItem { id: 301, contents: vec![] }, MapItem { id: 301, contents: vec![] }, MapItem { id: 301, contents: vec![] }] },
+                MapTile { x: 101, y: 100, z: 6, flags: 0, house_id: None, items: vec![MapItem { id: 100, contents: vec![] }] },
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        let mut g = Game::new(Arc::new(StaticMap::from_formats(&map, &items)));
+        let (mover, _rm) = add_player(&mut g, Position::new(100, 100, 7));
+        let (_spec, mut rx) = add_player(&mut g, Position::new(100, 101, 7)); // same floor, adjacent
+        g.do_move(mover, Direction::East); // climbs 7 -> 6
+        let pkt = rx.try_recv().expect("spectator should be notified of the climb");
+        assert_eq!(pkt[0], walk::OP_CREATURE_MOVE, "climb is a move, not a ghost-leaving remove");
+        assert_ne!(pkt[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
+    }
+
+    #[test]
     fn spectator_gets_remove_then_add_when_mover_crosses_to_underground() {
         // A z=8 spectator near the landing sees a mover descend 7->8: the
         // boundary must produce a clean remove (0x6C) then add (0x6A), not 0x6D.
@@ -730,16 +773,18 @@ mod tests {
     }
 
     #[test]
-    fn spectators_within_client_viewport_same_floor() {
+    fn spectators_within_client_viewport() {
         let mut g = Game::new(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(100, 100, 7));
         let (b, _rb) = add_player(&mut g, Position::new(108, 106, 7)); // edge: +8x +6y
-        let (c, _rc) = add_player(&mut g, Position::new(109, 100, 7)); // +9x out
-        let (d, _rd) = add_player(&mut g, Position::new(100, 100, 6)); // other floor
+        let (c, _rc) = add_player(&mut g, Position::new(109, 100, 7)); // 9 west of its own view: out
+        // Overground viewer one floor up: TFS lets it see floor 7 (projected),
+        // so it IS a spectator of a z7 tile (this is what makes stair presence work).
+        let (d, _rd) = add_player(&mut g, Position::new(100, 100, 6));
         let specs = g.spectators(Position::new(100, 100, 7), a);
         assert!(specs.contains(&b), "edge of viewport is visible");
-        assert!(!specs.contains(&c), "beyond +8x is not visible");
-        assert!(!specs.contains(&d), "other floor is not visible");
+        assert!(!specs.contains(&c), "beyond the viewport is not visible");
+        assert!(specs.contains(&d), "an overground viewer one floor up sees the z7 tile");
         assert!(!specs.contains(&a), "self excluded");
     }
 
@@ -927,10 +972,15 @@ mod tests {
     }
 
     #[test]
-    fn overground_visibility_unchanged() {
-        // Overground stays strictly same-floor (matches M5).
-        assert!(Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 7)));
-        assert!(!Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 6)));
+    fn overground_viewer_sees_all_upper_floors_but_not_underground() {
+        // TFS canSee: an overground viewer (z<=7) sees every floor 7→0 (so a
+        // creature on a higher floor IS visible, projected), but NOT underground.
+        assert!(Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 7)), "same floor");
+        assert!(Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 6)), "one floor up is visible");
+        // A higher floor projects by offsetz; at the same x/y it slides out of the
+        // viewport, but offset back by the projection it is visible.
+        assert!(Game::can_see(Position::new(100, 100, 7), Position::new(102, 102, 5)), "two floors up, projection-aligned, visible");
+        assert!(!Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 8)), "underground hidden from surface");
     }
 
     #[tokio::test]
