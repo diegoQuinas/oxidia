@@ -8,7 +8,7 @@ Reference spec: **TFS 1.4.2** at `reference/tfs/` (read-only — never edit, nev
 
 ## Current status
 
-- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) code-complete; underground floor-change desync fixes (teleport sloped stairs/ladders + boundary mover re-add) landed and **live-accepted**. **M7 (combat core + PvP melee) is code-complete, live acceptance pending** — branch `m7-combat`. **M8 ✅ persistence + accounts + outfit change/persist, accepted live** (load on login, save on logout; login never stacks on an occupied tile). M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
+- **Milestone:** M6 ✅ **chat complete and accepted live**. M6.1 (stairs / floor changes) code-complete; underground floor-change desync fixes (teleport sloped stairs/ladders + boundary mover re-add) landed and **live-accepted**. **M7 ✅ combat core + PvP melee** and **M7.1 ✅ combat polish** (death→logout, PZ badge, blood) — both **accepted live**. **M8 ✅ persistence + accounts + outfit change/persist, accepted live** (load on login, save on logout; login never stacks on an occupied tile). M5 ✅ presence, M4 ✅ walk. M6.2 (ladders/holes, use-driven) is **folded into M11** — it is script-driven (`teleport.lua` `onUse`), not a data milestone, so it ships on the Lua runtime. Auto-walk remains deferred.
 - **Build:** `cargo build` clean, `cargo test` green (workspace), `cargo clippy --all-targets -- -D warnings` clean.
 - **Toolchain:** Rust 1.96, edition 2024, `#![forbid(unsafe_code)]` in every crate.
 - **Accepted (M1):** real **OTClient Redemption** (protocol 1098) connects to `127.0.0.1:7171` with `test`/`test` and shows the MOTD + character list. M1 acceptance criterion fully met.
@@ -35,8 +35,8 @@ performance-critical or stable stays native Rust.
 | M6 | Chat: say / whisper / yell + default channel | ✅ done |
 | M6.1 | Floor changes & stairs (walk-driven): `items.xml` loader (`hasHeight` + `floorChange` dir), tile vertical semantics, walk up/down in `do_move`, `0xBE`/`0xBF` move-up/down, underground (z≥8) viewport + ±2 visibility band | ✅ code / live pending |
 | M6.2 | Ladders & holes (use-driven) — **deferred to M11**: the behavior is script-driven (`teleport.lua` `onUse`), not data; ladders/grates carry no `items.xml` attribute. Belongs on the Lua runtime, not hardcoded in Rust. Research: `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⏸️ → M11 |
-| M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ✅ code / live pending |
-| M7.1 | Combat polish: death→logout flow (relog at temple, save-on-death), protection-zone client badge (ICON_PIGEON), blood-hit effect fix | ✅ code / live pending |
+| M7 | Combat core + PvP melee: damage, HP sync, death, respawn, protected zones | ✅ done |
+| M7.1 | Combat polish: death→logout flow (relog at temple, save-on-death), protection-zone client badge (ICON_PIGEON), blood-hit effect fix | ✅ done |
 | M8 | Persistence + accounts: per-account characters, saved position/stats/outfit (load on login, save on logout via unbounded save channel); outfit change + persist (`0xD2` request → `0xC8` window, `0xD3` set → apply + `0x8E` broadcast); login never stacks on an occupied tile (`free_spawn_near`) | ✅ done |
 | M8.1 | PvP justice — PK skull system: white skull on first unprovoked attack (`whiteSkullTime` 15 min) + yellow skull shown relationally to the victim; unjustified kills (victim was `SKULL_NONE`, not in war) count as frags → red skull (`killsToRedSkull` 3) / black skull (`killsToBlackSkull` 6); frag decay (`timeToDecreaseFrags` 24 h, `checkSkullTicks`); skull byte in `AddCreature` + `sendCreatureSkull` update; `getSkullClient` relational coloring. Depends on M7 (kills) + M8 (persist skull state + frag timestamps). Research: TFS `const.h` `Skulls_t`, `player.cpp` (`addUnjustifiedDead`/`checkSkullTicks`), `config.lua.dist` | ⬜ |
 | **B** | **Items & Inventory** | |
@@ -230,11 +230,11 @@ fight modes / skulls / frags (M23); auto-walk follow; logout-in-fight block
 - **W3 (PZ per-tick):** `on_combat_tick` checked range but not protection zones; a victim who fled into the temple kept taking hits. Fixed: if either party is in PZ, clear `attacker.attacking` and skip — matches TFS `canTargetCreature` (combat.cpp:221-229) clearing the fight, not just suppressing damage.
 - **S1 (drawblood effect id):** `EFFECT_DRAWBLOOD = 2` was wrong; TFS `CONST_ME_DRAWBLOOD = 1`, wire = TFS − 1 = `0`. Fixed: constant corrected and moved to `enter_world.rs` next to `EFFECT_TELEPORT` for consistency.
 
-**Live acceptance — PENDING (manual gate):** two OTClient Redemption sessions:
+**Live acceptance — ✅ ACCEPTED (2026-06-07):** two OTClient Redemption sessions:
 A right-clicks B → B's HP bar drains on both screens; B's own HP digits drop;
-continued attacks kill B → B sees `0x28`, respawns at Thais temple with full
-HP; A sees B vanish + reappear; standing on a PZ tile, A cannot attack
-(status message). Flip M7 to ✅ once this passes.
+continued attacks kill B → B sees `0x28`; standing on a PZ tile, A cannot attack
+(status message). (The death→respawn flow was reworked in M7.1: death now logs
+out and the relog spawns at the temple.)
 
 ## M7.1 plan
 
@@ -268,7 +268,7 @@ Gate: `cargo test` green (225), `cargo clippy --all-targets -- -D warnings` clea
 **Deferred (confirmed with roadmap owner):** floor blood splat (`ITEM_SMALLSPLASH`
 + decay) → M9; corpse body → M13; PK skull system → M8.1.
 
-**Live acceptance — PENDING (manual gate):** die in PvP → death window → character
+**Live acceptance — ✅ ACCEPTED (2026-06-07):** die in PvP → death window → character
 select → relog spawns at the temple with full HP; standing in the temple shows the
 PZ dove badge (clears on leaving); hits draw a visible blood animation.
 
