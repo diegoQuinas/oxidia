@@ -42,6 +42,11 @@ fn wire_item(it: &formats::otb::ItemType) -> WireItem {
     WireItem { client_id: it.client_id, subtype, animated: it.is_animated() }
 }
 
+/// OTBM tile flag `PROTECTIONZONE` — bit 0 of `MapTile.flags` (iomap.h:60).
+/// TFS maps this to `TILESTATE_PROTECTIONZONE` (tile.h:33) at runtime; we keep
+/// the OTBM flag name here since we read it from the parsed `MapTile.flags`.
+const OTBM_TILEFLAG_PROTECTIONZONE: u32 = 1 << 0;
+
 pub struct StaticMap {
     tiles: HashMap<(u16, u16, u8), TileStack>,
     blocked: HashSet<(u16, u16, u8)>,
@@ -49,6 +54,9 @@ pub struct StaticMap {
     floor_change: HashMap<(u16, u16, u8), FloorChange>,
     /// Per-tile cumulative item height (count of `has_height` items).
     tile_height: HashMap<(u16, u16, u8), u8>,
+    /// Tiles whose OTBM `flags & OTBM_TILEFLAG_PROTECTIONZONE != 0` — precomputed
+    /// at load, mirroring the `blocked` and `floor_change` precompute pattern.
+    protection_zone: HashSet<(u16, u16, u8)>,
     spawn: Position,
 }
 
@@ -79,6 +87,7 @@ impl StaticMap {
         let mut blocked = HashSet::new();
         let mut floor_change = HashMap::new();
         let mut tile_height = HashMap::new();
+        let mut protection_zone = HashSet::new();
         for tile in &map.tiles {
             let mut ground: Option<WireItem> = None;
             let mut top: Vec<(u8, WireItem)> = Vec::new(); // (top_order, item)
@@ -132,6 +141,11 @@ impl StaticMap {
             if height > 0 {
                 tile_height.insert((tile.x, tile.y, tile.z), height);
             }
+
+            // Protection-zone flag from OTBM tile flags (iomap.h:60).
+            if tile.flags & OTBM_TILEFLAG_PROTECTIONZONE != 0 {
+                protection_zone.insert((tile.x, tile.y, tile.z));
+            }
         }
 
         let named = spawn_town.and_then(|name| {
@@ -146,7 +160,7 @@ impl StaticMap {
             .map(|t| Position::new(t.x, t.y, t.z))
             .unwrap_or(FALLBACK_SPAWN);
 
-        Self { tiles, blocked, floor_change, tile_height, spawn }
+        Self { tiles, blocked, floor_change, tile_height, protection_zone, spawn }
     }
 
     pub fn spawn(&self) -> Position {
@@ -179,6 +193,20 @@ impl StaticMap {
     /// Cumulative item height on a tile (0 if none).
     pub fn tile_height(&self, pos: Position) -> u8 {
         self.tile_height.get(&(pos.x, pos.y, pos.z)).copied().unwrap_or(0)
+    }
+
+    /// Returns `true` if the tile at `pos` is flagged `OTBM_TILEFLAG_PROTECTIONZONE`
+    /// (the temple/PZ tiles where combat is forbidden). Mirrors TFS
+    /// `Tile::hasFlag(TILESTATE_PROTECTIONZONE)` (`combat.cpp:294-297`).
+    pub fn is_protection_zone(&self, pos: Position) -> bool {
+        self.protection_zone.contains(&(pos.x, pos.y, pos.z))
+    }
+
+    /// Return the respawn temple for any player. M7 respawns everyone at the single
+    /// configured town temple (the `spawn` point). Per-town temple selection lands
+    /// with M8 persistence once characters carry their `townId`.
+    pub fn temple_for(&self, _pos: Position) -> Position {
+        self.spawn
     }
 
     /// TFS `Tile::hasHeight(3)`: does this tile raise enough to step up onto?
@@ -475,6 +503,43 @@ mod tests {
         assert_eq!(cids(slices.pre_creature), vec![5000, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010]);
         assert!(slices.post_creature.is_empty());
         assert_eq!(sm.creature_stackpos(95, 117, 7), 10);
+    }
+
+    #[test]
+    fn pz_flag_detected_on_flagged_tile() {
+        // OTBM tile flag PROTECTIONZONE = 1<<0 (iomap.h:60).
+        // A tile with flags & 1 == 1 must be reported as PZ; one without must not.
+        let items = ItemsOtb {
+            major_version: 3, minor_version: 57, build_number: 0,
+            items: vec![ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE }],
+        };
+        let map = OtbmMap {
+            width: 200, height: 200, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles: vec![
+                // PZ tile: flags = 1 (OTBM_TILEFLAG_PROTECTIONZONE)
+                MapTile { x: 100, y: 100, z: 7, flags: 1, house_id: None,
+                    items: vec![MapItem { id: 100, contents: vec![] }] },
+                // Non-PZ tile: flags = 0
+                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, contents: vec![] }] },
+            ],
+            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            waypoints: vec![],
+        };
+        let sm = StaticMap::from_formats(&map, &items);
+        assert!(sm.is_protection_zone(Position::new(100, 100, 7)), "PZ tile should be PZ");
+        assert!(!sm.is_protection_zone(Position::new(101, 100, 7)), "non-PZ tile should not be PZ");
+        assert!(!sm.is_protection_zone(Position::new(99, 99, 7)), "absent tile should not be PZ");
+    }
+
+    #[test]
+    fn temple_for_returns_spawn() {
+        let (map, items) = tiny_map();
+        let sm = StaticMap::from_formats(&map, &items);
+        let spawn = sm.spawn();
+        // M7: everyone respawns at the single town temple (the configured spawn).
+        assert_eq!(sm.temple_for(Position::new(200, 200, 7)), spawn, "temple_for always returns spawn in M7");
     }
 
     #[test]
