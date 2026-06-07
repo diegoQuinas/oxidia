@@ -4,7 +4,7 @@
 use anyhow::Result;
 use protocol::map_description::{self, Center, PlacedCreature};
 use protocol::rsa::RsaPrivateKey;
-use protocol::{chat, creature, enter_world, frame, game_login, xtea};
+use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
 use world::game::WorldHandle;
 use world::Direction;
@@ -246,6 +246,22 @@ where
                 }
                 continue;
             }
+            // 0xA1 — client attack target request (parseAttack, TFS line 972-977).
+            // Body after opcode: [u32 creatureId]. 0 = clear target.
+            // Must intercept BEFORE opcode_action, which does not map 0xA1 so it
+            // would fall through to the `None => continue` drain — silently losing
+            // the attack.
+            if opcode == combat_packets::OP_ATTACK {
+                if let Some(target_id) = combat_packets::parse_attack(&payload[1..]) {
+                    world.set_target(id, target_id).await;
+                }
+                continue;
+            }
+            // 0xA2 — client follow request (parseFollow, TFS line 979-984).
+            // M7: consume and ignore (no auto-walk follow yet).
+            if opcode == combat_packets::OP_FOLLOW {
+                continue;
+            }
             let Some((direction, is_turn)) = opcode_action(opcode) else { continue };
             if is_turn {
                 world.turn_player(id, direction).await;
@@ -449,6 +465,63 @@ mod tests {
         // the handler would hold the session open (pinging) until timeout.
         drop(client);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attack_opcode_reaches_world_without_error() {
+        // An 0xA1 attack packet with a dummy target id must be dispatched to the
+        // world (set_target) without producing a crash or being misread as a walk.
+        // We verify this by sending the opcode and confirming the reader loop does
+        // not error — the actual fight mechanics are covered by world unit tests.
+        let world = test_world();
+        let keys = xtea::expand_key(&[1u32, 2, 3, 4]);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (mut rd, _wr) = tokio::io::split(server);
+
+        // Send an 0xA1 attack packet with target_id = 0x1000_0001.
+        let mut pkt = protocol::message::MessageWriter::new();
+        pkt.write_u8(protocol::combat_packets::OP_ATTACK);
+        pkt.write_u32(0x1000_0001u32);
+        let body = xtea::encrypt_message(&pkt.into_bytes(), &keys);
+        let inner = frame::checksummed(&body);
+        net::frame::write_frame(&mut client, &inner).await.unwrap();
+
+        // Drop the client to produce EOF, then run the reader loop.
+        drop(client);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader_loop(&mut rd, &keys, &world, 1),
+        )
+        .await;
+        assert!(res.is_ok(), "reader_loop must not hang on 0xA1");
+        res.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_opcode_is_drained_without_error() {
+        // 0xA2 follow must be consumed (drained) and not treated as a walk.
+        let world = test_world();
+        let keys = xtea::expand_key(&[1u32, 2, 3, 4]);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (mut rd, _wr) = tokio::io::split(server);
+
+        let mut pkt = protocol::message::MessageWriter::new();
+        pkt.write_u8(protocol::combat_packets::OP_FOLLOW);
+        pkt.write_u32(0u32);
+        let body = xtea::encrypt_message(&pkt.into_bytes(), &keys);
+        let inner = frame::checksummed(&body);
+        net::frame::write_frame(&mut client, &inner).await.unwrap();
+
+        drop(client);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader_loop(&mut rd, &keys, &world, 1),
+        )
+        .await;
+        assert!(res.is_ok(), "reader_loop must not hang on 0xA2");
+        res.unwrap().unwrap();
     }
 
     #[tokio::test]
