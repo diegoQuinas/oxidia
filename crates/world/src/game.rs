@@ -191,6 +191,22 @@ impl Game {
         self.players.iter().any(|(&pid, p)| pid != exclude && p.position == pos)
     }
 
+    /// The wire stackpos a creature with id `exclude` occupies on `pos`, placed
+    /// on top: the tile's item base (TFS `getStackposOfCreature` ground+top
+    /// items) plus the other creatures already standing there. Co-occupancy
+    /// arises on stair/height landings (FLAG_IGNOREBLOCKCREATURE); the newest
+    /// arrival renders on top, matching TFS. Capped at 10 like the wire stack.
+    fn creature_stackpos_on(&self, pos: Position, exclude: u32) -> u8 {
+        let base = self.map.creature_stackpos(
+            i32::from(pos.x), i32::from(pos.y), i32::from(pos.z));
+        let others = self
+            .players
+            .iter()
+            .filter(|(id, p)| **id != exclude && p.position == pos)
+            .count();
+        (usize::from(base) + others).min(10) as u8
+    }
+
     /// The spawn tile, or the nearest walkable & unoccupied tile in expanding
     /// square rings around it (so co-logins don't stack on one tile). Falls back
     /// to the spawn itself if nothing free is found within the search radius.
@@ -238,8 +254,7 @@ impl Game {
                 others.push(PlacedCreature { x: p.position.x, y: p.position.y, z: p.position.z, bytes });
             }
             if let Some(bytes) = self.introduce(other, id) {
-                let stackpos = self.map.creature_stackpos(
-                    i32::from(position.x), i32::from(position.y), i32::from(position.z));
+                let stackpos = self.creature_stackpos_on(position, id);
                 self.push(other, tile_creature::add_tile_creature(
                     (position.x, position.y, position.z), stackpos, &bytes));
                 // Spectators also see the teleport puff on login (TFS
@@ -257,15 +272,15 @@ impl Game {
     fn logout(&mut self, id: u32) {
         let Some(p) = self.players.remove(&id) else { return };
         let pos = p.position;
-        let stackpos = self.map.creature_stackpos(
-            i32::from(pos.x), i32::from(pos.y), i32::from(pos.z));
         for spec in self.spectators(pos, id) {
             // A teleport puff on the departing creature's tile, then the remove.
             // (A deliberate polish over TFS, whose removeCreature disappears
             // silently; symmetric with the login appear effect.)
             self.push(spec, enter_world::magic_effect(
                 pos.x, pos.y, pos.z, enter_world::EFFECT_TELEPORT));
-            self.push(spec, tile_creature::remove_tile_thing((pos.x, pos.y, pos.z), stackpos));
+            // id-form remove: unambiguous even if the logging-out creature shared
+            // its tile with another (stair/height co-occupancy).
+            self.push(spec, walk::remove_creature_by_id(id));
             // The departed creature must be re-introduced (full form) if it ever
             // returns: drop it from each spectator's known-set.
             if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
@@ -392,17 +407,17 @@ impl Game {
             .map(|d| self.resolve_vertical(from, d, diagonal))
             .filter(|&d| {
                 // A vertical landing (stair/height redirect) is reached with TFS
-                // FLAG_NOLIMIT (tile.cpp:817) / FLAG_IGNOREBLOCKITEM
-                // (game.cpp:799), so block-solid items on the landing are ignored;
-                // it only needs to be a real tile. Same-floor steps keep the full
-                // walkability check. The creature-occupancy check stays in both
-                // cases to preserve the M5 one-creature-per-tile stackpos invariant.
-                let reachable = if d.z != from.z {
+                // FLAG_IGNOREBLOCKITEM | FLAG_IGNOREBLOCKCREATURE (game.cpp:799,815),
+                // so BOTH block-solid items AND a creature standing on the landing
+                // are ignored — it only needs to be a real tile. Tibia lets you
+                // stack onto whoever is on the landing (co-occupancy). Same-floor
+                // steps set no such flag, so they keep the full walkability +
+                // occupancy check (tile.cpp:564 still blocks).
+                if d.z != from.z {
                     self.map.has_ground(d)
                 } else {
-                    self.map.is_walkable(d)
-                };
-                reachable && !self.tile_occupied(d, id)
+                    self.map.is_walkable(d) && !self.tile_occupied(d, id)
+                }
             });
 
         let Some(to) = dest else {
@@ -410,10 +425,25 @@ impl Game {
             // spectators see nothing. Matches TFS: a failed walk never turns the
             // player (only Ctrl+arrows / 0x6F-0x72 do). cancel_walk carries the
             // unchanged direction so the client also keeps facing where it was.
+            tracing::debug!(
+                id, dir = ?direction, diagonal,
+                from = ?(from.x, from.y, from.z),
+                "move blocked: cancel_walk"
+            );
             self.push(id, walk::cancel_walk(cur_dir.to_byte()));
             return;
         };
-        // Successful move: now commit the new facing and position.
+        // Successful move: now commit the new facing and position. `vertical` is
+        // true when resolve_vertical redirected a step to another floor — the
+        // prime suspect for underground "desync" when a flat step changes z.
+        let vertical = to.z != from.z;
+        tracing::debug!(
+            id, dir = ?direction, diagonal, vertical,
+            from = ?(from.x, from.y, from.z),
+            to = ?(to.x, to.y, to.z),
+            underground = to.z > 7,
+            "move ok"
+        );
         if let Some(p) = self.players.get_mut(&id) { p.direction = direction; p.position = to; }
 
         // Spectators that can see either endpoint.
@@ -431,14 +461,12 @@ impl Game {
                     // Surface->underground boundary: the creature crosses between
                     // the overground and underground render stacks, so a plain
                     // 0x6D desyncs the spectator. TFS sendMoveCreature (2633-2649)
-                    // does a clean remove+add here.
-                    let sp = self.map.creature_stackpos(
-                        i32::from(from.x), i32::from(from.y), i32::from(from.z));
-                    self.push(spec, tile_creature::remove_tile_thing((from.x, from.y, from.z), sp));
+                    // does a clean remove+add here. id-form remove is unambiguous
+                    // under co-occupancy; the add lands the mover on top.
+                    self.push(spec, walk::remove_creature_by_id(id));
                     if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
                     if let Some(bytes) = self.introduce(spec, id) {
-                        let dsp = self.map.creature_stackpos(
-                            i32::from(to.x), i32::from(to.y), i32::from(to.z));
+                        let dsp = self.creature_stackpos_on(to, id);
                         self.push(spec, tile_creature::add_tile_creature(
                             (to.x, to.y, to.z), dsp, &bytes));
                     }
@@ -447,16 +475,14 @@ impl Game {
                 }
             } else if sees_to {
                 if let Some(bytes) = self.introduce(spec, id) {
-                    let sp = self.map.creature_stackpos(
-                        i32::from(to.x), i32::from(to.y), i32::from(to.z));
+                    let sp = self.creature_stackpos_on(to, id);
                     self.push(spec, tile_creature::add_tile_creature(
                         (to.x, to.y, to.z), sp, &bytes));
                 }
             } else {
-                // sees_from only: creature left this spectator's view.
-                let sp = self.map.creature_stackpos(
-                    i32::from(from.x), i32::from(from.y), i32::from(from.z));
-                self.push(spec, tile_creature::remove_tile_thing((from.x, from.y, from.z), sp));
+                // sees_from only: creature left this spectator's view. id-form
+                // remove stays correct even if `from` was co-occupied.
+                self.push(spec, walk::remove_creature_by_id(id));
                 if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
             }
         }
@@ -474,13 +500,14 @@ impl Game {
                 self.players.get(oid).is_some_and(|p| !Self::can_see(to, p.position))
             })
             .collect();
+        let left_view_len = left_view.len();
         for oid in left_view {
             if let Some(mover) = self.players.get_mut(&id) { mover.known.remove(&oid); }
         }
 
         // The mover's own view: 0x6D + revealed slices, carrying every other
         // player now in range so they render in the newly exposed tiles.
-        let others_in_range: Vec<PlacedCreature> = self
+        let mut wire_creatures: Vec<PlacedCreature> = self
             .visible_from(to, id)
             .into_iter()
             .filter_map(|oid| {
@@ -489,12 +516,38 @@ impl Game {
                 Some(PlacedCreature { x: opos.x, y: opos.y, z: opos.z, bytes })
             })
             .collect();
+        let others_count = wire_creatures.len();
+
+        // Floor changes whose header is a bare remove (the surface->underground
+        // boundary) or a full teleport map (a sloped stair/ladder jumping >1 tile)
+        // never re-place the mover on a tile via a 0x6D move. TFS gets away with
+        // it because GetFloorDescription lists the player standing on the new tile;
+        // here creatures travel out-of-band and `visible_from` excludes the mover,
+        // so without this the client keeps the localPlayer object detached from any
+        // tile and every later move trips "parseCreatureMove: unable to remove
+        // creature". Splice the mover onto its landing tile so the revealed floor
+        // block / teleport map re-attaches it. Mirrors TFS MoveDownCreature.
+        let dx = (i32::from(to.x) - i32::from(from.x)).abs();
+        let dy = (i32::from(to.y) - i32::from(from.y)).abs();
+        let boundary = from.z == 7 && to.z >= 8;
+        let teleport_like = to.z != from.z && (dx > 1 || dy > 1);
+        if boundary || teleport_like {
+            if let Some(bytes) = self.introduce(id, id) {
+                wire_creatures.push(PlacedCreature { x: to.x, y: to.y, z: to.z, bytes });
+            }
+        }
         let pkt = walk::walk_update(
             id,
             (from.x, from.y, from.z),
             (to.x, to.y, to.z),
             self.map.as_ref(),
-            &others_in_range,
+            &wire_creatures,
+        );
+        tracing::debug!(
+            id, pkt_len = pkt.len(),
+            others = others_count,
+            pruned = left_view_len,
+            "walk_update pushed to mover"
         );
         self.push(id, pkt);
     }
@@ -614,6 +667,26 @@ mod tests {
     }
 
     #[test]
+    fn mover_is_readded_on_its_landing_when_crossing_to_underground() {
+        // Regression (live desync -> client crash): crossing the surface->
+        // underground boundary, the mover's own header is a bare 0x6C id-form
+        // remove, never a 0x6D move, so unlike every other step it never re-places
+        // the player on a tile. The revealed floor block must carry the mover on
+        // its landing tile (as TFS GetFloorDescription lists the creature standing
+        // there) or the client keeps the localPlayer object detached from any tile
+        // and every later step trips "parseCreatureMove: unable to remove creature".
+        let mut g = Game::new(stair_map());
+        let (mover, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.do_move(mover, Direction::East); // 100,100,7 -> land 101,100,8
+        let pkt = rx.try_recv().expect("mover gets a packet");
+        // Bytes [0..7) are the id-form remove ([0x6C][0xFFFF][id]). The mover's id
+        // must appear AGAIN past the header: the floor block re-adding it.
+        let id_le = mover.to_le_bytes();
+        let readded = pkt[7..].windows(4).any(|w| w == id_le);
+        assert!(readded, "mover must be re-added on its landing tile after the boundary remove");
+    }
+
+    #[test]
     fn down_stair_lands_even_when_landing_is_block_solid() {
         // TFS sets FLAG_NOLIMIT on a stair landing (tile.cpp:817), so a
         // block-solid item on the landing tile does NOT cancel the descent.
@@ -643,6 +716,33 @@ mod tests {
         let (mover, _rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_move(mover, Direction::East);
         assert_eq!(g.players.get(&mover).unwrap().position, Position::new(101, 100, 8));
+    }
+
+    #[test]
+    fn down_stair_lands_even_when_landing_is_occupied_by_creature() {
+        // TFS sets FLAG_IGNOREBLOCKCREATURE on a height/stair floor change
+        // (game.cpp:799,815; gated in tile.cpp:564), so a creature standing on
+        // the landing does NOT cancel the descent — Tibia lets you stack onto
+        // them. Same-floor steps still respect occupancy (no such flag there).
+        let mut g = Game::new(stair_map());
+        // B already stands on the landing tile one floor below the stair.
+        let landing = Position::new(101, 100, 8);
+        let (b, _rb) = add_player(&mut g, landing);
+        let (mover, _rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.do_move(mover, Direction::East); // stair 101,100,7 -> land on occupied 101,100,8
+        assert_eq!(
+            g.players.get(&mover).unwrap().position, landing,
+            "descent must succeed onto an occupied landing"
+        );
+        // Both creatures now co-occupy the landing (Tibia stacking).
+        assert_eq!(g.players.get(&b).unwrap().position, landing, "B is still on the landing");
+        // The arriving creature renders on top of the one already there:
+        // its stackpos is the item base plus the one creature below it.
+        let base = g.map.creature_stackpos(101, 100, 8);
+        assert_eq!(
+            g.creature_stackpos_on(landing, mover), base + 1,
+            "the newcomer stacks above the resident creature"
+        );
     }
 
     #[test]
@@ -1032,5 +1132,267 @@ mod tests {
         let far = rx_far.try_recv().expect("far-in-view gets a packet");
         let fs = String::from_utf8_lossy(&far);
         assert!(fs.contains("pspsps") && !fs.contains("secret"), "far in view hears pspsps: {fs}");
+    }
+
+    // ---- underground walk-out-and-back map consistency (live desync repro) ----
+
+    /// Floor-8 room where each tile carries two plain items: a ground item whose
+    /// client id encodes x (1000 + dx) and a down item encoding y (2000 + dy). A
+    /// torn / shifted column therefore surfaces as a wrong client id at a coord.
+    fn underground_room() -> Arc<StaticMap> {
+        use formats::items_xml::FloorChange;
+        let (x0, x1) = (33200u16, 33240u16);
+        let (y0, y1) = (32448u16, 32468u16);
+        let mut item_types = Vec::new();
+        for x in x0..=x1 {
+            item_types.push(ItemType { group: 1, flags: 0, server_id: 100 + (x - x0), client_id: 1000 + (x - x0), always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
+        }
+        for y in y0..=y1 {
+            item_types.push(ItemType { group: 1, flags: 0, server_id: 500 + (y - y0), client_id: 2000 + (y - y0), always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
+        }
+        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_types };
+        let mut tiles = Vec::new();
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                tiles.push(MapTile { x, y, z: 8, flags: 0, house_id: None, items: vec![
+                    MapItem { id: 100 + (x - x0), contents: vec![] }, // ground -> client 1000+dx
+                    MapItem { id: 500 + (y - y0), contents: vec![] }, // down   -> client 2000+dy
+                ] });
+            }
+        }
+        let map = OtbmMap { width: 65000, height: 65000, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles, towns: vec![Town { id: 1, name: "U".into(), x: 33215, y: 32458, z: 8 }], waypoints: vec![] };
+        Arc::new(StaticMap::from_formats(&map, &items))
+    }
+
+    fn server_floor8_ids(map: &StaticMap, x: i32, y: i32) -> Vec<u16> {
+        match map.tile(x, y, 8) {
+            Some(s) => s.pre_creature.iter().chain(s.post_creature).map(|w| w.client_id).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Seed the client cache with the mover's initial 18x14 floor-8 view — the
+    /// client already has this before any walk; steps only send edge slices.
+    fn seed_floor8(cache: &mut HashMap<(i32, i32, u8), Vec<u16>>, map: &StaticMap, center: Position) {
+        for x in (i32::from(center.x) - 8)..=(i32::from(center.x) + 9) {
+            for y in (i32::from(center.y) - 6)..=(i32::from(center.y) + 7) {
+                let ids = server_floor8_ids(map, x, y);
+                if !ids.is_empty() { cache.insert((x, y, 8), ids); }
+            }
+        }
+    }
+
+    /// Faithful OTClient-side decoder of one band slice stream (mirror of the
+    /// `get_map_description` encoder): walks `floors` with `offset = center_z - nz`,
+    /// a `skip` run-length counter persisting across floors, plain `[cid][0xFF]`
+    /// items. Fills `cache` at the real world coordinate of each tile.
+    fn decode_band_into(cache: &mut HashMap<(i32, i32, u8), Vec<u16>>, bytes: &[u8], pos: &mut usize,
+        anchor_x: i32, anchor_y: i32, center_z: i32, width: i32, height: i32) {
+        let floors: Vec<i32> = if center_z > 7 {
+            ((center_z - 2)..=(center_z + 2).min(15)).collect()
+        } else {
+            (0..=7).rev().collect()
+        };
+        let floor_size = width * height;
+        let total = floors.len() as i32 * floor_size;
+        let mut skip = 0i32;
+        let mut idx = 0i32;
+        while idx < total {
+            let fi = (idx / floor_size) as usize;
+            let nz = floors[fi];
+            let offset = center_z - nz;
+            let t = idx % floor_size;
+            let nx = t / height;
+            let ny = t % height;
+            let coord = (anchor_x + nx + offset, anchor_y + ny + offset, nz as u8);
+            if skip == 0 {
+                let peek = u16::from_le_bytes([bytes[*pos], bytes[*pos + 1]]);
+                if peek >= 0xFF00 {
+                    skip = i32::from(peek & 0x00FF);
+                    *pos += 2;
+                    cache.remove(&coord); // client cleanTile: this position is empty
+                } else {
+                    *pos += 2; // env u16 (0x0000)
+                    let mut ids = Vec::new();
+                    loop {
+                        let v = u16::from_le_bytes([bytes[*pos], bytes[*pos + 1]]);
+                        if v >= 0xFF00 { skip = i32::from(v & 0x00FF); *pos += 2; break; }
+                        assert_eq!(bytes[*pos + 2], 0xFF, "expected plain item mark at {}", *pos + 2);
+                        ids.push(v);
+                        *pos += 3;
+                    }
+                    cache.insert(coord, ids);
+                }
+            } else {
+                cache.remove(&coord); // client cleanTile on a skipped position
+                skip -= 1;
+            }
+            idx += 1;
+        }
+    }
+
+    /// Apply a same-floor `walk_update` packet to the client cache: skip the
+    /// 12-byte 0x6D move header, then decode each directional slice with the same
+    /// anchor formulas `walk_update` used to emit them.
+    fn apply_walk_update(cache: &mut HashMap<(i32, i32, u8), Vec<u16>>, pkt: &[u8], before: Position, after: Position) {
+        assert_eq!(pkt[0], protocol::walk::OP_CREATURE_MOVE, "same-floor move uses 0x6D header");
+        let mut pos = 12usize; // [0x6D][0xFFFF][id u32][newx u16][newy u16][newz u8]
+        let bx = i32::from(before.x);
+        let ax = i32::from(after.x);
+        let ay = i32::from(after.y);
+        let cz = i32::from(after.z);
+        while pos < pkt.len() {
+            let opcode = pkt[pos];
+            pos += 1;
+            let (anchor_x, anchor_y, width, height) = match opcode {
+                0x66 => (ax + 9, ay - 6, 1, 14),  // EAST
+                0x68 => (ax - 8, ay - 6, 1, 14),  // WEST
+                0x65 => (bx - 8, ay - 6, 18, 1),  // NORTH (anchored on old x)
+                0x67 => (bx - 8, ay + 7, 18, 1),  // SOUTH (anchored on old x)
+                other => panic!("unexpected slice opcode {other:#x}"),
+            };
+            decode_band_into(cache, pkt, &mut pos, anchor_x, anchor_y, cz, width, height);
+        }
+    }
+
+    #[test]
+    fn underground_walk_out_and_back_keeps_floor8_consistent() {
+        // Live desync repro: B walks east out of its viewport, back west, then a
+        // couple north on floor 8. Each step only sends an edge slice, so the
+        // client cache must stay byte-consistent with the server map — observed
+        // live as a torn staircase / shifted left half on the returning client.
+        // No other creatures here: this isolates pure map-slice geometry.
+        let map = underground_room();
+        let mut g = Game::new(map);
+        let start = Position::new(33215, 32458, 8);
+        let (b, mut rx) = add_player(&mut g, start);
+        while rx.try_recv().is_ok() {} // drain login bookkeeping
+
+        let mut cache: HashMap<(i32, i32, u8), Vec<u16>> = HashMap::new();
+        seed_floor8(&mut cache, g.map.as_ref(), start);
+
+        let mut seq = Vec::new();
+        for _ in 0..8 { seq.push(Direction::East); }
+        for _ in 0..8 { seq.push(Direction::West); }
+        for _ in 0..2 { seq.push(Direction::North); }
+        for dir in seq {
+            let before = g.players[&b].position;
+            g.do_move(b, dir);
+            let after = g.players[&b].position;
+            assert_ne!(before, after, "step {dir:?} should succeed");
+            let pkt = rx.try_recv().expect("mover gets a walk packet");
+            apply_walk_update(&mut cache, &pkt, before, after);
+            while rx.try_recv().is_ok() {} // drain extras
+        }
+
+        let p = g.players[&b].position;
+        let mut mismatches = Vec::new();
+        for x in (i32::from(p.x) - 8)..=(i32::from(p.x) + 9) {
+            for y in (i32::from(p.y) - 6)..=(i32::from(p.y) + 7) {
+                let server = server_floor8_ids(g.map.as_ref(), x, y);
+                let client = cache.get(&(x, y, 8)).cloned().unwrap_or_default();
+                if client != server {
+                    mismatches.push(format!("({x},{y}): client={client:?} server={server:?}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "floor-8 desync after walk-out-and-back:\n{}", mismatches.join("\n"));
+    }
+
+    /// Underground room with ground on the full z-2..z+2 band (floors 6..10),
+    /// every tile carrying a single item whose client id is unique per (x,y,z) so
+    /// any cross-floor / shifted misplacement surfaces as a wrong id at a coord.
+    fn underground_multifloor() -> Arc<StaticMap> {
+        use formats::items_xml::FloorChange;
+        let (x0, x1) = (33200u16, 33240u16);
+        let (y0, y1) = (32448u16, 32468u16);
+        let span_x = x1 - x0 + 1; // 41
+        let span_y = y1 - y0 + 1; // 21
+        let uid = |x: u16, y: u16, z: u8| -> u16 {
+            1 + (x - x0) + (y - y0) * span_x + u16::from(z - 6) * span_x * span_y
+        };
+        let mut item_types = Vec::new();
+        let mut tiles = Vec::new();
+        for z in 6u8..=10 {
+            for x in x0..=x1 {
+                for y in y0..=y1 {
+                    let id = uid(x, y, z);
+                    item_types.push(ItemType { group: 1, flags: 0, server_id: id, client_id: id, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
+                    tiles.push(MapTile { x, y, z, flags: 0, house_id: None, items: vec![MapItem { id, contents: vec![] }] });
+                }
+            }
+        }
+        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_types };
+        let map = OtbmMap { width: 65000, height: 65000, major_items: 3, minor_items: 57,
+            description: String::new(), spawn_file: None, house_file: None,
+            tiles, towns: vec![Town { id: 1, name: "U".into(), x: 33215, y: 32458, z: 8 }], waypoints: vec![] };
+        Arc::new(StaticMap::from_formats(&map, &items))
+    }
+
+    #[test]
+    fn underground_walk_east_west_keeps_full_band_consistent() {
+        // Live single-client repro: in an underground depot, walking east/west
+        // shifts walls/stairs and trips "unable to remove creature". This exercises
+        // the FULL z-2..z+2 band (floors above + below the player), which the
+        // floor-8-only test did not. Seed the client cache with the initial band,
+        // walk east out of view and back, and assert every band floor stays
+        // byte-consistent with the server map.
+        let map = underground_multifloor();
+        let mut g = Game::new(map);
+        let start = Position::new(33215, 32458, 8);
+        let (b, mut rx) = add_player(&mut g, start);
+        while rx.try_recv().is_ok() {}
+
+        let mut cache: HashMap<(i32, i32, u8), Vec<u16>> = HashMap::new();
+        for z in 6u8..=10 {
+            for x in (i32::from(start.x) - 8)..=(i32::from(start.x) + 9) {
+                for y in (i32::from(start.y) - 6)..=(i32::from(start.y) + 7) {
+                    // initial full-map description projects each floor by (z-nz).
+                    let off = 8 - i32::from(z);
+                    let ids = server_floor8_ids_z(g.map.as_ref(), x + off, y + off, z);
+                    if !ids.is_empty() { cache.insert((x + off, y + off, z), ids); }
+                }
+            }
+        }
+
+        let mut seq = Vec::new();
+        for _ in 0..8 { seq.push(Direction::East); }
+        for _ in 0..8 { seq.push(Direction::West); }
+        for dir in seq {
+            let before = g.players[&b].position;
+            g.do_move(b, dir);
+            let after = g.players[&b].position;
+            assert_ne!(before, after, "step {dir:?} should succeed");
+            let pkt = rx.try_recv().expect("mover gets a walk packet");
+            apply_walk_update(&mut cache, &pkt, before, after);
+            while rx.try_recv().is_ok() {}
+        }
+
+        let p = g.players[&b].position;
+        let mut mismatches = Vec::new();
+        for z in 6u8..=10 {
+            let off = 8 - i32::from(z);
+            for sx in (i32::from(p.x) - 8)..=(i32::from(p.x) + 9) {
+                for sy in (i32::from(p.y) - 6)..=(i32::from(p.y) + 7) {
+                    let (wx, wy) = (sx + off, sy + off);
+                    let server = server_floor8_ids_z(g.map.as_ref(), wx, wy, z);
+                    let client = cache.get(&(wx, wy, z)).cloned().unwrap_or_default();
+                    if client != server {
+                        mismatches.push(format!("({wx},{wy},{z}): client={client:?} server={server:?}"));
+                    }
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "band desync after E/W walk ({} tiles):\n{}",
+            mismatches.len(), mismatches.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
+    }
+
+    fn server_floor8_ids_z(map: &StaticMap, x: i32, y: i32, z: u8) -> Vec<u16> {
+        match map.tile(x, y, i32::from(z)) {
+            Some(s) => s.pre_creature.iter().chain(s.post_creature).map(|w| w.client_id).collect(),
+            None => Vec::new(),
+        }
     }
 }
