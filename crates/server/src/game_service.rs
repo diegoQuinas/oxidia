@@ -177,6 +177,8 @@ where
 
 /// Game opcode `0x1D` — ping. TFS sends it to keep the connection alive.
 const PING_OPCODE: u8 = 0x1D;
+/// Game opcode `0x14` — client logout request (Ctrl+L / window-close "Logout").
+const OPCODE_CLIENT_LOGOUT: u8 = 0x14;
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Map an incoming opcode to a (direction, is_turn) action, or `None` to drain.
@@ -194,7 +196,7 @@ fn opcode_action(opcode: u8) -> Option<(Direction, bool)> {
         0x70 => Some((Direction::East, true)),
         0x71 => Some((Direction::South, true)),
         0x72 => Some((Direction::West, true)),
-        _ => None, // pong (0x1E), unknown -> drain; logout handled by EOF
+        _ => None, // pong (0x1E), unknown -> drain; logout (0x14) handled in reader_loop
     }
 }
 
@@ -220,6 +222,19 @@ where
             Err(e) => { tracing::debug!(?e, "dropping undecryptable frame"); continue; }
         };
         if let Some(&opcode) = payload.first() {
+            // 0x14 — client "safe logout": the client sends this and waits for the
+            // server to close the connection (unlike a force-exit, which just drops
+            // the socket and arrives here as EOF). Ending the loop tears the session
+            // down (writer.abort + world.logout), which closes the socket and lets
+            // the client's safe-logout complete.
+            //
+            // TODO(combat): real Tibia refuses logout while in a fight — when combat
+            // state exists, check it here and, instead of breaking, push a status
+            // message ("You may not logout during or immediately after a fight.")
+            // and keep the session open.
+            if opcode == OPCODE_CLIENT_LOGOUT {
+                break;
+            }
             let Some((direction, is_turn)) = opcode_action(opcode) else { continue };
             if is_turn {
                 world.turn_player(id, direction).await;
@@ -409,5 +424,35 @@ mod tests {
         // the handler would hold the session open (pinging) until timeout.
         drop(client);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_opcode_ends_reader_loop_without_eof() {
+        // A client "safe logout" (window dialog or Ctrl+L safeLogout) sends the
+        // 0x14 logout opcode and then WAITS for the server to close the socket —
+        // it does not send EOF itself. The reader loop must return on 0x14 so the
+        // session tears down (writer.abort + world.logout) and the socket closes.
+        let world = test_world();
+        let keys = xtea::expand_key(&[1u32, 2, 3, 4]);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (mut rd, _wr) = tokio::io::split(server);
+
+        // Send a logout (0x14) frame, then keep `client` open — no EOF.
+        let mut pkt = protocol::message::MessageWriter::new();
+        pkt.write_u8(0x14);
+        let body = xtea::encrypt_message(&pkt.into_bytes(), &keys);
+        let inner = frame::checksummed(&body);
+        net::frame::write_frame(&mut client, &inner).await.unwrap();
+
+        // With the fix, reader_loop returns promptly on 0x14. Without it, it would
+        // drain the opcode and block on the next read_frame forever (timeout).
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader_loop(&mut rd, &keys, &world, 1),
+        )
+        .await;
+        assert!(res.is_ok(), "reader_loop must return on 0x14 without waiting for EOF");
+        res.unwrap().unwrap();
     }
 }

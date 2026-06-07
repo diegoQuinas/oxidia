@@ -2,7 +2,10 @@
 
 [server]
 world_name = "Oxidia"
-# Address advertised to the client in the character list.
+# Address advertised to the client in the character list. Must be an address the
+# client can actually reach (127.0.0.1 for local play, or the LAN/public IP for
+# remote clients) — NOT a bind wildcard like 0.0.0.0. The interface the server
+# listens on is configured separately via [network].bind.
 host = "127.0.0.1"
 motd = "Welcome to Oxidia"
 
