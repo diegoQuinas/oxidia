@@ -731,6 +731,7 @@ impl Game {
     /// is broadcast to spectators.
     fn do_move_thing(&mut self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
         if from.x == 0xFFFF || to.x == 0xFFFF { return; } // inventory/container = M10.2/M10.3
+        if from == to { return; }
         let Some(p) = self.players.get(&id) else { return };
         let player_pos = p.position;
 
@@ -763,17 +764,19 @@ impl Game {
             self.push_cannot_move(id, "You cannot put that there."); return;
         }
 
-        let move_count = if stackable { count.max(1) } else { 1 };
+        let moved_req = if stackable { count.max(1) } else { 1 };
 
         // --- Source: COW + remove/split. Scope the get_mut so no other self.* call
         //     overlaps the &mut borrow. ---
         if !self.materialize(from) { return; }
         let removed_fully;
+        let moved; // clamped amount actually taken from source
         {
             let st = self.dynamic.get_mut(&(from.x, from.y, from.z)).unwrap();
             let cur = st.counts[src_idx].unwrap_or(1).max(1);
-            if stackable && i32::from(cur) > i32::from(move_count) {
-                let left = cur - move_count;
+            moved = if stackable { moved_req.min(cur) } else { 1 };
+            if stackable && cur > moved {
+                let left = cur - moved;
                 st.counts[src_idx] = Some(left);
                 st.items[src_idx].subtype = Some(left);
                 removed_fully = false;
@@ -792,6 +795,7 @@ impl Game {
         let dest_item: WireItem;
         let dest_idx: usize;
         let dest_update: bool;
+        let mut spill: Option<(usize, WireItem)> = None;
         {
             let st = self.dynamic.get_mut(&(to.x, to.y, to.z)).unwrap();
             // Top item is a mergeable same-type stackable only when it sits among
@@ -804,7 +808,7 @@ impl Game {
             };
             if let Some(t) = merge_at {
                 let merged = u32::from(st.counts[t].unwrap_or(1).max(1))
-                    + u32::from(move_count);
+                    + u32::from(moved);
                 let capped = merged.min(100) as u8;
                 st.counts[t] = Some(capped);
                 st.items[t].subtype = Some(capped);
@@ -812,13 +816,15 @@ impl Game {
                 dest_idx = t;
                 dest_update = true;
                 if merged > 100 {
-                    let spill = (merged - 100) as u8;
-                    st.items.push(WireItem { client_id, subtype: Some(spill), animated });
+                    let spill_count = u8::try_from(merged - 100).unwrap_or(u8::MAX);
+                    let spill_wi = WireItem { client_id, subtype: Some(spill_count), animated };
+                    st.items.push(spill_wi);
                     st.server_ids.push(src_sid);
-                    st.counts.push(Some(spill));
+                    st.counts.push(Some(spill_count));
+                    spill = Some((st.items.len() - 1, spill_wi));
                 }
             } else {
-                let subtype = if stackable { Some(move_count) } else { None };
+                let subtype = if stackable { Some(moved) } else { None };
                 let wi = WireItem { client_id, subtype, animated };
                 st.items.push(wi);
                 st.server_ids.push(src_sid);
@@ -830,6 +836,9 @@ impl Game {
         }
 
         self.broadcast_tile_update(to, dest_idx, dest_item, dest_update);
+        if let Some((sidx, sitem)) = spill {
+            self.broadcast_tile_update(to, sidx, sitem, false);
+        }
         self.broadcast_source(from, from_stackpos, removed_fully, src_idx);
     }
 
