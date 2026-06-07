@@ -90,6 +90,8 @@ pub struct PlayerSave {
     /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
     /// Controls which outfit catalog is offered in the 0xC8 window.
     pub sex: u8,
+    /// Equipped items: `(slot 1..=10, server_id, count)`.
+    pub inventory: Vec<(u8, u16, u8)>,
 }
 
 /// Handle to the account/player database.
@@ -225,6 +227,25 @@ impl Store {
                 Ok(())
             }
         })?;
+
+        // Replace the player's equipped items (delete-all then insert).
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM player_inventory WHERE player_name = ?")
+            .bind(&state.name)
+            .execute(&mut *tx)
+            .await?;
+        for &(slot, server_id, count) in &state.inventory {
+            sqlx::query(
+                "INSERT INTO player_inventory (player_name, slot, server_id, count) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&state.name)
+            .bind(i64::from(slot))
+            .bind(i64::from(server_id))
+            .bind(i64::from(count))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -256,7 +277,26 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| PlayerSave {
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let inv_rows = sqlx::query(
+            "SELECT slot, server_id, count FROM player_inventory WHERE player_name = ?",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await?;
+        let inventory: Vec<(u8, u16, u8)> = inv_rows
+            .iter()
+            .map(|ir| {
+                (
+                    ir.get::<i64, _>("slot") as u8,
+                    ir.get::<i64, _>("server_id") as u16,
+                    ir.get::<i64, _>("count") as u8,
+                )
+            })
+            .collect();
+        Ok(Some(PlayerSave {
             name: r.get("name"),
             pos_x: r.get::<i64, _>("pos_x") as u16,
             pos_y: r.get::<i64, _>("pos_y") as u16,
@@ -275,6 +315,7 @@ impl Store {
             look_addons: r.get::<i64, _>("look_addons") as u8,
             look_mount: r.get::<i64, _>("look_mount") as u16,
             sex: r.get::<i64, _>("sex") as u8,
+            inventory,
         }))
     }
 
@@ -358,6 +399,7 @@ mod tests {
             look_addons: 1,
             look_mount: 0,
             sex: 1, // male (default)
+            inventory: Vec::new(),
         }
     }
 
@@ -445,6 +487,7 @@ mod tests {
             look_addons: 3,
             look_mount: 42,
             sex: 1,
+            inventory: Vec::new(),
         };
         store.save_player(&second).await.unwrap();
 
