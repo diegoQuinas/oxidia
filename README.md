@@ -7,7 +7,7 @@
 
 An Open Tibia server written in Rust — protocol **10.98**, targeting the **OTClient Redemption** client.
 
-![Test Knight standing on the Thais temple ground in OTClient](docs/assets/ingame.png)
+![A character standing on a town street rendered from the real map in OTClient](docs/assets/ingame.png)
 
 > A real OTClient connects, logs in, and renders a character on the actual `forgotten.otbm` map. No emulator tricks — genuine protocol, genuine map data.
 
