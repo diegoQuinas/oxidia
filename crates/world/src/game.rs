@@ -481,27 +481,24 @@ impl Game {
 
     /// Push a `0xC8` outfit-window packet to `id` only (no broadcast).
     ///
-    /// Uses a small pre-alpha stub catalog. The real catalog is data-driven
-    /// (Outfits.xml per sex) and will be loaded in a later milestone.
+    /// The catalog is gender-correct: a female player (sex 0) is offered the
+    /// female look_types, a male player (sex 1) the male ones — see
+    /// [`crate::outfit_catalog`], sourced from `reference/tfs/data/XML/outfits.xml`.
+    /// All outfits (free and premium) are offered with both addons (addons = 3):
+    /// the 10.98 wire format carries no premium flag, so "available" simply means
+    /// "present in the list".
     ///
     /// If `id` is not in the game, this is a no-op.
     fn do_request_outfit(&mut self, id: u32) {
-        // Pre-alpha stub: four starter outfits (look_type, name, addons).
-        // Real catalog is data-driven (Outfits.xml per sex) in a later milestone.
-        const OUTFIT_CATALOG: &[(u16, &[u8], u8)] = &[
-            (128, b"Citizen", 3),
-            (129, b"Hunter",  3),
-            (130, b"Mage",    3),
-            (131, b"Knight",  3),
-        ];
-        let outfit = match self.players.get(&id) {
-            Some(p) => p.outfit,
+        let (outfit, sex) = match self.players.get(&id) {
+            Some(p) => (p.outfit, p.sex),
             None => return,
         };
-        let available: Vec<outfit_packets::AvailableOutfit> = OUTFIT_CATALOG
-            .iter()
-            .map(|&(look_type, name, addons)| outfit_packets::AvailableOutfit { look_type, name, addons })
-            .collect();
+        let available: Vec<outfit_packets::AvailableOutfit> =
+            crate::outfit_catalog::catalog_for_sex(sex)
+                .iter()
+                .map(|&(look_type, name)| outfit_packets::AvailableOutfit { look_type, name, addons: 3 })
+                .collect();
         let pkt = outfit_packets::outfit_window(&outfit, &available, &[]);
         self.push(id, pkt);
     }
@@ -3132,6 +3129,53 @@ mod tests {
         let pkt = rx_self.try_recv().expect("requester must receive 0xC8");
         assert_eq!(pkt[0], protocol::outfit::OP_OUTFIT_WINDOW, "packet must be 0xC8");
         assert!(rx_spec.try_recv().is_err(), "spectator must NOT receive anything");
+    }
+
+    /// Parse the available-outfit `look_type`s out of a `0xC8` outfit-window
+    /// packet. Assumes the `current` outfit has a non-zero look_type, so its
+    /// `AddOutfit` block is 9 bytes (u16 look_type + 5×u8 + u16 mount).
+    fn outfit_window_looktypes(pkt: &[u8]) -> Vec<u16> {
+        // [0xC8][AddOutfit current = 9][u8 count][per outfit: u16 lt, u16 namelen, name, u8 addons]...
+        let mut p = 1 + 9;
+        let count = pkt[p] as usize;
+        p += 1;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let lt = u16::from_le_bytes([pkt[p], pkt[p + 1]]);
+            p += 2;
+            let name_len = u16::from_le_bytes([pkt[p], pkt[p + 1]]) as usize;
+            p += 2 + name_len + 1; // namelen + name bytes + addons byte
+            out.push(lt);
+        }
+        out
+    }
+
+    #[test]
+    fn request_outfit_male_gets_male_catalog() {
+        let mut g = Game::new(walk_map());
+        let (id, mut rx) = add_player(&mut g, Position::new(95, 117, 7)); // sex = 1 (male)
+        while rx.try_recv().is_ok() {}
+        g.do_request_outfit(id);
+        let pkt = rx.try_recv().expect("requester must receive 0xC8");
+        assert_eq!(pkt[0], protocol::outfit::OP_OUTFIT_WINDOW);
+        let types = outfit_window_looktypes(&pkt);
+        assert_eq!(types.len(), 55, "male catalog has all 55 outfits");
+        assert!(types.contains(&128), "male catalog contains male Citizen (128)");
+        assert!(!types.contains(&136), "male catalog must NOT contain female Citizen (136)");
+    }
+
+    #[test]
+    fn request_outfit_female_gets_female_catalog() {
+        let mut g = Game::new(walk_map());
+        let (id, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        g.players.get_mut(&id).unwrap().sex = 0; // female
+        while rx.try_recv().is_ok() {}
+        g.do_request_outfit(id);
+        let pkt = rx.try_recv().expect("requester must receive 0xC8");
+        let types = outfit_window_looktypes(&pkt);
+        assert_eq!(types.len(), 55, "female catalog has all 55 outfits");
+        assert!(types.contains(&136), "female catalog contains female Citizen (136)");
+        assert!(!types.contains(&128), "female catalog must NOT contain male Citizen (128)");
     }
 
     /// Drain a receiver and return the last `0xA2` icons packet seen, if any.
