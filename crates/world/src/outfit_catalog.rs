@@ -13,7 +13,7 @@
 /// means "available" (always addons=3).
 pub type CatalogEntry = (u16, &'static [u8]);
 
-/// Female outfit catalog — all 57 `type="0"` entries from outfits.xml.
+/// Female outfit catalog — all 55 `type="0"` entries from outfits.xml.
 /// Ordered as they appear in the XML (ascending look_type within the file).
 pub static FEMALE: &[CatalogEntry] = &[
     (136, b"Citizen"),
@@ -73,7 +73,7 @@ pub static FEMALE: &[CatalogEntry] = &[
     (900, b"Lupine Warden"),
 ];
 
-/// Male outfit catalog — all 57 `type="1"` entries from outfits.xml.
+/// Male outfit catalog — all 55 `type="1"` entries from outfits.xml.
 /// Ordered as they appear in the XML (ascending look_type within the file).
 pub static MALE: &[CatalogEntry] = &[
     (128, b"Citizen"),
