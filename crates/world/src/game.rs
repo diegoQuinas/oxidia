@@ -17,6 +17,7 @@ use protocol::chat::{self, SpeakType};
 use protocol::combat_packets;
 use protocol::creature::{self, CreatureView, Outfit};
 use protocol::map_description::{Center, PlacedCreature, TileSource};
+use protocol::outfit as outfit_packets;
 use protocol::{enter_world, tile_creature, walk};
 
 use crate::combat;
@@ -275,6 +276,8 @@ impl Game {
             Command::Turn { id, direction } => self.do_turn(id, direction),
             Command::Say { id, speak_type, text } => self.do_say(id, speak_type, text),
             Command::SetTarget { id, target_id } => self.do_set_target(id, target_id),
+            Command::ChangeOutfit { id, outfit } => self.do_change_outfit(id, outfit),
+            Command::RequestOutfit { id } => self.do_request_outfit(id),
             Command::CombatTick { now_ms } => self.on_combat_tick(now_ms),
         }
     }
@@ -416,6 +419,53 @@ impl Game {
         for spec in self.spectators(pos, id) {
             self.push(spec, pkt.clone());
         }
+    }
+
+    /// Apply a new outfit to `id`, then broadcast a `0x8E` creature-outfit packet
+    /// to the player and all current spectators.
+    ///
+    /// If `id` is not in the game, this is a no-op.
+    ///
+    /// NOTE(pre-alpha): the requested outfit is trusted unconditionally.
+    /// TFS checks `getOutfitAddons` to verify the player owns the addons;
+    /// validation is deferred to a later milestone.
+    fn do_change_outfit(&mut self, id: u32, outfit: Outfit) {
+        let pos = match self.players.get_mut(&id) {
+            Some(p) => { p.outfit = outfit; p.position }
+            None => return,
+        };
+        let pkt = outfit_packets::creature_outfit(id, &outfit);
+        self.push(id, pkt.clone());
+        for spec in self.spectators(pos, id) {
+            self.push(spec, pkt.clone());
+        }
+    }
+
+    /// Push a `0xC8` outfit-window packet to `id` only (no broadcast).
+    ///
+    /// Uses a small pre-alpha stub catalog. The real catalog is data-driven
+    /// (Outfits.xml per sex) and will be loaded in a later milestone.
+    ///
+    /// If `id` is not in the game, this is a no-op.
+    fn do_request_outfit(&mut self, id: u32) {
+        // Pre-alpha stub: four starter outfits (look_type, name, addons).
+        // Real catalog is data-driven (Outfits.xml per sex) in a later milestone.
+        const OUTFIT_CATALOG: &[(u16, &[u8], u8)] = &[
+            (128, b"Citizen", 3),
+            (129, b"Hunter",  3),
+            (130, b"Mage",    3),
+            (131, b"Knight",  3),
+        ];
+        let outfit = match self.players.get(&id) {
+            Some(p) => p.outfit,
+            None => return,
+        };
+        let available: Vec<outfit_packets::AvailableOutfit> = OUTFIT_CATALOG
+            .iter()
+            .map(|&(look_type, name, addons)| outfit_packets::AvailableOutfit { look_type, name, addons })
+            .collect();
+        let pkt = outfit_packets::outfit_window(&outfit, &available, &[]);
+        self.push(id, pkt);
     }
 
     /// Resolve the true destination of a step, applying the two TFS vertical
@@ -1017,6 +1067,10 @@ enum Command {
     Say { id: u32, speak_type: SpeakType, text: String },
     /// Client `0xA1`: set (or clear) the attacker's target. `target_id == 0` clears.
     SetTarget { id: u32, target_id: u32 },
+    /// Client `0xD3`: apply a new outfit and broadcast `0x8E` to spectators.
+    ChangeOutfit { id: u32, outfit: Outfit },
+    /// Client `0xD2`: push `0xC8` outfit-window to the requester only.
+    RequestOutfit { id: u32 },
     /// Global combat tick fired by the `tokio::time::interval` task.
     CombatTick { now_ms: u64 },
 }
@@ -1068,6 +1122,18 @@ impl WorldHandle {
     /// Fire-and-forget; the world applies the PZ check and fight scheduling.
     pub async fn set_target(&self, id: u32, target_id: u32) {
         let _ = self.tx.send(Command::SetTarget { id, target_id }).await;
+    }
+
+    /// Apply a new outfit (`0xD3`) and broadcast `0x8E` to all spectators.
+    /// Fire-and-forget; the world actor owns the state update.
+    pub async fn change_outfit(&self, id: u32, outfit: Outfit) {
+        let _ = self.tx.send(Command::ChangeOutfit { id, outfit }).await;
+    }
+
+    /// Push the `0xC8` outfit-window to the requester only (`0xD2`).
+    /// Fire-and-forget; no reply is expected.
+    pub async fn request_outfit(&self, id: u32) {
+        let _ = self.tx.send(Command::RequestOutfit { id }).await;
     }
 }
 
@@ -2435,5 +2501,67 @@ mod tests {
             .expect("dead-session reap must also emit a SaveRecord");
         assert_eq!(rec.name, "Ghost");
         assert_eq!(rec.health, 50);
+    }
+
+    // ---------------------------------------------------------------------------
+    // M8 Slice B — outfit-change spine tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn change_outfit_updates_player_state() {
+        let mut g = Game::new(walk_map());
+        let (id, _rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let new_outfit = Outfit { look_type: 130, head: 10, body: 20, legs: 30, feet: 40, addons: 3, mount: 0 };
+        g.do_change_outfit(id, new_outfit);
+        assert_eq!(g.players[&id].outfit, new_outfit);
+    }
+
+    #[test]
+    fn change_outfit_broadcasts_0x8e_to_player_and_spectator() {
+        let mut g = Game::new(walk_map());
+        // Both players at the same tile so they are each other's spectators.
+        let (id, mut rx_self)  = add_player(&mut g, Position::new(95, 117, 7));
+        let (_spec, mut rx_spec) = add_player(&mut g, Position::new(95, 117, 7));
+        let new_outfit = Outfit { look_type: 130, head: 0, body: 0, legs: 0, feet: 0, addons: 0, mount: 0 };
+        g.do_change_outfit(id, new_outfit);
+
+        // Drain initial login messages; the LAST packet in the channel is the outfit broadcast.
+        let pkt_self = {
+            let mut last = None;
+            while let Ok(p) = rx_self.try_recv() { last = Some(p); }
+            last.expect("player must receive at least one packet (the 0x8E)")
+        };
+        let pkt_spec = {
+            let mut last = None;
+            while let Ok(p) = rx_spec.try_recv() { last = Some(p); }
+            last.expect("spectator must receive at least one packet (the 0x8E)")
+        };
+        assert_eq!(pkt_self[0], protocol::outfit::OP_CREATURE_OUTFIT, "player must receive 0x8E");
+        assert_eq!(pkt_spec[0], protocol::outfit::OP_CREATURE_OUTFIT, "spectator must receive 0x8E");
+        // Both packets must carry the changer's id.
+        let id_bytes = id.to_le_bytes();
+        assert_eq!(&pkt_self[1..5], &id_bytes);
+        assert_eq!(&pkt_spec[1..5], &id_bytes);
+    }
+
+    #[test]
+    fn change_outfit_unknown_id_is_noop() {
+        let mut g = Game::new(walk_map());
+        // Should not panic; game has no players.
+        g.do_change_outfit(0xDEAD_BEEF, Outfit { look_type: 130, head: 0, body: 0, legs: 0, feet: 0, addons: 0, mount: 0 });
+    }
+
+    #[test]
+    fn request_outfit_sends_0xc8_to_requester_only() {
+        let mut g = Game::new(walk_map());
+        let (id, mut rx_self)  = add_player(&mut g, Position::new(95, 117, 7));
+        let (_spec, mut rx_spec) = add_player(&mut g, Position::new(95, 117, 7));
+        // Drain any login-side packets first.
+        while rx_self.try_recv().is_ok() {}
+        while rx_spec.try_recv().is_ok() {}
+        g.do_request_outfit(id);
+        let pkt = rx_self.try_recv().expect("requester must receive 0xC8");
+        assert_eq!(pkt[0], protocol::outfit::OP_OUTFIT_WINDOW, "packet must be 0xC8");
+        assert!(rx_spec.try_recv().is_err(), "spectator must NOT receive anything");
     }
 }
