@@ -125,21 +125,42 @@ impl Store {
         Ok(Self { pool })
     }
 
-    /// Insert the hardcoded M1 test account (`test`/`test`) with two characters.
+    /// Insert the hardcoded M1 test account (`test`/`test`) with two characters,
+    /// plus two dev accounts (`diego`, `griss`) used for live PvP testing.
     pub async fn seed_test_account(&self) -> Result<(), PersistenceError> {
-        let account_id: i64 =
+        let account_test: i64 =
             sqlx::query_scalar("INSERT INTO accounts (name, password) VALUES (?, ?) RETURNING id")
                 .bind("test")
                 .bind("test")
                 .fetch_one(&self.pool)
                 .await?;
 
-        for name in ["Test Knight", "Test Sorcerer"] {
-            sqlx::query("INSERT INTO players (account_id, name) VALUES (?, ?)")
-                .bind(account_id)
-                .bind(name)
-                .execute(&self.pool)
+        let account_diego: i64 =
+            sqlx::query_scalar("INSERT INTO accounts (name, password) VALUES (?, ?) RETURNING id")
+                .bind("diego")
+                .bind("diego1")
+                .fetch_one(&self.pool)
                 .await?;
+
+        let account_griss: i64 =
+            sqlx::query_scalar("INSERT INTO accounts (name, password) VALUES (?, ?) RETURNING id")
+                .bind("griss")
+                .bind("griss1")
+                .fetch_one(&self.pool)
+                .await?;
+
+        for (account_id, names) in [
+            (account_test, ["Test Knight", "Test Sorcerer"]),
+            (account_diego, ["God Diego", "Diego"]),
+            (account_griss, ["Grissda", "Pastel"]),
+        ] {
+            for name in names {
+                sqlx::query("INSERT INTO players (account_id, name) VALUES (?, ?)")
+                    .bind(account_id)
+                    .bind(name)
+                    .execute(&self.pool)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -345,7 +366,11 @@ mod tests {
         let save = default_save("Test Knight");
 
         store.save_player(&save).await.unwrap();
-        let loaded = store.load_player("Test Knight").await.unwrap().expect("should be Some");
+        let loaded = store
+            .load_player("Test Knight")
+            .await
+            .unwrap()
+            .expect("should be Some");
 
         assert_eq!(loaded.name, save.name);
         assert_eq!(loaded.pos_x, save.pos_x);
@@ -393,7 +418,11 @@ mod tests {
         };
         store.save_player(&second).await.unwrap();
 
-        let loaded = store.load_player("Test Knight").await.unwrap().expect("should be Some");
+        let loaded = store
+            .load_player("Test Knight")
+            .await
+            .unwrap()
+            .expect("should be Some");
         assert_eq!(loaded.pos_x, 999);
         assert_eq!(loaded.pos_y, 888);
         assert_eq!(loaded.pos_z, 3);

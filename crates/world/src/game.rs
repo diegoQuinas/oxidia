@@ -593,12 +593,12 @@ impl Game {
         let temple = self.map.temple_for(death_pos);
 
         // --- Remove from death tile (mirrors logout) ---
-        let stackpos = self.map.creature_stackpos(
-            i32::from(death_pos.x), i32::from(death_pos.y), i32::from(death_pos.z));
+        // Id-form remove: under co-occupancy (stair/height landings) a
+        // position+stackpos remove is ambiguous when another creature shares the
+        // death tile. Matches logout and do_move.
         let spectators_death: Vec<u32> = self.spectators(death_pos, victim_id);
         for spec in &spectators_death {
-            self.push(*spec, tile_creature::remove_tile_thing(
-                (death_pos.x, death_pos.y, death_pos.z), stackpos));
+            self.push(*spec, walk::remove_creature_by_id(victim_id));
             if let Some(s) = self.players.get_mut(spec) { s.known.remove(&victim_id); }
         }
 
@@ -1758,6 +1758,39 @@ mod tests {
     }
 
     #[test]
+    fn death_remove_uses_id_form_for_coocc_safety() {
+        // Regression for the M7<->co-occupancy merge: do_death must remove the
+        // victim with the id-form (0x6C 0xFFFF <id>), not position+stackpos.
+        // Under co-occupancy (stair/height landings) a position+stackpos remove
+        // is ambiguous when another creature shares the death tile. Matches
+        // logout and do_move.
+        let mut g = Game::new(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(97, 117, 7));
+        let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
+        let max_hp = g.players[&b].max_health;
+        g.do_set_target(a, b);
+        g.players.get_mut(&b).unwrap().health = 1;
+        // Drive ticks until B dies; a single tick may roll 0 damage, so loop and
+        // drain A's channel each tick (avoids overflow) until the 0x6C remove
+        // appears. A is a spectator of B's death tile.
+        let mut remove_pkt: Option<Vec<u8>> = None;
+        for tick in 1..=(max_hp as u64 + 5) {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            while let Ok(pkt) = ra.try_recv() {
+                if pkt.first() == Some(&0x6C) {
+                    remove_pkt = Some(pkt);
+                }
+            }
+            if remove_pkt.is_some() {
+                break;
+            }
+        }
+        let pkt = remove_pkt.expect("spectator must receive a 0x6C remove on the victim's death");
+        assert_eq!(&pkt[1..3], &[0xFF, 0xFF], "death remove must be id-form (co-occupancy safe)");
+        assert_eq!(&pkt[3..7], &b.to_le_bytes(), "id-form remove carries the victim id");
+    }
+
+    #[test]
     fn tick_clears_target_when_target_logs_out() {
         // If the target logs out, the attacker's attacking must be cleared on the
         // next tick (no panic, no stale fight).
@@ -1862,15 +1895,22 @@ mod tests {
         let (c, _rc) = add_player(&mut g, Position::new(96, 117, 7));
         // Victim B starts adjacent to A so melee range works, then we force-kill.
         let (b, mut rb) = add_player(&mut g, Position::new(113, 117, 7));
+        let max_hp = g.players[&b].max_health;
         g.do_set_target(a, b);
         g.players.get_mut(&b).unwrap().health = 1;
-        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
 
-        // Drain all packets until we find the 0x64 map description sent on respawn.
+        // Drive ticks until B dies (a single tick may roll 0 damage); capture the
+        // 0x64 map description pushed to B on respawn.
         let mut map_desc: Option<Vec<u8>> = None;
-        while let Ok(pkt) = rb.try_recv() {
-            if pkt[0] == protocol::map_description::OPCODE_MAP_DESCRIPTION {
-                map_desc = Some(pkt);
+        for tick in 1..=(max_hp as u64 + 5) {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            while let Ok(pkt) = rb.try_recv() {
+                if pkt[0] == protocol::map_description::OPCODE_MAP_DESCRIPTION {
+                    map_desc = Some(pkt);
+                }
+            }
+            if map_desc.is_some() {
+                break;
             }
         }
         let map_bytes = map_desc.expect("respawned victim must receive a 0x64 map description");
@@ -1905,10 +1945,14 @@ mod tests {
 
         // A at (112,117) adjacent to B; force B to die.
         let (a, _ra) = add_player(&mut g, Position::new(112, 117, 7));
+        let max_hp = g.players[&b].max_health;
         g.do_set_target(a, b);
         g.players.get_mut(&b).unwrap().health = 1;
-        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
-        while rb.try_recv().is_ok() {} // drain
+        // Drive ticks until B dies + respawns (a single tick may roll 0 damage).
+        for tick in 1..=(max_hp as u64 + 5) {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            while rb.try_recv().is_ok() {} // drain to avoid channel overflow
+        }
 
         // B respawned at temple (95,117). X is at (110,117): dx=15 > VIEW_RIGHT(9).
         // B must have forgotten X — otherwise a re-encounter sends the short 0x62
