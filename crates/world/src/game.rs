@@ -84,6 +84,9 @@ pub struct InitialState {
     pub health: u16,
     /// Maximum hit points.
     pub max_health: u16,
+    /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
+    /// Selects the gendered outfit catalog served by do_request_outfit.
+    pub sex: u8,
 }
 
 /// Emitted on the save channel the instant a player leaves the game.
@@ -97,6 +100,8 @@ pub struct SaveRecord {
     pub outfit: Outfit,
     pub health: u16,
     pub max_health: u16,
+    /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
+    pub sex: u8,
 }
 
 struct PlayerState {
@@ -119,6 +124,9 @@ struct PlayerState {
     /// `CombatTick { now_ms }`. Initialized to 0 so the first eligible tick
     /// swings immediately (mirrors TFS `doAttacking` priming logic).
     last_attack_ms: u64,
+    /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
+    /// Determines which gendered outfit catalog is sent in the 0xC8 window.
+    sex: u8,
 }
 
 struct Game {
@@ -372,6 +380,7 @@ impl Game {
             name, position, direction, outfit, push_tx, known: HashSet::new(),
             health: initial.health, max_health: initial.max_health, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
+            sex: initial.sex,
         });
 
         // Render each existing player into the new client's enter-world map, and
@@ -416,6 +425,7 @@ impl Game {
                 outfit: p.outfit,
                 health: p.health,
                 max_health: p.max_health,
+                sex: p.sex,
             };
             // Unbounded send never blocks; error only if the worker is gone
             // (server shutting down) — silently drop in that case.
@@ -764,6 +774,7 @@ impl Game {
                 outfit: p.outfit,
                 health: p.max_health,
                 max_health: p.max_health,
+                sex: p.sex,
             });
         }
 
@@ -1367,6 +1378,7 @@ mod tests {
             outfit,
             health: 150,
             max_health: 150,
+            sex: 1, // male (default)
         }
     }
 
@@ -1380,6 +1392,7 @@ mod tests {
             outfit: knight(), push_tx: tx, known: HashSet::new(),
             health: 150, max_health: 150, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
+            sex: 1, // male (default)
         });
         (id, rx)
     }
@@ -1591,6 +1604,7 @@ mod tests {
             outfit: knight(),
             health: 150,
             max_health: 150,
+            sex: 1,
         };
         let ack = g.login("Returning".into(), initial, tx);
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
@@ -2962,6 +2976,7 @@ mod tests {
             outfit,
             health: 80,
             max_health: 120,
+            sex: 1,
         };
         let ack = g.login("Restored".into(), initial, tx);
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
@@ -2986,6 +3001,7 @@ mod tests {
             outfit: knight(),
             health: 150,
             max_health: 150,
+            sex: 1,
         };
         let ack = g.login("NewPlayer".into(), initial, tx);
         assert_eq!(
@@ -3013,6 +3029,7 @@ mod tests {
             outfit, push_tx: tx, known: HashSet::new(),
             health: 77, max_health: 150, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
+            sex: 1,
         });
 
         g.logout(id);
@@ -3044,6 +3061,7 @@ mod tests {
             outfit: knight(), push_tx: tx, known: HashSet::new(),
             health: 50, max_health: 150, fist_skill: 10,
             attacking: None, last_attack_ms: 0,
+            sex: 1,
         });
 
         // Pushing any payload triggers the dead-session reap → logout → save.
@@ -3140,5 +3158,52 @@ mod tests {
         g.do_move(p, Direction::East);
         let out_pz = drain_find_icons(&mut rp).expect("expected an icons packet leaving PZ");
         assert_eq!(out_pz, [enter_world::OP_ICONS, 0x00, 0x00], "icons cleared on leaving PZ");
+    }
+
+    // -------------------------------------------------------------------------
+    // M8 sex / gender plumbing tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn sex_is_set_from_initial_state_on_login() {
+        // RED: InitialState must carry a `sex` field that is stored in the live
+        // PlayerState and exposed via do_request_outfit catalog selection later.
+        let mut g = Game::new(walk_map());
+        let (tx, _rx) = mpsc::channel(PUSH_CAPACITY);
+        let initial = InitialState {
+            position: None,
+            direction: Direction::South,
+            outfit: knight(),
+            health: 150,
+            max_health: 150,
+            sex: 0, // female
+        };
+        let ack = g.login("Tester".into(), initial, tx);
+        assert_eq!(
+            g.players[&ack.snapshot.id].sex, 0,
+            "sex from InitialState must be stored in PlayerState"
+        );
+    }
+
+    #[test]
+    fn sex_is_emitted_in_save_record_on_logout() {
+        // RED: logout must carry sex into SaveRecord so the server can persist it.
+        let mut g = Game::new(walk_map());
+        let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
+        g.save_tx = Some(save_tx);
+        let (tx, _rx) = mpsc::channel(PUSH_CAPACITY);
+        let initial = InitialState {
+            position: None,
+            direction: Direction::South,
+            outfit: knight(),
+            health: 150,
+            max_health: 150,
+            sex: 0, // female
+        };
+        let ack = g.login("Tester".into(), initial, tx);
+        let id = ack.snapshot.id;
+        g.logout(id);
+        let rec = save_rx.try_recv().expect("logout must emit a SaveRecord");
+        assert_eq!(rec.sex, 0, "sex must round-trip login→logout through SaveRecord");
     }
 }
