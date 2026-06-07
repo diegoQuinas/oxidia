@@ -723,6 +723,66 @@ impl Game {
         self.map.tile_item_server_id(pos, idx)
     }
 
+    /// COW the source tile and remove (or split) `want` units of the item at stack
+    /// index `src_idx`. Returns the amount actually taken and whether the slot was
+    /// fully removed. `src_idx` must already be validated by the caller.
+    fn take_from_ground(&mut self, from: Position, src_idx: usize, want: u8, stackable: bool) -> Option<(u8, bool)> {
+        if !self.materialize(from) { return None; }
+        let st = self.dynamic.get_mut(&(from.x, from.y, from.z)).unwrap();
+        let cur = st.counts[src_idx].unwrap_or(1).max(1);
+        let moved = if stackable { want.max(1).min(cur) } else { 1 };
+        let removed_fully;
+        if stackable && cur > moved {
+            let left = cur - moved;
+            st.counts[src_idx] = Some(left);
+            st.items[src_idx].subtype = Some(left);
+            removed_fully = false;
+        } else {
+            st.items.remove(src_idx);
+            st.server_ids.remove(src_idx);
+            st.counts.remove(src_idx);
+            if src_idx < st.pre_creature_len { st.pre_creature_len -= 1; }
+            removed_fully = true;
+        }
+        Some((moved, removed_fully))
+    }
+
+    /// COW the dest tile and insert `moved` units of item `src_sid` at the FRONT of
+    /// the down-items, merging into a same-type front stack (cap 100, spill on
+    /// overflow). Returns `(merged_update, added)` wire items to broadcast at slot S.
+    fn add_to_ground_front(
+        &mut self, to: Position, src_sid: u16, client_id: u16, moved: u8, animated: bool, stackable: bool,
+    ) -> Option<(Option<WireItem>, Option<WireItem>)> {
+        if !self.materialize(to) { return None; }
+        let st = self.dynamic.get_mut(&(to.x, to.y, to.z)).unwrap();
+        let front = st.pre_creature_len;
+        let merge_at_front = stackable && st.server_ids.len() > front && st.server_ids[front] == src_sid;
+        if merge_at_front {
+            let total = u32::from(st.counts[front].unwrap_or(1).max(1)) + u32::from(moved);
+            let capped = total.min(100) as u8;
+            st.counts[front] = Some(capped);
+            st.items[front].subtype = Some(capped);
+            let merged_item = st.items[front];
+            if total > 100 {
+                let spill_count = u8::try_from(total - 100).unwrap_or(u8::MAX);
+                let spill_wi = WireItem { client_id, subtype: Some(spill_count), animated };
+                st.items.insert(front, spill_wi);
+                st.server_ids.insert(front, src_sid);
+                st.counts.insert(front, Some(spill_count));
+                Some((Some(merged_item), Some(spill_wi)))
+            } else {
+                Some((Some(merged_item), None))
+            }
+        } else {
+            let subtype = if stackable { Some(moved) } else { None };
+            let wi = WireItem { client_id, subtype, animated };
+            st.items.insert(front, wi);
+            st.server_ids.insert(front, src_sid);
+            st.counts.insert(front, subtype);
+            Some((None, Some(wi)))
+        }
+    }
+
     /// Move a thing from one map tile to another (M10.1: ground items only).
     /// Validates moveability, reach, and throw line-of-sight; removes `count`
     /// from the source (split or whole), then merges same-type stackables on the
@@ -766,75 +826,11 @@ impl Game {
 
         let moved_req = if stackable { count.max(1) } else { 1 };
 
-        // --- Source: COW + remove/split. Scope the get_mut so no other self.* call
-        //     overlaps the &mut borrow. ---
-        if !self.materialize(from) { return; }
-        let removed_fully;
-        let moved; // clamped amount actually taken from source
-        {
-            let st = self.dynamic.get_mut(&(from.x, from.y, from.z)).unwrap();
-            let cur = st.counts[src_idx].unwrap_or(1).max(1);
-            moved = if stackable { moved_req.min(cur) } else { 1 };
-            if stackable && cur > moved {
-                let left = cur - moved;
-                st.counts[src_idx] = Some(left);
-                st.items[src_idx].subtype = Some(left);
-                removed_fully = false;
-            } else {
-                st.items.remove(src_idx);
-                st.server_ids.remove(src_idx);
-                st.counts.remove(src_idx);
-                if src_idx < st.pre_creature_len { st.pre_creature_len -= 1; }
-                removed_fully = true;
-            }
-        }
+        let Some((moved, removed_fully)) = self.take_from_ground(from, src_idx, moved_req, stackable) else { return };
 
-        // ---- Destination: insert/merge at the FRONT of the down-items (newest on top). ----
-        // Compute dest_creatures before the get_mut borrow (immutable self borrow).
-        if !self.materialize(to) { return; }
         let dest_creatures = self.creatures_on(to).len();
-        // Results of the dest mutation, broadcast after the borrow ends:
-        // dest_merged_update: Some(WireItem) → 0x6B update of the existing (now-capped) stack at S
-        // dest_added:         Some(WireItem) → 0x6A add of the new/spill item at S
-        let dest_merged_update: Option<WireItem>;
-        let dest_added: Option<WireItem>;
-        {
-            let st = self.dynamic.get_mut(&(to.x, to.y, to.z)).unwrap();
-            let front = st.pre_creature_len;
-            // Merge only when the FRONT down-item is the same stackable type.
-            let merge_at_front = stackable
-                && st.server_ids.len() > front
-                && st.server_ids[front] == src_sid;
-            if merge_at_front {
-                let total = u32::from(st.counts[front].unwrap_or(1).max(1)) + u32::from(moved);
-                let capped = total.min(100) as u8;
-                st.counts[front] = Some(capped);
-                st.items[front].subtype = Some(capped);
-                let merged_item = st.items[front];
-                if total > 100 {
-                    // Overflow: spill the excess into a NEW stack placed on top (front).
-                    let spill_count = u8::try_from(total - 100).unwrap_or(u8::MAX);
-                    let spill_wi = WireItem { client_id, subtype: Some(spill_count), animated };
-                    st.items.insert(front, spill_wi);
-                    st.server_ids.insert(front, src_sid);
-                    st.counts.insert(front, Some(spill_count));
-                    dest_merged_update = Some(merged_item); // existing stack now capped at 100
-                    dest_added = Some(spill_wi);             // new spill stack on top
-                } else {
-                    dest_merged_update = Some(merged_item);
-                    dest_added = None;
-                }
-            } else {
-                // Non-merge: insert the moved item at the FRONT of the down-items.
-                let subtype = if stackable { Some(moved) } else { None };
-                let wi = WireItem { client_id, subtype, animated };
-                st.items.insert(front, wi);
-                st.server_ids.insert(front, src_sid);
-                st.counts.insert(front, if stackable { Some(moved) } else { None });
-                dest_merged_update = None;
-                dest_added = Some(wi);
-            }
-        }
+        let Some((dest_merged_update, dest_added)) =
+            self.add_to_ground_front(to, src_sid, client_id, moved, animated, stackable) else { return };
         // Broadcast: all dest changes target the top down-item slot S = front + creatures.
         // For the overflow case: UPDATE the existing stack at S first (it gets capped to 100),
         // then ADD the spill at S (which pushes the existing one down to S+1 on the client).
