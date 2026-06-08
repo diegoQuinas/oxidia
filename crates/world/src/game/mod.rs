@@ -13,16 +13,28 @@ use tokio::sync::{mpsc, oneshot};
 
 use rand::{SeedableRng, rngs::StdRng};
 
-use protocol::chat::{self, SpeakType};
+use protocol::chat as proto_chat;
+use protocol::chat::SpeakType;
 use protocol::combat_packets;
 use protocol::creature::{self, CreatureView, Outfit};
 use protocol::map_description::{PlacedCreature, TileSource, WireItem};
 use protocol::outfit as outfit_packets;
 use protocol::{enter_world, tile_creature, tile_item, walk};
 
-use crate::combat;
+use crate::combat as crate_combat;
 use crate::map::StaticMap;
 use crate::{Direction, Position};
+
+mod chat;
+mod combat;
+mod containers;
+mod gm;
+mod items;
+mod look;
+mod movement;
+mod session;
+#[cfg(test)]
+mod test_support;
 
 /// Outbound channel depth per session. A client that backs this up past the cap
 /// is treated as dead (logged out) rather than blocking the game loop or growing
@@ -1231,7 +1243,7 @@ impl Game {
         match speak_type {
             SpeakType::Say => {
                 let body = cap(text.as_bytes());
-                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &body);
+                let pkt = proto_chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &body);
                 self.push(id, pkt.clone());
                 // Chat is same-floor (TFS getSpectators multifloor=false); the
                 // band-aware `spectators` is for presence, not talk.
@@ -1241,7 +1253,7 @@ impl Game {
             }
             SpeakType::Yell => {
                 let body = cap(text.to_uppercase().as_bytes());
-                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &body);
+                let pkt = proto_chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &body);
                 self.push(id, pkt.clone());
                 for spec in self.spectators_in_range(pos, id, 18, 14) {
                     self.push(spec, pkt.clone());
@@ -1249,13 +1261,13 @@ impl Game {
             }
             SpeakType::Whisper => {
                 let full = cap(text.as_bytes());
-                self.push(id, chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &full));
+                self.push(id, proto_chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &full));
                 for spec in self.spectators_in_range(pos, id, 8, 6) {
                     let Some(spos) = self.players.get(&spec).map(|p| p.position) else { continue };
                     let adjacent = (i32::from(spos.x) - i32::from(pos.x)).abs() <= 1
                         && (i32::from(spos.y) - i32::from(pos.y)).abs() <= 1;
                     let heard: &[u8] = if adjacent { &full } else { b"pspsps" };
-                    self.push(spec, chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, heard));
+                    self.push(spec, proto_chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, heard));
                 }
             }
         }
@@ -2598,7 +2610,7 @@ impl Game {
                 continue; // out of melee range, no swing this tick
             }
             // Roll damage.
-            let dmg = combat::fist_damage(&mut self.rng, 1, fist_skill);
+            let dmg = crate_combat::fist_damage(&mut self.rng, 1, fist_skill);
             // Update last_attack_ms before applying damage (apply_damage may call
             // do_death which removes the attacker's fight — the timestamp update
             // must not be lost in that chain).
