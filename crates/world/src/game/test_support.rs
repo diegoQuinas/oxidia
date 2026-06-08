@@ -60,6 +60,11 @@ pub(super) fn knight() -> Outfit {
     Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
 }
 
+/// A custom outfit distinct from the default knight outfit, for restore tests.
+pub(super) fn wizard_outfit() -> Outfit {
+    Outfit { look_type: 75, head: 20, body: 30, legs: 40, feet: 50, addons: 1, mount: 0 }
+}
+
 /// Build a default `InitialState` for use in tests that don't care about
 /// the restored-vs-new distinction.
 pub(super) fn default_initial(outfit: Outfit) -> InitialState {
