@@ -975,14 +975,34 @@ impl Game {
         }
     }
 
-    /// Add `item` to the front (slot 0) of an open container and notify the player.
+    /// Add `item` to the front (slot 0) of a container. Notifies the player only
+    /// when the window is currently open — a retained-but-closed container (e.g. a
+    /// nested bag the item was dropped into without opening it) tracks the item in
+    /// memory but sends no `0x70`, since the client has no widget for that cid.
     fn push_item_to_container(&mut self, id: u32, cid: u8, item: ContainerItem) {
         let Some(p) = self.players.get_mut(&id) else { return };
-        let Some(oc) = p.open_containers[cid as usize].as_mut() else { return };
-        if oc.items.len() >= oc.capacity as usize { return; } // container full
-        oc.items.insert(0, item);
-        let wire = item.wire();
-        self.push(id, protocol::container::add_container_item(cid, 0, &wire));
+        let notify = {
+            let Some(oc) = p.open_containers[cid as usize].as_mut() else { return };
+            if oc.items.len() >= oc.capacity as usize { return; } // container full
+            let notify = oc.is_open;
+            oc.items.insert(0, item);
+            notify
+        };
+        // Inserting at the front shifts every existing item down one slot, so any
+        // nested container addressed by (parent_cid == cid, parent_slot) must have
+        // its cached slot incremented to stay addressable. Without this the slot
+        // goes stale, a duplicate cid is allocated on the next drop-into, and the
+        // item is stranded. Symmetric to close_orphaned_nested_container's removal
+        // adjustment.
+        for o in p.open_containers.iter_mut().flatten() {
+            if let ContainerSource::Nested { parent_cid: pc, ref mut parent_slot } = o.source {
+                if pc == cid { *parent_slot = parent_slot.saturating_add(1); }
+            }
+        }
+        if notify {
+            let wire = item.wire();
+            self.push(id, protocol::container::add_container_item(cid, 0, &wire));
+        }
     }
 
     /// Remove the item at `slot` from an open container and notify the player.
@@ -998,6 +1018,49 @@ impl Game {
         let pkt = protocol::container::remove_container_item(cid, slot as u16, None);
         self.push(id, pkt);
         Some(removed)
+    }
+
+    /// If the item at `slot_idx` inside container `parent_cid` is itself a
+    /// container, return the cid that tracks that nested container's contents —
+    /// reusing its already-allocated cid, or allocating a fresh closed one if the
+    /// bag has never been opened. Returns `None` when the destination slot holds
+    /// no container (the caller then inserts into `parent_cid` directly).
+    ///
+    /// Faithful to TFS `Container::queryDestination`, which descends into a
+    /// destination slot that holds a container instead of placing beside it.
+    fn nested_dest_cid(&mut self, id: u32, parent_cid: u8, slot_idx: usize) -> Option<u8> {
+        let sid = {
+            let p = self.players.get(&id)?;
+            let oc = p.open_containers[parent_cid as usize].as_ref()?;
+            oc.items.get(slot_idx)?.server_id
+        };
+        let meta = self.map.item_meta(sid)?;
+        if !meta.is_container { return None; }
+
+        // Reuse the cid already tracking this exact nested slot, if any.
+        let target = ContainerSource::Nested { parent_cid, parent_slot: slot_idx as u8 };
+        if let Some(p) = self.players.get(&id) {
+            if let Some(c) = (0u8..16).find(|&c| {
+                p.open_containers[c as usize].as_ref().is_some_and(|o| matches_source(o.source, target))
+            }) {
+                return Some(c);
+            }
+        }
+
+        // Allocate a fresh, closed cid to hold the nested bag's contents.
+        let p = self.players.get(&id)?;
+        let cid = Self::next_free_cid(p)?;
+        let oc = OpenContainer {
+            server_id: sid,
+            client_id: meta.client_id,
+            capacity: meta.container_capacity.max(1),
+            name: meta.name.clone(),
+            items: Vec::new(),
+            source: target,
+            is_open: false,
+        };
+        self.players.get_mut(&id)?.open_containers[cid as usize] = Some(oc);
+        Some(cid)
     }
 
     fn do_turn(&mut self, id: u32, direction: Direction) {
@@ -1557,18 +1620,36 @@ impl Game {
             let fc = from_cid.unwrap();
             let fs = from_slot_idx.unwrap();
             let tc = to_cid.unwrap();
+            let ts = to_slot_idx.unwrap();
 
-            // Pull the item out of `from`.
+            // Dropping an item onto its own source slot is a no-op.
+            if fc == tc && fs == ts { return; }
+
+            // Resolve the real destination BEFORE removing the source item, so the
+            // descent index math isn't disturbed by the removal. If the destination
+            // slot holds a container, the item goes INTO it (TFS queryDestination).
+            // We don't descend when the moved item is itself a container: our flat
+            // cid model can't safely deep-nest bag-in-bag-in-bag.
+            let moving_is_container = self.players.get(&id)
+                .and_then(|p| p.open_containers[fc as usize].as_ref())
+                .and_then(|oc| oc.items.get(fs))
+                .and_then(|it| self.map.item_meta(it.server_id))
+                .is_some_and(|m| m.is_container);
+            let dest_cid = if moving_is_container { tc }
+                else { self.nested_dest_cid(id, tc, ts).unwrap_or(tc) };
+
+            // Pull the item out of `from`. close_orphaned fixes nested-cid slot
+            // bookkeeping for the removal — including the dest cid if fc == tc.
             let item = match self.pop_item_from_container(id, fc, fs) {
                 Some(i) => i,
                 None => return,
             };
             self.close_orphaned_nested_container(id, fc, fs);
 
-            // Check capacity on dest.
+            // Check capacity on the resolved destination.
             let dest_full = {
                 let p = match self.players.get(&id) { Some(p) => p, None => return };
-                match p.open_containers[tc as usize].as_ref() {
+                match p.open_containers[dest_cid as usize].as_ref() {
                     Some(oc) => oc.items.len() >= oc.capacity as usize,
                     None => return,
                 }
@@ -1580,8 +1661,7 @@ impl Game {
             }
 
             // Insert into destination at front (TFS: addThing → push_front).
-            let _ = to_slot_idx; // not used for destination insert; always prepend
-            self.push_item_to_container(id, tc, item);
+            self.push_item_to_container(id, dest_cid, item);
             return;
         }
 
@@ -1966,6 +2046,7 @@ impl Game {
             GmVerb::Teleport => self.gm_teleport(id, &args),
             GmVerb::TeleportTo => self.gm_teleportto(id, &args),
             GmVerb::Bring => self.gm_bring(id, &args),
+            GmVerb::ChangeSex => self.gm_changesex(id, &args),
         }
     }
 
@@ -2138,6 +2219,38 @@ impl Game {
         let Some(pos) = self.players.get(&id).map(|p| p.position) else { return };
         self.do_teleport(target, pos);
         self.push_status_message(id, format!("Brought {name} to you.").as_bytes());
+    }
+
+    fn gm_changesex(&mut self, id: u32, args: &[&str]) {
+        let (Some(name), Some(sex_str)) = (args.first(), args.get(1)) else {
+            self.push_status_message(id, b"Usage: /changesex <name> <male|female>");
+            return;
+        };
+        let new_sex: u8 = match sex_str.to_lowercase().as_str() {
+            "male" => 1,
+            "female" => 0,
+            _ => {
+                self.push_status_message(id, b"Sex must be 'male' or 'female'.");
+                return;
+            }
+        };
+        // Default look_type per sex: 128 = male Citizen, 136 = female Citizen.
+        let default_look_type: u16 = if new_sex == 1 { 128 } else { 136 };
+        let Some(target) = self.find_player_by_name(name) else {
+            self.push_status_message(id, format!("Player '{name}' not found.").as_bytes());
+            return;
+        };
+        let new_outfit = match self.players.get_mut(&target) {
+            Some(p) => {
+                p.sex = new_sex;
+                p.outfit.look_type = default_look_type;
+                p.outfit
+            }
+            None => return,
+        };
+        self.do_change_outfit(target, new_outfit);
+        let sex_label = if new_sex == 1 { "male" } else { "female" };
+        self.push_status_message(id, format!("{name} is now {sex_label}.").as_bytes());
     }
 
     /// Place a fresh item on `pos` and broadcast a `0x6A` add to spectators.
@@ -2664,6 +2777,7 @@ enum GmVerb {
     Teleport,
     TeleportTo,
     Bring,
+    ChangeSex,
 }
 
 impl GmVerb {
@@ -2676,6 +2790,7 @@ impl GmVerb {
         Self::Teleport,
         Self::TeleportTo,
         Self::Bring,
+        Self::ChangeSex,
     ];
 
     /// Accepted command words (first is canonical; the rest are aliases).
@@ -2688,6 +2803,7 @@ impl GmVerb {
             Self::Teleport => &["teleport"],
             Self::TeleportTo => &["teleportto"],
             Self::Bring => &["bring"],
+            Self::ChangeSex => &["changesex"],
         }
     }
 
@@ -2701,6 +2817,7 @@ impl GmVerb {
             Self::Teleport => "/teleport \"player\" <x> <y> <z>",
             Self::TeleportTo => "/teleportto \"player\"",
             Self::Bring => "/bring \"player\"",
+            Self::ChangeSex => "/changesex \"player\" <male|female>",
         }
     }
 
@@ -2714,6 +2831,7 @@ impl GmVerb {
             Self::Teleport => "Teleport another player to coordinates.",
             Self::TeleportTo => "Teleport yourself next to another player.",
             Self::Bring => "Teleport another player to you.",
+            Self::ChangeSex => "Change a player's sex and reset their look type.",
         }
     }
 
@@ -5625,6 +5743,102 @@ mod tests {
     /// Helper: assert a packet list contains at least one packet whose first byte is `op`.
     fn has_op(packets: &[Vec<u8>], op: u8) -> bool {
         packets.iter().any(|p| p.first() == Some(&op))
+    }
+
+    #[test]
+    fn drop_onto_nested_bag_opened_before_parent_shift_is_not_lost() {
+        // Real loss repro: open the inner bag FIRST (its cid is pinned to the slot
+        // it occupied then), THEN insert an item at the front of the parent — which
+        // shifts the inner bag down a slot — THEN drag an item onto the inner bag.
+        // Without slot maintenance on insertion the inner bag's cached parent_slot
+        // goes stale: a duplicate cid is allocated, close_orphaned collapses both to
+        // the same source, and the empty stale cid shadows the one holding the item
+        // on reopen -> the item is stranded. The fix keeps exactly one nested cid,
+        // open, holding the item.
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.players.get_mut(&player).unwrap().inventory[2] =
+            Some(InvItem { server_id: 600, client_id: 1988, count: None, animated: false });
+        // Parent backpack (cid 0) initially holds only the inner bag at slot 0.
+        g.players.get_mut(&player).unwrap().open_containers[0] = Some(OpenContainer {
+            server_id: 600, client_id: 1988, capacity: 20, name: "backpack".into(),
+            items: vec![ContainerItem { server_id: 600, client_id: 1988, count: None, animated: false }],
+            source: ContainerSource::Slot(3), is_open: true,
+        });
+        drain(&mut rx);
+
+        // Open the inner bag (parent cid 0, slot 0) -> nested cid pinned to slot 0.
+        g.do_use_item(player, 0xFFFF, 0x40, 0, 0, 0);
+        // Insert a stone at the FRONT of the parent, shifting the inner bag to slot 1.
+        g.push_item_to_container(player, 0, ContainerItem { server_id: 200, client_id: 1987, count: None, animated: false });
+        drain(&mut rx);
+
+        // Drag the stone (cid 0, slot 0) onto the inner bag icon (cid 0, slot 1).
+        g.do_move_container(player, Position::new(0xFFFF, 0x40, 0), 0, Position::new(0xFFFF, 0x40, 1), 1);
+
+        // Exactly one nested cid under the parent, open, holding the stone.
+        let nested: Vec<&OpenContainer> = (0u8..16).filter_map(|c| {
+            g.players[&player].open_containers[c as usize].as_ref()
+                .filter(|oc| matches!(oc.source, ContainerSource::Nested { parent_cid: 0, .. }))
+        }).collect();
+        assert_eq!(nested.len(), 1, "exactly one nested cid (no shadow duplicate)");
+        assert!(nested[0].items.iter().any(|i| i.server_id == 200),
+            "stone must be inside the inner bag, not stranded; contents: {:?}",
+            nested[0].items.iter().map(|i| i.server_id).collect::<Vec<_>>());
+        assert!(nested[0].is_open, "inner bag stays open and shows the stone");
+    }
+
+    #[test]
+    fn drop_item_onto_nested_bag_routes_inside_and_is_retrievable() {
+        // Issue 2 repro: drag a non-container item onto a CLOSED nested bag icon
+        // inside an open parent backpack. The item must route INTO the nested bag
+        // (vanishing from the parent window, no false re-add) and be retrievable
+        // by opening that nested bag. Parent = cid 0 (inventory slot 3) holding
+        // [stone@slot0, inner-backpack@slot1].
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        {
+            let p = g.players.get_mut(&player).unwrap();
+            p.inventory[2] = Some(InvItem { server_id: 600, client_id: 1988, count: None, animated: false });
+            p.open_containers[0] = Some(OpenContainer {
+                server_id: 600, client_id: 1988, capacity: 20, name: "backpack".into(),
+                items: vec![
+                    ContainerItem { server_id: 200, client_id: 1987, count: None, animated: false }, // stone slot 0
+                    ContainerItem { server_id: 600, client_id: 1988, count: None, animated: false }, // inner bag slot 1
+                ],
+                source: ContainerSource::Slot(3), is_open: true,
+            });
+        }
+        drain(&mut rx);
+
+        // Drag stone (cid 0, slot 0) onto the inner bag (cid 0, slot 1).
+        let from = Position::new(0xFFFF, 0x40, 0); // cid 0, slot 0
+        let to = Position::new(0xFFFF, 0x40, 1);   // cid 0, slot 1 (inner bag)
+        g.do_move_container(player, from, 0, to, 1);
+
+        // Parent must keep only the inner bag; the stone left it.
+        let parent = g.players[&player].open_containers[0].as_ref().unwrap();
+        assert_eq!(parent.items.len(), 1, "parent should keep only the inner bag");
+        assert_eq!(parent.items[0].server_id, 600, "remaining parent item is the inner bag");
+
+        // A nested cid must now track the inner bag and hold the stone.
+        let nested = (0u8..16).find(|&c| {
+            c != 0 && g.players[&player].open_containers[c as usize].as_ref()
+                .is_some_and(|o| matches!(o.source, ContainerSource::Nested { parent_cid: 0, .. }))
+        }).expect("a nested cid must be allocated for the inner bag");
+        let noc = g.players[&player].open_containers[nested as usize].as_ref().unwrap();
+        assert_eq!(noc.items.len(), 1, "inner bag must hold the routed stone (not lost)");
+        assert_eq!(noc.items[0].server_id, 200, "routed item is the stone");
+
+        // Retrievable: opening the inner bag (now at parent slot 0) shows the stone.
+        drain(&mut rx);
+        g.do_use_item(player, 0xFFFF, 0x40, 0, 0, 0); // container endpoint: cid 0, slot 0
+        let pkts = drain(&mut rx);
+        assert!(has_op(&pkts, protocol::container::OP_OPEN_CONTAINER),
+            "opening the inner bag must push 0x6E; got {:?}", pkts);
+        let noc = g.players[&player].open_containers[nested as usize].as_ref().unwrap();
+        assert!(noc.is_open, "inner bag must be open after use");
+        assert_eq!(noc.items[0].server_id, 200, "stone must be visible inside the opened inner bag");
     }
 
     /// Count how many dynamic tiles currently hold an item with server id `sid`,
