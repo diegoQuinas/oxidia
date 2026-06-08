@@ -2234,21 +2234,14 @@ impl Game {
                 return;
             }
         };
-        // Default look_type per sex: 128 = male Citizen, 136 = female Citizen.
-        let default_look_type: u16 = if new_sex == 1 { 128 } else { 136 };
         let Some(target) = self.find_player_by_name(name) else {
             self.push_status_message(id, format!("Player '{name}' not found.").as_bytes());
             return;
         };
-        let new_outfit = match self.players.get_mut(&target) {
-            Some(p) => {
-                p.sex = new_sex;
-                p.outfit.look_type = default_look_type;
-                p.outfit
-            }
+        match self.players.get_mut(&target) {
+            Some(p) => p.sex = new_sex,
             None => return,
         };
-        self.do_change_outfit(target, new_outfit);
         let sex_label = if new_sex == 1 { "male" } else { "female" };
         self.push_status_message(id, format!("{name} is now {sex_label}.").as_bytes());
     }
