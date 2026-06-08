@@ -1074,6 +1074,21 @@ impl Game {
         Some(cid)
     }
 
+    /// Re-key the open-container window whose source matches `old` to `new`, so a
+    /// container's tracked contents follow the item when it moves between an
+    /// inventory slot and the ground. A source location uniquely identifies one
+    /// window, so the first match is the only one. No-op if nothing matches (the
+    /// moved item is not a container, or was never opened this session).
+    fn rekey_container_source(&mut self, id: u32, old: ContainerSource, new: ContainerSource) {
+        let Some(p) = self.players.get_mut(&id) else { return };
+        for oc in p.open_containers.iter_mut().flatten() {
+            if matches_source(oc.source, old) {
+                oc.source = new;
+                break;
+            }
+        }
+    }
+
     /// Close every open ground container the player has walked out of range of
     /// (more than one tile on x/y, or a different floor). Inventory and nested
     /// containers travel with the player and are never closed by walking. Mirrors
@@ -1567,6 +1582,9 @@ impl Game {
                     p.inventory[(slot - 1) as usize] = Some(InvItem { server_id: src_sid, client_id, count: cnt, animated });
                 }
                 self.push_inventory_slot(id, slot);
+                // A container picked up from the ground keeps its contents: follow
+                // its open window from the ground tile to the inventory slot.
+                self.rekey_container_source(id, ContainerSource::Ground(from), ContainerSource::Slot(slot));
             }
             // ---- unequip: slot → ground ----
             (Some(slot), None) => {
@@ -1604,6 +1622,10 @@ impl Game {
                 let dest_s = (dest_front + dest_creatures).min(9) as u8;
                 if let Some(item) = merged { self.broadcast_dest(to, dest_s, item, true); }
                 if let Some(item) = added { self.broadcast_dest(to, dest_s, item, false); }
+                // A thrown container keeps its contents: follow its open window to
+                // the ground tile, then close it if the throw landed out of range.
+                self.rekey_container_source(id, ContainerSource::Slot(slot), ContainerSource::Ground(to));
+                self.auto_close_ground_containers(id);
             }
             // ---- slot → slot: move or swap ----
             (Some(src), Some(dst)) => {
@@ -5816,6 +5838,40 @@ mod tests {
     /// Helper: assert a packet list contains at least one packet whose first byte is `op`.
     fn has_op(packets: &[Vec<u8>], op: u8) -> bool {
         packets.iter().any(|p| p.first() == Some(&op))
+    }
+
+    #[test]
+    fn throwing_open_inventory_container_follows_to_ground_with_contents() {
+        // New issue: throwing an open inventory backpack must not strand its
+        // contents on the old slot window. The window follows the item to the
+        // ground tile (contents intact) and closes if the throw lands out of
+        // range — exactly one window, no duplicate, no empty ground bag.
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        {
+            let p = g.players.get_mut(&player).unwrap();
+            p.inventory[2] = Some(InvItem { server_id: 600, client_id: 1988, count: None, animated: false });
+            p.open_containers[0] = Some(OpenContainer {
+                server_id: 600, client_id: 1988, capacity: 20, name: "backpack".into(),
+                items: vec![ContainerItem { server_id: 200, client_id: 1987, count: None, animated: false }],
+                source: ContainerSource::Slot(3), is_open: true,
+            });
+        }
+        drain(&mut rx);
+
+        // Throw the backpack from slot 3 to a far ground tile (105,100,7).
+        g.do_move_inventory(player, Position::new(0xFFFF, 3, 0), 0, Position::new(105, 100, 7), 1);
+
+        let cids: Vec<&OpenContainer> = (0u8..16)
+            .filter_map(|c| g.players[&player].open_containers[c as usize].as_ref())
+            .collect();
+        assert_eq!(cids.len(), 1, "still exactly one container window (no duplicate)");
+        assert!(matches!(cids[0].source, ContainerSource::Ground(p) if p == Position::new(105, 100, 7)),
+            "window re-keyed to the ground tile; got {:?}", cids[0].source);
+        assert!(!cids[0].is_open, "thrown out of range -> window closed");
+        assert!(cids[0].items.iter().any(|i| i.server_id == 200),
+            "contents preserved on the ground container");
+        assert!(g.players[&player].inventory[2].is_none(), "slot 3 emptied by the throw");
     }
 
     #[test]
