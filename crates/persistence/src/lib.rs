@@ -92,6 +92,10 @@ pub struct PlayerSave {
     pub sex: u8,
     /// Equipped items: `(slot 1..=10, server_id, count)`.
     pub inventory: Vec<(u8, u16, u8)>,
+    /// Container contents: `(inv_slot 1..=10, path, server_id, count)`.
+    /// `path` is `""` for items directly in the top-level bag, `"N"` for items
+    /// inside the sub-container at slot N of that bag, etc.
+    pub container_items: Vec<(u8, String, u16, u8)>,
 }
 
 /// Handle to the account/player database.
@@ -245,6 +249,23 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        // Replace container contents.
+        sqlx::query("DELETE FROM player_container_items WHERE player_name = ?")
+            .bind(&state.name)
+            .execute(&mut *tx)
+            .await?;
+        for (inv_slot, path, server_id, count) in &state.container_items {
+            sqlx::query(
+                "INSERT INTO player_container_items (player_name, inv_slot, slot_path, server_id, count) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&state.name)
+            .bind(i64::from(*inv_slot))
+            .bind(path)
+            .bind(i64::from(*server_id))
+            .bind(i64::from(*count))
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -296,6 +317,23 @@ impl Store {
                 )
             })
             .collect();
+        let container_rows = sqlx::query(
+            "SELECT inv_slot, slot_path, server_id, count FROM player_container_items WHERE player_name = ? ORDER BY id",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await?;
+        let container_items: Vec<(u8, String, u16, u8)> = container_rows
+            .iter()
+            .map(|cr| {
+                (
+                    cr.get::<i64, _>("inv_slot") as u8,
+                    cr.get::<String, _>("slot_path"),
+                    cr.get::<i64, _>("server_id") as u16,
+                    cr.get::<i64, _>("count") as u8,
+                )
+            })
+            .collect();
         Ok(Some(PlayerSave {
             name: r.get("name"),
             pos_x: r.get::<i64, _>("pos_x") as u16,
@@ -316,6 +354,7 @@ impl Store {
             look_mount: r.get::<i64, _>("look_mount") as u16,
             sex: r.get::<i64, _>("sex") as u8,
             inventory,
+            container_items,
         }))
     }
 
@@ -400,6 +439,7 @@ mod tests {
             look_mount: 0,
             sex: 1, // male (default)
             inventory: Vec::new(),
+            container_items: Vec::new(),
         }
     }
 
@@ -488,6 +528,7 @@ mod tests {
             look_mount: 42,
             sex: 1,
             inventory: Vec::new(),
+            container_items: Vec::new(),
         };
         store.save_player(&second).await.unwrap();
 

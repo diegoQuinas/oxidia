@@ -104,6 +104,10 @@ pub struct InitialState {
     /// Equipped items to restore: `(slot 1..=10, server_id, count)`. Empty for
     /// new characters. The world resolves each `server_id` via the item catalog.
     pub inventory: Vec<(u8, u16, u8)>,
+    /// Container contents to restore: `(inv_slot 1..=10, path, server_id, count)`.
+    /// `path` is `""` for items directly in the top-level bag, `"N"` for items
+    /// inside the sub-container at slot N of that bag, and so on for deeper nesting.
+    pub container_items: Vec<(u8, String, u16, u8)>,
 }
 
 /// Emitted on the save channel the instant a player leaves the game.
@@ -121,6 +125,8 @@ pub struct SaveRecord {
     pub sex: u8,
     /// Equipped items at logout: `(slot 1..=10, server_id, count)`.
     pub inventory: Vec<(u8, u16, u8)>,
+    /// Container contents at logout: `(inv_slot 1..=10, path, server_id, count)`.
+    pub container_items: Vec<(u8, String, u16, u8)>,
 }
 
 /// One equipped item, with the cached wire fields needed to re-send `0x78`.
@@ -131,6 +137,60 @@ struct InvItem {
     /// Stack count for stackables (ammo); `None` for non-stackables.
     count: Option<u8>,
     animated: bool,
+}
+
+/// One item held inside an open container.
+#[derive(Debug, Clone, Copy)]
+struct ContainerItem {
+    server_id: u16,
+    client_id: u16,
+    count: Option<u8>,
+    animated: bool,
+}
+
+impl ContainerItem {
+    fn wire(&self) -> protocol::container::ContainerWireItem {
+        protocol::container::ContainerWireItem {
+            client_id: self.client_id,
+            subtype: self.count,
+            animated: self.animated,
+        }
+    }
+}
+
+/// Where a container was opened from (determines `has_parent` and navigation).
+#[derive(Debug, Clone, Copy)]
+enum ContainerSource {
+    /// Opened from inventory slot 1..=10.
+    Slot(u8),
+    /// Opened from inside another open container (parent cid + item slot).
+    Nested { parent_cid: u8, parent_slot: u8 },
+}
+
+fn matches_source(a: ContainerSource, b: ContainerSource) -> bool {
+    match (a, b) {
+        (ContainerSource::Slot(x), ContainerSource::Slot(y)) => x == y,
+        (ContainerSource::Nested { parent_cid: pa, parent_slot: ps },
+         ContainerSource::Nested { parent_cid: qa, parent_slot: qs }) => pa == qa && ps == qs,
+        _ => false,
+    }
+}
+
+/// One container the player has in their possession, with an optional open window.
+/// Contents survive close+reopen within the same session (`is_open` toggles the
+/// visibility; `= None` in the cid slot means the slot itself is unallocated).
+#[derive(Debug, Clone)]
+struct OpenContainer {
+    #[allow(dead_code)] // retained for future lookup-by-item-type use
+    server_id: u16,
+    client_id: u16,
+    capacity: u8,
+    name: String,
+    items: Vec<ContainerItem>,
+    source: ContainerSource,
+    /// Whether the client window is currently showing. `false` means the player
+    /// closed the window but the items are still in memory.
+    is_open: bool,
 }
 
 struct PlayerState {
@@ -160,6 +220,8 @@ struct PlayerState {
     gamemaster: bool,
     /// Equipment slots 1..=10, indexed 0..=9. `None` = empty slot.
     inventory: [Option<InvItem>; 10],
+    /// Open container windows, indexed by cid (0..=15). `None` = window not open.
+    open_containers: [Option<OpenContainer>; 16],
 }
 
 struct Game {
@@ -347,6 +409,10 @@ impl Game {
             Command::LookBattle { id, target_id } => self.do_look_battle(id, target_id),
             Command::MoveThing { id, from, from_stackpos, to, count } =>
                 self.do_move_thing(id, from, from_stackpos, to, count),
+            Command::UseItem { id, pos_x, pos_y, pos_z, stackpos, index } =>
+                self.do_use_item(id, pos_x, pos_y, pos_z, stackpos, index),
+            Command::CloseContainer { id, cid } => self.do_close_container(id, cid),
+            Command::UpArrow { id, cid } => self.do_up_arrow(id, cid),
             Command::Gm { id, text } => self.do_gm_command(id, text),
             // Intercepted in the actor loop (it must break the loop + ack);
             // never reaches `handle`. Arm kept for match exhaustiveness.
@@ -451,6 +517,9 @@ impl Game {
             }
         }
 
+        // Restore container contents from InitialState.
+        let open_containers = Self::restore_containers(&initial.container_items, &inventory, &self.map);
+
         self.players.insert(id, PlayerState {
             name, position, direction, outfit, push_tx, known: HashSet::new(),
             health: initial.health, max_health: initial.max_health, fist_skill: 10,
@@ -458,6 +527,7 @@ impl Game {
             sex: initial.sex,
             gamemaster: initial.gamemaster,
             inventory,
+            open_containers,
         });
 
         // Render each existing player into the new client's enter-world map, and
@@ -535,6 +605,7 @@ impl Game {
             let inventory: Vec<(u8, u16, u8)> = p.inventory.iter().enumerate()
                 .filter_map(|(i, slot)| slot.map(|it| ((i + 1) as u8, it.server_id, it.count.unwrap_or(1))))
                 .collect();
+            let container_items = Self::export_container_items(&p.inventory, &p.open_containers);
             let rec = SaveRecord {
                 name: p.name.clone(),
                 position: p.position,
@@ -544,6 +615,7 @@ impl Game {
                 max_health: p.max_health,
                 sex: p.sex,
                 inventory,
+                container_items,
             };
             // Unbounded send never blocks; error only if the worker is gone
             // (server shutting down) — silently drop in that case.
@@ -583,8 +655,337 @@ impl Game {
                 inventory: p.inventory.iter().enumerate()
                     .filter_map(|(i, slot)| slot.map(|it| ((i + 1) as u8, it.server_id, it.count.unwrap_or(1))))
                     .collect(),
+                container_items: Self::export_container_items(&p.inventory, &p.open_containers),
             });
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Container helpers
+    // -----------------------------------------------------------------------
+
+    /// Restore container state from persisted items. Builds `OpenContainer`
+    /// structs (in the closed state — not pushed to the client here; the player
+    /// must re-open them). Container contents are stored so that once the player
+    /// re-opens the bag the items are already there.
+    ///
+    /// Path format: `""` = top-level bag (inv_slot), `"N"` = item at slot N
+    /// inside that bag (when it's a container), `"N/M"` = slot M inside
+    /// the sub-bag at slot N, etc.
+    /// Restore container state from persisted items. Builds closed `OpenContainer`
+    /// entries (not shown to the client on login — the player must re-open them).
+    /// Supports one level of nesting: items directly inside an inventory-slot bag.
+    /// Nested-bag contents are not restored (shown empty until moved this session).
+    fn restore_containers(
+        rows: &[(u8, String, u16, u8)],
+        inventory: &[Option<InvItem>; 10],
+        map: &StaticMap,
+    ) -> [Option<OpenContainer>; 16] {
+        // Group rows by inv_slot, sorting by the numeric path so items are in order.
+        let mut by_slot: std::collections::HashMap<u8, Vec<(usize, u16, u8)>> = Default::default();
+        for (inv_slot, path, sid, cnt) in rows {
+            let idx = path.parse::<usize>().unwrap_or(0);
+            by_slot.entry(*inv_slot).or_default().push((idx, *sid, *cnt));
+        }
+        for v in by_slot.values_mut() {
+            v.sort_by_key(|&(idx, _, _)| idx);
+        }
+
+        let mut result: [Option<OpenContainer>; 16] = Default::default();
+        let mut cid = 0u8;
+        for (slot_0, inv_item) in inventory.iter().enumerate() {
+            let inv_slot = (slot_0 + 1) as u8;
+            let Some(it) = inv_item else { continue };
+            let Some(meta) = map.item_meta(it.server_id) else { continue };
+            if !meta.is_container { continue; }
+            let items_for_slot = by_slot.remove(&inv_slot).unwrap_or_default();
+            let items: Vec<ContainerItem> = items_for_slot.into_iter().filter_map(|(_, sid, cnt)| {
+                let m = map.item_meta(sid)?;
+                Some(ContainerItem {
+                    server_id: sid,
+                    client_id: m.client_id,
+                    count: if m.stackable { Some(cnt) } else { None },
+                    animated: m.animated,
+                })
+            }).collect();
+            if cid < 16 {
+                result[cid as usize] = Some(OpenContainer {
+                    server_id: it.server_id,
+                    client_id: meta.client_id,
+                    capacity: meta.container_capacity.max(1),
+                    name: meta.name.clone(),
+                    items,
+                    source: ContainerSource::Slot(inv_slot),
+                    is_open: false,
+                });
+                cid += 1;
+            }
+        }
+        result
+    }
+
+    /// Export container contents for persistence. Walks ALL cid slots (both open
+    /// and closed windows) and produces `(inv_slot, path, server_id, count)` rows.
+    /// Only containers rooted in an inventory slot are exported (ground containers
+    /// are transient). Nested containers are exported as items of their parent; their
+    /// own contents are exported under the parent slot with a "/child_idx" path suffix.
+    fn export_container_items(
+        _inventory: &[Option<InvItem>; 10],
+        open_containers: &[Option<OpenContainer>; 16],
+    ) -> Vec<(u8, String, u16, u8)> {
+        let mut rows = Vec::new();
+        for oc in open_containers.iter().flatten() {
+            let inv_slot = match oc.source {
+                ContainerSource::Slot(s) if s >= 1 => s,
+                _ => continue, // ground or nested — skipped (nested exported via parent)
+            };
+            for (idx, item) in oc.items.iter().enumerate() {
+                rows.push((inv_slot, idx.to_string(), item.server_id, item.count.unwrap_or(1)));
+            }
+        }
+        rows
+    }
+
+    /// Find the first unallocated cid slot (None) for a brand-new container.
+    /// When all 16 slots are allocated, picks the first slot whose window is
+    /// not currently open (so its contents can be silently evicted). Returns
+    /// `None` only if all 16 slots are open simultaneously (pathological case).
+    fn next_free_cid(p: &PlayerState) -> Option<u8> {
+        // Prefer a completely unallocated slot.
+        if let Some(cid) = (0u8..16).find(|&c| p.open_containers[c as usize].is_none()) {
+            return Some(cid);
+        }
+        // Fall back to the first closed (but allocated) slot — its contents will
+        // be silently replaced by the new container.
+        (0u8..16).find(|&c| p.open_containers[c as usize].as_ref().map(|o| !o.is_open).unwrap_or(false))
+    }
+
+    /// Push an `0x6E` open-container packet to `id` for the given cid.
+    fn push_open_container(&mut self, id: u32, cid: u8) {
+        let Some(p) = self.players.get(&id) else { return };
+        let Some(oc) = p.open_containers[cid as usize].as_ref() else { return };
+        let has_parent = matches!(oc.source, ContainerSource::Nested { .. });
+        let server_id = oc.server_id;
+        let client_id = oc.client_id;
+        let wire_items: Vec<protocol::container::ContainerWireItem> =
+            oc.items.iter().map(|i| i.wire()).collect();
+        let animated = self.map.item_meta(server_id).map(|m| m.animated).unwrap_or(false);
+        let bag = WireItem { client_id, subtype: None, animated };
+        let pkt = protocol::container::open_container(
+            cid, &bag, &oc.name, oc.capacity, has_parent, &wire_items,
+        );
+        self.push(id, pkt);
+    }
+
+    // -----------------------------------------------------------------------
+    // Container commands
+    // -----------------------------------------------------------------------
+
+    /// Handle `0x82` use-item: if the item is a container, open it as a window.
+    /// Other use cases (levers, runes, potions) are M11/Lua — silently ignored here.
+    fn do_use_item(&mut self, id: u32, pos_x: u16, pos_y: u16, pos_z: u8, stackpos: u8, index: u8) {
+        let Some(p) = self.players.get(&id) else { return };
+
+        // Resolve where the item is and its server_id.
+        let (server_id, source) = if pos_x == 0xFFFF {
+            // Inventory or container endpoint.
+            if pos_y & 0x40 != 0 {
+                // Container endpoint: (cid, slot_index).
+                let cid = (pos_y & 0x0F) as u8;
+                let slot_idx = pos_z as usize;
+                let Some(oc) = p.open_containers[cid as usize].as_ref() else { return };
+                let Some(item) = oc.items.get(slot_idx) else { return };
+                let sid = item.server_id;
+                (sid, ContainerSource::Nested { parent_cid: cid, parent_slot: slot_idx as u8 })
+            } else {
+                // Inventory slot.
+                let slot = pos_y as u8;
+                if !(1..=10).contains(&slot) { return; }
+                let Some(it) = p.inventory[(slot - 1) as usize] else { return };
+                (it.server_id, ContainerSource::Slot(slot))
+            }
+        } else {
+            // Ground item.
+            let pos = Position::new(pos_x, pos_y, pos_z);
+            let player_pos = p.position;
+            let near = (i32::from(player_pos.x) - i32::from(pos.x)).abs() <= 1
+                && (i32::from(player_pos.y) - i32::from(pos.y)).abs() <= 1
+                && player_pos.z == pos.z;
+            if !near { return; }
+
+            let pre = self.dynamic.get(&(pos_x, pos_y, pos_z))
+                .map(|st| st.pre_creature_len)
+                .unwrap_or_else(|| self.map.tile_pre_creature_len(pos));
+            let creatures_len = self.creatures_on(pos).len();
+            let sp = stackpos as usize;
+            let src_idx = if sp < pre { sp }
+                else if sp < pre + creatures_len { return; }
+                else { sp - creatures_len };
+            let Some(sid) = self.merged_server_id(pos, src_idx) else { return };
+            (sid, ContainerSource::Slot(0)) // ground: use Slot(0) as sentinel; not persisted
+        };
+
+        let Some(meta) = self.map.item_meta(server_id) else { return };
+        if !meta.is_container { return; }
+
+        let capacity = meta.container_capacity.max(1);
+        let name = meta.name.clone();
+        let client_id = meta.client_id;
+
+        // Look for an existing slot (open or closed) that already holds a container
+        // from the same source — reuse it so items are never lost on close+reopen.
+        let p = self.players.get(&id).unwrap();
+        let existing_cid = (0u8..16).find(|&c| {
+            p.open_containers[c as usize].as_ref().map(|oc| {
+                matches_source(oc.source, source)
+            }).unwrap_or(false)
+        });
+
+        let cid = if let Some(c) = existing_cid {
+            // Reopen the existing slot: update metadata (in case the container
+            // item changed type somehow) and mark it visible again.
+            if let Some(p) = self.players.get_mut(&id) {
+                if let Some(oc) = p.open_containers[c as usize].as_mut() {
+                    oc.is_open = true;
+                    oc.name = name;
+                    oc.capacity = capacity;
+                    oc.client_id = client_id;
+                }
+            }
+            c
+        } else {
+            // No prior slot for this source — allocate a fresh one.
+            // The client hints with `index`; use it if the slot is completely free.
+            let p = self.players.get(&id).unwrap();
+            let new_cid = if (index as usize) < 16 && p.open_containers[index as usize].is_none() {
+                index
+            } else {
+                match Self::next_free_cid(p) {
+                    Some(c) => c,
+                    None => return, // all 16 windows occupied
+                }
+            };
+            let oc = OpenContainer {
+                server_id, client_id, capacity, name,
+                items: Vec::new(), source, is_open: true,
+            };
+            if let Some(p) = self.players.get_mut(&id) {
+                p.open_containers[new_cid as usize] = Some(oc);
+            }
+            new_cid
+        };
+
+        self.push_open_container(id, cid);
+    }
+
+    /// Close `cid` and every container nested inside it (depth-first).
+    /// Sets `is_open = false` and sends `close_container` for each.
+    fn close_container_tree(&mut self, id: u32, cid: u8) {
+        let children: Vec<u8> = if let Some(p) = self.players.get(&id) {
+            (0u8..16).filter(|&c| {
+                p.open_containers[c as usize].as_ref().map_or(false, |oc| {
+                    matches!(oc.source, ContainerSource::Nested { parent_cid: pc, .. } if pc == cid)
+                })
+            }).collect()
+        } else {
+            return;
+        };
+        for child in children {
+            self.close_container_tree(id, child);
+        }
+        if let Some(p) = self.players.get_mut(&id) {
+            if let Some(oc) = p.open_containers[cid as usize].as_mut() {
+                oc.is_open = false;
+            }
+        }
+        self.push(id, protocol::container::close_container(cid));
+    }
+
+    /// After removing the item at `removed_slot` from `parent_cid`:
+    /// close any open window that tracked that item (and its children),
+    /// and fix slot indices for siblings that shifted down.
+    fn close_orphaned_nested_container(&mut self, id: u32, parent_cid: u8, removed_slot: usize) {
+        let mut orphaned: Option<u8> = None;
+        if let Some(p) = self.players.get_mut(&id) {
+            for (c, oc_opt) in p.open_containers.iter_mut().enumerate() {
+                let Some(oc) = oc_opt.as_mut() else { continue };
+                let ContainerSource::Nested { parent_cid: pc, ref mut parent_slot } = oc.source
+                    else { continue };
+                if pc != parent_cid { continue; }
+                let ps = *parent_slot as usize;
+                if ps == removed_slot {
+                    orphaned = Some(c as u8);
+                } else if ps > removed_slot {
+                    *parent_slot -= 1;
+                }
+            }
+        }
+        if let Some(cid) = orphaned {
+            self.close_container_tree(id, cid);
+        }
+    }
+
+    /// Handle `0x87` close-container: mark the window as closed (keep the items
+    /// in memory so they survive a re-open within the same session) and send
+    /// `0x6F` to the client.
+    fn do_close_container(&mut self, id: u32, cid: u8) {
+        if cid >= 16 { return; }
+        let Some(p) = self.players.get_mut(&id) else { return };
+        match p.open_containers[cid as usize].as_mut() {
+            Some(oc) => { oc.is_open = false; }
+            None => return,
+        }
+        self.push(id, protocol::container::close_container(cid));
+    }
+
+    /// Handle `0x88` up-arrow: navigate from a nested container to its parent.
+    fn do_up_arrow(&mut self, id: u32, cid: u8) {
+        if cid >= 16 { return; }
+        let Some(p) = self.players.get(&id) else { return };
+        let Some(oc) = p.open_containers[cid as usize].as_ref() else { return };
+        let source = oc.source;
+
+        match source {
+            ContainerSource::Nested { parent_cid, .. } => {
+                // The parent is already open in another cid — just send its packet.
+                if parent_cid < 16 && p.open_containers[parent_cid as usize].is_some() {
+                    self.push_open_container(id, parent_cid);
+                }
+                // Close the child window.
+                if let Some(p) = self.players.get_mut(&id) {
+                    p.open_containers[cid as usize] = None;
+                }
+                self.push(id, protocol::container::close_container(cid));
+            }
+            ContainerSource::Slot(_) => {
+                // Already at the top level; up-arrow does nothing.
+            }
+        }
+    }
+
+    /// Add `item` to the front (slot 0) of an open container and notify the player.
+    fn push_item_to_container(&mut self, id: u32, cid: u8, item: ContainerItem) {
+        let Some(p) = self.players.get_mut(&id) else { return };
+        let Some(oc) = p.open_containers[cid as usize].as_mut() else { return };
+        if oc.items.len() >= oc.capacity as usize { return; } // container full
+        oc.items.insert(0, item);
+        let wire = item.wire();
+        self.push(id, protocol::container::add_container_item(cid, 0, &wire));
+    }
+
+    /// Remove the item at `slot` from an open container and notify the player.
+    fn pop_item_from_container(&mut self, id: u32, cid: u8, slot: usize) -> Option<ContainerItem> {
+        let p = self.players.get_mut(&id)?;
+        let oc = p.open_containers[cid as usize].as_mut()?;
+        if slot >= oc.items.len() { return None; }
+        let removed = oc.items.remove(slot);
+        // OTClient's onRemoveItem erases the slot and shifts items up automatically.
+        // The `lastItem` (replacement) field is only for scrolled containers — it brings
+        // in a previously hidden item at the bottom of the visible window. Our containers
+        // never exceed capacity, so there is never a hidden item to reveal: always None.
+        let pkt = protocol::container::remove_container_item(cid, slot as u16, None);
+        self.push(id, pkt);
+        Some(removed)
     }
 
     fn do_turn(&mut self, id: u32, direction: Direction) {
@@ -924,10 +1325,16 @@ impl Game {
     /// tiles are copied-on-write into `dynamic` before mutation, then the change
     /// is broadcast to spectators.
     fn do_move_thing(&mut self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
-        // Container endpoints (y & 0x40) are M10.3 — reject for now.
-        if (from.x == 0xFFFF && from.y & 0x40 != 0) || (to.x == 0xFFFF && to.y & 0x40 != 0) { return; }
+        // Route any endpoint with x==0xFFFF (inventory or container).
         if from.x == 0xFFFF || to.x == 0xFFFF {
-            self.do_move_inventory(id, from, from_stackpos, to, count);
+            // Check for container endpoints: y & 0x40 != 0.
+            let from_is_container = from.x == 0xFFFF && (from.y & 0x40) != 0;
+            let to_is_container   = to.x   == 0xFFFF && (to.y   & 0x40) != 0;
+            if from_is_container || to_is_container {
+                self.do_move_container(id, from, from_stackpos, to, count);
+            } else {
+                self.do_move_inventory(id, from, from_stackpos, to, count);
+            }
             return;
         }
         if from == to { return; }
@@ -1111,6 +1518,220 @@ impl Game {
                 self.push_inventory_slot(id, dst);
             }
             (None, None) => {}
+        }
+    }
+
+    /// Handle moves where at least one endpoint is a container slot
+    /// (`x == 0xFFFF && y & 0x40 != 0`). Four cases:
+    ///   - container → container (same or different cid)
+    ///   - ground → container
+    ///   - container → ground
+    ///   - inventory slot → container (or vice versa)
+    fn do_move_container(&mut self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
+        // Decode endpoints.
+        let from_is_container = from.x == 0xFFFF && (from.y & 0x40) != 0;
+        let to_is_container   = to.x   == 0xFFFF && (to.y   & 0x40) != 0;
+        let from_is_inv_slot  = from.x == 0xFFFF && (from.y & 0x40) == 0;
+        let to_is_inv_slot    = to.x   == 0xFFFF && (to.y   & 0x40) == 0;
+
+        // Decode container endpoints.
+        let from_cid      = if from_is_container { Some((from.y & 0x0F) as u8) } else { None };
+        let from_slot_idx = if from_is_container { Some(from.z as usize) } else { None };
+        let to_cid        = if to_is_container   { Some((to.y   & 0x0F) as u8) } else { None };
+        let to_slot_idx   = if to_is_container   { Some(to.z   as usize) } else { None };
+
+        // --- CASE 1: container → container ---
+        if from_is_container && to_is_container {
+            let fc = from_cid.unwrap();
+            let fs = from_slot_idx.unwrap();
+            let tc = to_cid.unwrap();
+
+            // Pull the item out of `from`.
+            let item = match self.pop_item_from_container(id, fc, fs) {
+                Some(i) => i,
+                None => return,
+            };
+            self.close_orphaned_nested_container(id, fc, fs);
+
+            // Check capacity on dest.
+            let dest_full = {
+                let p = match self.players.get(&id) { Some(p) => p, None => return };
+                match p.open_containers[tc as usize].as_ref() {
+                    Some(oc) => oc.items.len() >= oc.capacity as usize,
+                    None => return,
+                }
+            };
+            if dest_full {
+                // Put back into source at front (since we already removed it).
+                self.push_item_to_container(id, fc, item);
+                return;
+            }
+
+            // Insert into destination at front (TFS: addThing → push_front).
+            let _ = to_slot_idx; // not used for destination insert; always prepend
+            self.push_item_to_container(id, tc, item);
+            return;
+        }
+
+        // --- CASE 2: ground → container ---
+        if !from_is_container && !from_is_inv_slot && to_is_container {
+            let tc = to_cid.unwrap();
+            let from_pos = Position::new(from.x, from.y, from.z);
+            let Some(p) = self.players.get(&id) else { return };
+            let player_pos = p.position;
+
+            // Adjacency check.
+            let near = (i32::from(player_pos.x) - i32::from(from_pos.x)).abs() <= 1
+                && (i32::from(player_pos.y) - i32::from(from_pos.y)).abs() <= 1
+                && player_pos.z == from_pos.z;
+            if !near { self.push_cannot_move(id, "You are too far away."); return; }
+
+            // Resolve item from ground stack.
+            let creatures = self.creatures_on(from_pos);
+            let pre = self.dynamic.get(&(from_pos.x, from_pos.y, from_pos.z))
+                .map(|st| st.pre_creature_len)
+                .unwrap_or_else(|| self.map.tile_pre_creature_len(from_pos));
+            let sp = from_stackpos as usize;
+            let src_idx = if sp < pre { sp }
+                else if sp < pre + creatures.len() { return; }
+                else { sp - creatures.len() };
+
+            let Some(src_sid) = self.merged_server_id(from_pos, src_idx) else { return };
+            let Some(meta) = self.map.item_meta(src_sid) else { return };
+            if !meta.moveable { self.push_cannot_move(id, "You cannot move this object."); return; }
+
+            // Check dest capacity.
+            let dest_full = {
+                let p = match self.players.get(&id) { Some(p) => p, None => return };
+                match p.open_containers[tc as usize].as_ref() {
+                    Some(oc) => oc.items.len() >= oc.capacity as usize,
+                    None => return,
+                }
+            };
+            if dest_full { return; }
+
+            let stackable  = meta.stackable;
+            let client_id  = meta.client_id;
+            let animated   = meta.animated;
+            let want = if stackable { count.max(1) } else { 1 };
+
+            let Some((moved, removed_fully)) = self.take_from_ground(from_pos, src_idx, want, stackable) else { return };
+            self.broadcast_source(from_pos, from_stackpos, removed_fully, src_idx);
+
+            let cnt = if stackable { Some(moved) } else { None };
+            let item = ContainerItem { server_id: src_sid, client_id, count: cnt, animated };
+            self.push_item_to_container(id, tc, item);
+            return;
+        }
+
+        // --- CASE 3: container → ground ---
+        if from_is_container && !to_is_container && !to_is_inv_slot {
+            let fc = from_cid.unwrap();
+            let fs = from_slot_idx.unwrap();
+            let to_pos = Position::new(to.x, to.y, to.z);
+
+            // Validate destination.
+            let Some(p) = self.players.get(&id) else { return };
+            let player_pos = p.position;
+            if player_pos.z != to_pos.z || !self.map.can_throw_object_to(player_pos, to_pos) {
+                self.push_cannot_move(id, "You cannot throw there."); return;
+            }
+            if self.map.tile_pre_creature_len(to_pos) == 0 && self.map.tile_stack_clone(to_pos).is_none() {
+                self.push_cannot_move(id, "You cannot put that there."); return;
+            }
+            if self.map.is_blocked(to_pos) {
+                self.push_cannot_move(id, "You cannot put that there."); return;
+            }
+
+            let item = match self.pop_item_from_container(id, fc, fs) {
+                Some(i) => i,
+                None => return,
+            };
+            self.close_orphaned_nested_container(id, fc, fs);
+            let meta_stackable = self.map.item_meta(item.server_id).map(|m| m.stackable).unwrap_or(false);
+            let moved = item.count.unwrap_or(1).max(1);
+            let dest_creatures = self.creatures_on(to_pos).len();
+            let Some((dest_merged, dest_added)) =
+                self.add_to_ground_front(to_pos, item.server_id, item.client_id, moved, item.animated, meta_stackable)
+            else { return };
+            let dest_front = self.dynamic.get(&(to_pos.x, to_pos.y, to_pos.z))
+                .map(|st| st.pre_creature_len).unwrap_or(0);
+            let dest_s = (dest_front + dest_creatures).min(9) as u8;
+            if let Some(wi) = dest_merged { self.broadcast_dest(to_pos, dest_s, wi, true); }
+            if let Some(wi) = dest_added  { self.broadcast_dest(to_pos, dest_s, wi, false); }
+            return;
+        }
+
+        // --- CASE 4: inventory slot → container ---
+        if from_is_inv_slot && to_is_container {
+            let inv_slot = from.y as u8;
+            let tc = to_cid.unwrap();
+            if !(1..=10).contains(&inv_slot) { return; }
+
+            let item = {
+                let p = match self.players.get(&id) { Some(p) => p, None => return };
+                match p.inventory[(inv_slot - 1) as usize] {
+                    Some(it) => it,
+                    None => return,
+                }
+            };
+            // Check capacity on dest.
+            let dest_full = {
+                let p = match self.players.get(&id) { Some(p) => p, None => return };
+                match p.open_containers[tc as usize].as_ref() {
+                    Some(oc) => oc.items.len() >= oc.capacity as usize,
+                    None => return,
+                }
+            };
+            if dest_full { return; }
+
+            if let Some(p) = self.players.get_mut(&id) {
+                p.inventory[(inv_slot - 1) as usize] = None;
+            }
+            self.push_inventory_slot(id, inv_slot);
+
+            let cnt = item.count;
+            let ci = ContainerItem { server_id: item.server_id, client_id: item.client_id, count: cnt, animated: item.animated };
+            self.push_item_to_container(id, tc, ci);
+            return;
+        }
+
+        // --- CASE 5: container → inventory slot ---
+        if from_is_container && to_is_inv_slot {
+            let fc = from_cid.unwrap();
+            let fs = from_slot_idx.unwrap();
+            let inv_slot = to.y as u8;
+            if !(1..=10).contains(&inv_slot) { return; }
+
+            // Dest slot must be empty.
+            let slot_empty = {
+                let p = match self.players.get(&id) { Some(p) => p, None => return };
+                p.inventory[(inv_slot - 1) as usize].is_none()
+            };
+            if !slot_empty { return; }
+
+            let item = match self.pop_item_from_container(id, fc, fs) {
+                Some(i) => i,
+                None => return,
+            };
+            self.close_orphaned_nested_container(id, fc, fs);
+
+            // Check equip slot compatibility.
+            let admits = self.map.item_meta(item.server_id)
+                .and_then(|m| m.equip_slot)
+                .map(|eq| eq.admits(inv_slot))
+                .unwrap_or(false);
+            if !admits { return; }
+
+            if let Some(p) = self.players.get_mut(&id) {
+                p.inventory[(inv_slot - 1) as usize] = Some(InvItem {
+                    server_id: item.server_id,
+                    client_id: item.client_id,
+                    count: item.count,
+                    animated: item.animated,
+                });
+            }
+            self.push_inventory_slot(id, inv_slot);
         }
     }
 
@@ -1706,6 +2327,7 @@ impl Game {
                 inventory: p.inventory.iter().enumerate()
                     .filter_map(|(i, slot)| slot.map(|it| ((i + 1) as u8, it.server_id, it.count.unwrap_or(1))))
                     .collect(),
+                container_items: Self::export_container_items(&p.inventory, &p.open_containers),
             });
         }
 
@@ -2156,6 +2778,12 @@ enum Command {
     /// Chat text beginning with `/` from a player. The actor gates on
     /// `PlayerState.gamemaster`, parses the verb, and dispatches to a GM primitive.
     Gm { id: u32, text: String },
+    /// Client `0x82`: use item (open container). `index` is the client-requested cid.
+    UseItem { id: u32, pos_x: u16, pos_y: u16, pos_z: u8, stackpos: u8, index: u8 },
+    /// Client `0x87`: close a container window.
+    CloseContainer { id: u32, cid: u8 },
+    /// Client `0x88`: navigate to the parent container (up-arrow button).
+    UpArrow { id: u32, cid: u8 },
     /// Graceful shutdown: persist every online player, ack, then stop the actor.
     /// Dropping the actor drops `save_tx`, closing the save channel so the DB
     /// drain task can finish. Handled in the actor loop, not in `handle`.
@@ -2244,6 +2872,21 @@ impl WorldHandle {
     /// Fire-and-forget; feedback is pushed to the sender as a `0xB4` message.
     pub async fn gm_command(&self, id: u32, text: String) {
         let _ = self.tx.send(Command::Gm { id, text }).await;
+    }
+
+    /// Use an item (`0x82`). If the item is a container, opens a window.
+    pub async fn use_item(&self, id: u32, pos_x: u16, pos_y: u16, pos_z: u8, stackpos: u8, index: u8) {
+        let _ = self.tx.send(Command::UseItem { id, pos_x, pos_y, pos_z, stackpos, index }).await;
+    }
+
+    /// Close a container window (`0x87`).
+    pub async fn close_container(&self, id: u32, cid: u8) {
+        let _ = self.tx.send(Command::CloseContainer { id, cid }).await;
+    }
+
+    /// Navigate to the parent container (`0x88` up-arrow).
+    pub async fn up_arrow(&self, id: u32, cid: u8) {
+        let _ = self.tx.send(Command::UpArrow { id, cid }).await;
     }
 
     /// Persist every online player, then stop the world actor. Resolves once all
@@ -2559,6 +3202,7 @@ mod tests {
             sex: 1, // male (default)
             gamemaster: false,
             inventory: Vec::new(),
+            container_items: Vec::new(),
         }
     }
 
@@ -2575,6 +3219,7 @@ mod tests {
             sex: 1, // male (default)
             gamemaster: false,
             inventory: [None; 10],
+            open_containers: std::array::from_fn(|_| None),
         });
         (id, rx)
     }
@@ -2896,6 +3541,7 @@ mod tests {
             sex: 1,
             gamemaster: false,
             inventory: Vec::new(),
+            container_items: Vec::new(),
         };
         let ack = g.login("Returning".into(), initial, tx);
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
@@ -4272,6 +4918,7 @@ mod tests {
             sex: 1,
             gamemaster: false,
             inventory: Vec::new(),
+            container_items: Vec::new(),
         };
         let ack = g.login("Restored".into(), initial, tx);
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
@@ -4299,6 +4946,7 @@ mod tests {
             sex: 1,
             gamemaster: false,
             inventory: Vec::new(),
+            container_items: Vec::new(),
         };
         let ack = g.login("NewPlayer".into(), initial, tx);
         assert_eq!(
@@ -4329,6 +4977,7 @@ mod tests {
             sex: 1,
             gamemaster: false,
             inventory: [None; 10],
+            open_containers: std::array::from_fn(|_| None),
         });
 
         g.logout(id);
@@ -4360,6 +5009,7 @@ mod tests {
             health: 90, max_health: 150, fist_skill: 10,
             attacking: None, last_attack_ms: 0, sex: 1, gamemaster: true,
             inventory: [None; 10],
+            open_containers: std::array::from_fn(|_| None),
         });
 
         let (tx_b, _rx_b) = mpsc::channel(PUSH_CAPACITY);
@@ -4371,6 +5021,7 @@ mod tests {
             health: 145, max_health: 145, fist_skill: 10,
             attacking: None, last_attack_ms: 0, sex: 0, gamemaster: false,
             inventory: [None; 10],
+            open_containers: std::array::from_fn(|_| None),
         });
 
         g.save_all();
@@ -4409,6 +5060,7 @@ mod tests {
             known: HashSet::new(), health: 100, max_health: 100, fist_skill: 10,
             attacking: None, last_attack_ms: 0, sex: 1, gamemaster: false,
             inventory: [None; 10],
+            open_containers: std::array::from_fn(|_| None),
         });
 
         g.save_all(); // must not panic
@@ -4436,6 +5088,7 @@ mod tests {
             sex: 1,
             gamemaster: false,
             inventory: [None; 10],
+            open_containers: std::array::from_fn(|_| None),
         });
 
         // Pushing any payload triggers the dead-session reap → logout → save.
@@ -4600,6 +5253,7 @@ mod tests {
             sex: 0, // female
             gamemaster: false,
             inventory: Vec::new(),
+            container_items: Vec::new(),
         };
         let ack = g.login("Tester".into(), initial, tx);
         assert_eq!(
@@ -4624,6 +5278,7 @@ mod tests {
             sex: 0, // female
             gamemaster: false,
             inventory: Vec::new(),
+            container_items: Vec::new(),
         };
         let ack = g.login("Tester".into(), initial, tx);
         let id = ack.snapshot.id;
@@ -4794,6 +5449,7 @@ mod tests {
             sex: 0, // female
             gamemaster: false,
             inventory: [None; 10],
+            open_containers: std::array::from_fn(|_| None),
         });
         // Looker is at the same tile; tile pre_creature_len is 1 (just the ground),
         // creatures = [looker_id, target_id] (sorted). stackpos 1 = first creature

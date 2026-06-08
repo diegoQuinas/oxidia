@@ -57,6 +57,7 @@ fn player_save_to_initial(save: &PlayerSave) -> InitialState {
         max_health: save.health_max,
         gamemaster: false,
         inventory: save.inventory.clone(),
+        container_items: save.container_items.clone(),
     }
 }
 
@@ -85,6 +86,7 @@ pub fn save_record_to_player_save(rec: &SaveRecord) -> PlayerSave {
         look_mount: rec.outfit.mount,
         sex: rec.sex,
         inventory: rec.inventory.clone(),
+        container_items: rec.container_items.clone(),
     }
 }
 
@@ -232,6 +234,7 @@ where
             max_health: 150,
             gamemaster: false,
             inventory: Vec::new(),
+            container_items: Vec::new(),
         },
     };
     let mut initial = initial;
@@ -434,6 +437,28 @@ where
                         Position::new(t.to.0, t.to.1, t.to.2),
                         t.count,
                     ).await;
+                }
+                continue;
+            }
+            // 0x82 — client use-item (parseUseItem). M10.3: opens containers.
+            // Note: inbound 0x82 = use-item; outbound 0x82 = world-light. No conflict.
+            if opcode == protocol::container::OP_USE_ITEM {
+                if let Some(u) = protocol::container::parse_use_item(&payload[1..]) {
+                    world.use_item(id, u.pos_x, u.pos_y, u.pos_z, u.stackpos, u.index).await;
+                }
+                continue;
+            }
+            // 0x87 — client close-container (parseCloseContainer).
+            if opcode == protocol::container::OP_CLOSE_CONTAINER_IN {
+                if let Some(cid) = protocol::container::parse_container_cid(&payload[1..]) {
+                    world.close_container(id, cid).await;
+                }
+                continue;
+            }
+            // 0x88 — client up-arrow (parseUpArrowContainer).
+            if opcode == protocol::container::OP_UP_ARROW {
+                if let Some(cid) = protocol::container::parse_container_cid(&payload[1..]) {
+                    world.up_arrow(id, cid).await;
                 }
                 continue;
             }
@@ -792,6 +817,7 @@ mod tests {
             look_mount: 0,
             sex: 0, // female
             inventory: vec![],
+            container_items: vec![],
         };
         let initial = player_save_to_initial(&save);
         assert_eq!(initial.position, Some(world::Position::new(200, 300, 8)));
@@ -833,6 +859,7 @@ mod tests {
             max_health: 160,
             sex: 0, // female
             inventory: Vec::new(),
+            container_items: Vec::new(),
         };
         let save = save_record_to_player_save(&rec);
         assert_eq!(save.name, "Hero");
