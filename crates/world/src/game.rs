@@ -1489,6 +1489,7 @@ impl Game {
         if !meta.moveable { self.push_cannot_move(id, "You cannot move this object."); return; }
         let client_id = meta.client_id;
         let animated = meta.animated;
+        let is_container = meta.is_container;
 
         if self.map.tile_pre_creature_len(to) == 0 && self.map.tile_stack_clone(to).is_none() {
             self.push_cannot_move(id, "You cannot put that there."); return;
@@ -1519,6 +1520,13 @@ impl Game {
             self.broadcast_dest(to, dest_s, item, false); // 0x6A add new/spill on top
         }
         self.broadcast_source(from, from_stackpos, removed_fully, src_idx);
+
+        // A container dragged tile-to-tile carries its open window (and contents)
+        // with it: re-key to the new tile, then close it if it landed out of range.
+        if is_container {
+            self.rekey_container_source(id, ContainerSource::Ground(from), ContainerSource::Ground(to));
+            self.auto_close_ground_containers(id);
+        }
     }
 
     /// Handle a move where at least one endpoint is an inventory slot (`x==0xFFFF`,
@@ -5819,6 +5827,16 @@ mod tests {
                 MapTile { x: 106, y: 100, z: 7, flags: 0, house_id: None,
                     items: vec![MapItem { id: 100, count: None, contents: vec![] },
                                 MapItem { id: 500, count: None, contents: vec![] }] }, // helmet
+                // Isolated vertical strip (y=110..113) for ground->ground container tests.
+                MapTile { x: 100, y: 110, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] },
+                                MapItem { id: 600, count: None, contents: vec![] }] }, // backpack on ground
+                MapTile { x: 100, y: 111, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
+                MapTile { x: 100, y: 112, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
+                MapTile { x: 100, y: 113, z: 7, flags: 0, house_id: None,
+                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
             ],
             towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
             waypoints: vec![],
@@ -5838,6 +5856,31 @@ mod tests {
     /// Helper: assert a packet list contains at least one packet whose first byte is `op`.
     fn has_op(packets: &[Vec<u8>], op: u8) -> bool {
         packets.iter().any(|p| p.first() == Some(&op))
+    }
+
+    #[test]
+    fn throwing_open_ground_container_follows_and_closes_out_of_range() {
+        // New detail: a container opened from the ground and thrown far must close.
+        // The tile-to-tile move re-keys the window to the new tile and auto-closes
+        // it when it lands out of range. Backpack on (100,110,7); player adjacent
+        // on (100,111,7); throw to (100,113,7) (2 tiles from the player).
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 111, 7));
+        // Open the ground backpack window (cid keyed to its tile).
+        g.players.get_mut(&player).unwrap().open_containers[0] = Some(OpenContainer {
+            server_id: 600, client_id: 1988, capacity: 20, name: "backpack".into(),
+            items: vec![], source: ContainerSource::Ground(Position::new(100, 110, 7)), is_open: true,
+        });
+        drain(&mut rx);
+
+        // Throw the backpack from (100,110,7) to (100,113,7). Stackpos 1 = the
+        // backpack (ground at 0, no creatures on that tile).
+        g.do_move_thing(player, Position::new(100, 110, 7), 1, Position::new(100, 113, 7), 1);
+
+        let oc = g.players[&player].open_containers[0].as_ref().expect("window retained");
+        assert!(matches!(oc.source, ContainerSource::Ground(p) if p == Position::new(100, 113, 7)),
+            "window re-keyed to the destination tile; got {:?}", oc.source);
+        assert!(!oc.is_open, "container thrown out of range must close");
     }
 
     #[test]
