@@ -5,6 +5,7 @@
 ![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
+![Oxidia hero](docs/assets/oxidia.png)
 An Open Tibia server written in Rust — protocol **10.98**, targeting the **OTClient Redemption** client.
 
 ![A character standing on a town street rendered from the real map in OTClient](docs/assets/ingame.png)
