@@ -165,6 +165,9 @@ enum ContainerSource {
     Slot(u8),
     /// Opened from inside another open container (parent cid + item slot).
     Nested { parent_cid: u8, parent_slot: u8 },
+    /// Opened from a container lying on the ground, at the given tile. Not
+    /// persisted; auto-closes when the player walks out of range (TFS).
+    Ground(Position),
 }
 
 fn matches_source(a: ContainerSource, b: ContainerSource) -> bool {
@@ -172,8 +175,16 @@ fn matches_source(a: ContainerSource, b: ContainerSource) -> bool {
         (ContainerSource::Slot(x), ContainerSource::Slot(y)) => x == y,
         (ContainerSource::Nested { parent_cid: pa, parent_slot: ps },
          ContainerSource::Nested { parent_cid: qa, parent_slot: qs }) => pa == qa && ps == qs,
+        (ContainerSource::Ground(p), ContainerSource::Ground(q)) => p == q,
         _ => false,
     }
+}
+
+/// TFS `Position::areInRange<1,1,0>`: within one tile on x and y, same floor.
+fn in_close_range(a: Position, b: Position) -> bool {
+    a.z == b.z
+        && (i32::from(a.x) - i32::from(b.x)).abs() <= 1
+        && (i32::from(a.y) - i32::from(b.y)).abs() <= 1
 }
 
 /// One container the player has in their possession, with an optional open window.
@@ -822,7 +833,7 @@ impl Game {
                 else if sp < pre + creatures_len { return; }
                 else { sp - creatures_len };
             let Some(sid) = self.merged_server_id(pos, src_idx) else { return };
-            (sid, ContainerSource::Slot(0)) // ground: use Slot(0) as sentinel; not persisted
+            (sid, ContainerSource::Ground(pos)) // ground container, tracked by tile; not persisted
         };
 
         let Some(meta) = self.map.item_meta(server_id) else { return };
@@ -969,7 +980,7 @@ impl Game {
                 }
                 self.push(id, protocol::container::close_container(cid));
             }
-            ContainerSource::Slot(_) => {
+            ContainerSource::Slot(_) | ContainerSource::Ground(_) => {
                 // Already at the top level; up-arrow does nothing.
             }
         }
@@ -1061,6 +1072,29 @@ impl Game {
         };
         self.players.get_mut(&id)?.open_containers[cid as usize] = Some(oc);
         Some(cid)
+    }
+
+    /// Close every open ground container the player has walked out of range of
+    /// (more than one tile on x/y, or a different floor). Inventory and nested
+    /// containers travel with the player and are never closed by walking. Mirrors
+    /// TFS `Player::onCreatureMove` + `autoCloseContainers`, which key off the
+    /// container's tile position. Call after the player's position is committed.
+    fn auto_close_ground_containers(&mut self, id: u32) {
+        let Some(player_pos) = self.players.get(&id).map(|p| p.position) else { return };
+        let to_close: Vec<u8> = {
+            let Some(p) = self.players.get(&id) else { return };
+            (0u8..16).filter(|&c| {
+                p.open_containers[c as usize].as_ref().is_some_and(|oc| {
+                    oc.is_open
+                        && matches!(oc.source, ContainerSource::Ground(gp) if !in_close_range(gp, player_pos))
+                })
+            }).collect()
+        };
+        // close_container_tree also closes any sub-containers opened from inside
+        // the ground bag (depth-first) and sends each `0x6F`.
+        for cid in to_close {
+            self.close_container_tree(id, cid);
+        }
     }
 
     fn do_turn(&mut self, id: u32, direction: Direction) {
@@ -2047,6 +2081,7 @@ impl Game {
             GmVerb::TeleportTo => self.gm_teleportto(id, &args),
             GmVerb::Bring => self.gm_bring(id, &args),
             GmVerb::ChangeSex => self.gm_changesex(id, &args),
+            GmVerb::SetLookType => self.gm_setlooktype(id, &args),
         }
     }
 
@@ -2244,6 +2279,40 @@ impl Game {
         };
         let sex_label = if new_sex == 1 { "male" } else { "female" };
         self.push_status_message(id, format!("{name} is now {sex_label}.").as_bytes());
+    }
+
+    fn gm_setlooktype(&mut self, id: u32, args: &[&str]) {
+        // /setlooktype <id>  OR  /setlooktype "player" <id>
+        let (target, look_type) = match args {
+            [raw_id] => {
+                let Ok(lt) = raw_id.parse::<u16>() else {
+                    self.push_status_message(id, b"Usage: /setlooktype <id> | /setlooktype \"player\" <id>");
+                    return;
+                };
+                (id, lt)
+            }
+            [name, raw_id] => {
+                let Ok(lt) = raw_id.parse::<u16>() else {
+                    self.push_status_message(id, b"Usage: /setlooktype <id> | /setlooktype \"player\" <id>");
+                    return;
+                };
+                let Some(t) = self.find_player_by_name(name) else {
+                    self.push_status_message(id, format!("Player '{name}' not found.").as_bytes());
+                    return;
+                };
+                (t, lt)
+            }
+            _ => {
+                self.push_status_message(id, b"Usage: /setlooktype <id> | /setlooktype \"player\" <id>");
+                return;
+            }
+        };
+        let new_outfit = match self.players.get_mut(&target) {
+            Some(p) => { p.outfit.look_type = look_type; p.outfit }
+            None => return,
+        };
+        self.do_change_outfit(target, new_outfit);
+        self.push_status_message(id, format!("Look type set to {look_type}.").as_bytes());
     }
 
     /// Place a fresh item on `pos` and broadcast a `0x6A` add to spectators.
@@ -2523,6 +2592,9 @@ impl Game {
         if from == to { return; }
         if let Some(p) = self.players.get_mut(&id) { p.position = to; }
 
+        // A teleport can leave an open ground container out of range too.
+        self.auto_close_ground_containers(id);
+
         // PZ badge: resend icons if we crossed a protection-zone boundary.
         if self.map.is_protection_zone(from) != self.map.is_protection_zone(to) {
             let mask = if self.map.is_protection_zone(to) { enter_world::ICON_PIGEON } else { 0 };
@@ -2637,6 +2709,9 @@ impl Game {
             "move ok"
         );
         if let Some(p) = self.players.get_mut(&id) { p.direction = direction; p.position = to; }
+
+        // Walking out of range of an open ground container closes its window (TFS).
+        self.auto_close_ground_containers(id);
 
         // PZ badge: if the mover crossed a protection-zone boundary, resend the
         // icons packet so the client shows/hides the dove (TFS getClientIcons).
@@ -2771,6 +2846,7 @@ enum GmVerb {
     TeleportTo,
     Bring,
     ChangeSex,
+    SetLookType,
 }
 
 impl GmVerb {
@@ -2784,6 +2860,7 @@ impl GmVerb {
         Self::TeleportTo,
         Self::Bring,
         Self::ChangeSex,
+        Self::SetLookType,
     ];
 
     /// Accepted command words (first is canonical; the rest are aliases).
@@ -2797,6 +2874,7 @@ impl GmVerb {
             Self::TeleportTo => &["teleportto"],
             Self::Bring => &["bring"],
             Self::ChangeSex => &["changesex"],
+            Self::SetLookType => &["setlooktype"],
         }
     }
 
@@ -2811,6 +2889,7 @@ impl GmVerb {
             Self::TeleportTo => "/teleportto \"player\"",
             Self::Bring => "/bring \"player\"",
             Self::ChangeSex => "/changesex \"player\" <male|female>",
+            Self::SetLookType => "/setlooktype <id> | /setlooktype \"player\" <id>",
         }
     }
 
@@ -2824,7 +2903,8 @@ impl GmVerb {
             Self::Teleport => "Teleport another player to coordinates.",
             Self::TeleportTo => "Teleport yourself next to another player.",
             Self::Bring => "Teleport another player to you.",
-            Self::ChangeSex => "Change a player's sex and reset their look type.",
+            Self::ChangeSex => "Change a player's sex (affects outfit catalog).",
+            Self::SetLookType => "Set look type on yourself or another player.",
         }
     }
 
@@ -5736,6 +5816,43 @@ mod tests {
     /// Helper: assert a packet list contains at least one packet whose first byte is `op`.
     fn has_op(packets: &[Vec<u8>], op: u8) -> bool {
         packets.iter().any(|p| p.first() == Some(&op))
+    }
+
+    #[test]
+    fn walking_away_closes_ground_container_keeps_inventory_open() {
+        // Issue 3: a ground container auto-closes when the player walks more than
+        // one tile away; an inventory container travels with the player and stays
+        // open. Player starts on (102,100,7) with both open.
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(102, 100, 7));
+        {
+            let p = g.players.get_mut(&player).unwrap();
+            p.open_containers[0] = Some(OpenContainer {
+                server_id: 600, client_id: 1988, capacity: 20, name: "backpack".into(),
+                items: vec![], source: ContainerSource::Ground(Position::new(102, 100, 7)), is_open: true,
+            });
+            p.open_containers[1] = Some(OpenContainer {
+                server_id: 600, client_id: 1988, capacity: 20, name: "backpack".into(),
+                items: vec![], source: ContainerSource::Slot(3), is_open: true,
+            });
+        }
+        drain(&mut rx);
+
+        // Step to 101: ground container at 102 is 1 tile away -> stays open.
+        g.do_move(player, Direction::West);
+        assert!(g.players[&player].open_containers[0].as_ref().unwrap().is_open,
+            "ground container one tile away must stay open");
+
+        // Step to 100: ground container at 102 is now 2 tiles away -> closes.
+        drain(&mut rx);
+        g.do_move(player, Direction::West);
+        let pkts = drain(&mut rx);
+        assert!(has_op(&pkts, protocol::container::OP_CLOSE_CONTAINER),
+            "a 0x6F close must be sent for the out-of-range ground container; got {:?}", pkts);
+        assert!(!g.players[&player].open_containers[0].as_ref().unwrap().is_open,
+            "ground container more than one tile away must close");
+        assert!(g.players[&player].open_containers[1].as_ref().unwrap().is_open,
+            "inventory container must stay open while walking");
     }
 
     #[test]
