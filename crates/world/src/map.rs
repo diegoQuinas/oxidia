@@ -93,6 +93,10 @@ pub struct ItemMeta {
     pub moveable: bool,
     /// Which equipment slot this item admits, or `None` if not equippable.
     pub equip_slot: Option<EquipSlot>,
+    /// True if this item is a container/bag (`ITEM_GROUP_CONTAINER`).
+    pub is_container: bool,
+    /// Maximum items the container holds (0 for non-containers, 8+ for bags).
+    pub container_capacity: u8,
 }
 
 impl ItemMeta {
@@ -297,6 +301,8 @@ impl StaticMap {
                 animated: it.is_animated(),
                 moveable: it.is_moveable(),
                 equip_slot: x.and_then(|a| EquipSlot::from_xml(&a.slot_type, &a.weapon_type)),
+                is_container: it.is_container(),
+                container_capacity: x.map(|a| a.container_size).unwrap_or(0),
             });
         }
     }

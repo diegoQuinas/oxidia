@@ -41,6 +41,8 @@ const FLAG_ANIMATION: u32 = 1 << 24;
 
 /// `ITEM_GROUP_GROUND` (`itemgroup_t`) — a ground-tile item.
 const ITEM_GROUP_GROUND: u8 = 1;
+/// `ITEM_GROUP_CONTAINER` — the item is a bag / container; holds other items.
+pub const ITEM_GROUP_CONTAINER: u8 = 2;
 /// `ITEM_GROUP_SPLASH` / `ITEM_GROUP_FLUID` — carry a u8 fluid-type byte on the wire.
 const ITEM_GROUP_SPLASH: u8 = 11;
 const ITEM_GROUP_FLUID: u8 = 12;
@@ -108,6 +110,11 @@ impl ItemType {
     /// `FLAG_ANIMATION` — the wire form carries a u8 animation-phase byte.
     pub fn is_animated(&self) -> bool {
         self.flags & FLAG_ANIMATION != 0
+    }
+
+    /// True if this item is a container / bag (`itemgroup_t == ITEM_GROUP_CONTAINER`).
+    pub fn is_container(&self) -> bool {
+        self.group == ITEM_GROUP_CONTAINER
     }
 
     /// Splash or fluid container — the wire form carries a u8 fluid-type byte.

@@ -76,6 +76,8 @@ pub struct ItemXmlAttrs {
     /// Weapon type (`<attribute key="weaponType">`): "sword","axe","club",
     /// "distance","wand","shield","ammunition", or empty.
     pub weapon_type: String,
+    /// Container capacity (`<attribute key="containersize">`). 0 if not a container.
+    pub container_size: u8,
 }
 
 impl Default for ItemXmlAttrs {
@@ -90,6 +92,7 @@ impl Default for ItemXmlAttrs {
             show_count: true,
             slot_type: String::new(),
             weapon_type: String::new(),
+            container_size: 0,
         }
     }
 }
@@ -151,6 +154,8 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
                 attrs.slot_type = value.to_ascii_lowercase();
             } else if key.eq_ignore_ascii_case("weaponType") {
                 attrs.weapon_type = value.to_ascii_lowercase();
+            } else if key.eq_ignore_ascii_case("containersize") {
+                attrs.container_size = value.parse::<u8>().unwrap_or(0);
             }
         }
         for id in ids {
@@ -164,6 +169,7 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
             entry.show_count = attrs.show_count;
             if !attrs.slot_type.is_empty() { entry.slot_type = attrs.slot_type.clone(); }
             if !attrs.weapon_type.is_empty() { entry.weapon_type = attrs.weapon_type.clone(); }
+            if attrs.container_size != 0 { entry.container_size = attrs.container_size; }
         }
     }
 
