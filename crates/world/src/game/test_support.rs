@@ -1,7 +1,6 @@
 //! Shared test fixtures for the game module's per-file test suites.
 
 use super::*;
-use crate::map::StaticMap;
 use formats::otb::{ItemType, ItemsOtb};
 use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
 

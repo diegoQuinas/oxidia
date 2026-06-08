@@ -893,4 +893,33 @@ mod tests {
         assert!(g.players[&player].open_containers[cid as usize].as_ref().unwrap().is_open,
             "container must be open again after third use");
     }
+
+    // -------------------------------------------------------------------------
+    // M10.1 do_move_thing tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn throwing_open_ground_container_follows_and_closes_out_of_range() {
+        // New detail: a container opened from the ground and thrown far must close.
+        // The tile-to-tile move re-keys the window to the new tile and auto-closes
+        // it when it lands out of range. Backpack on (100,110,7); player adjacent
+        // on (100,111,7); throw to (100,113,7) (2 tiles from the player).
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 111, 7));
+        // Open the ground backpack window (cid keyed to its tile).
+        g.players.get_mut(&player).unwrap().open_containers[0] = Some(OpenContainer {
+            server_id: 600, client_id: 1988, capacity: 20, name: "backpack".into(),
+            items: vec![], source: ContainerSource::Ground(Position::new(100, 110, 7)), is_open: true,
+        });
+        drain(&mut rx);
+
+        // Throw the backpack from (100,110,7) to (100,113,7). Stackpos 1 = the
+        // backpack (ground at 0, no creatures on that tile).
+        g.do_move_thing(player, Position::new(100, 110, 7), 1, Position::new(100, 113, 7), 1);
+
+        let oc = g.players[&player].open_containers[0].as_ref().expect("window retained");
+        assert!(matches!(oc.source, ContainerSource::Ground(p) if p == Position::new(100, 113, 7)),
+            "window re-keyed to the destination tile; got {:?}", oc.source);
+        assert!(!oc.is_open, "container thrown out of range must close");
+    }
 }

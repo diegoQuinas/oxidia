@@ -1,7 +1,7 @@
 //! Chat (say/yell/whisper) for the game actor.
 
 use super::*;
-use protocol::chat::{self, SpeakType};
+use protocol::chat;
 
 impl Game {
     pub(super) fn do_say(&mut self, id: u32, speak_type: SpeakType, text: String) {
