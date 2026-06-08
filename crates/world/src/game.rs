@@ -842,8 +842,20 @@ impl Game {
         });
 
         let cid = if let Some(c) = existing_cid {
-            // Reopen the existing slot: update metadata (in case the container
-            // item changed type somehow) and mark it visible again.
+            // TFS toggle (actions.cpp useItem): using an already-open container
+            // closes it. TFS keys "open" off the openContainers map (erased on
+            // close); we retain the slot with `is_open=false` so contents survive
+            // a reopen, so "currently open" means `is_open == true`.
+            let already_open = self.players.get(&id)
+                .and_then(|p| p.open_containers[c as usize].as_ref())
+                .map(|oc| oc.is_open)
+                .unwrap_or(false);
+            if already_open {
+                self.do_close_container(id, c);
+                return;
+            }
+            // Reopen the existing (closed) slot: update metadata (in case the
+            // container item changed type somehow) and mark it visible again.
             if let Some(p) = self.players.get_mut(&id) {
                 if let Some(oc) = p.open_containers[c as usize].as_mut() {
                     oc.is_open = true;
@@ -883,7 +895,7 @@ impl Game {
     fn close_container_tree(&mut self, id: u32, cid: u8) {
         let children: Vec<u8> = if let Some(p) = self.players.get(&id) {
             (0u8..16).filter(|&c| {
-                p.open_containers[c as usize].as_ref().map_or(false, |oc| {
+                p.open_containers[c as usize].as_ref().is_some_and(|oc| {
                     matches!(oc.source, ContainerSource::Nested { parent_cid: pc, .. } if pc == cid)
                 })
             }).collect()
@@ -5558,6 +5570,9 @@ mod tests {
                 // helmet: moveable + pickupable, slotType head (equippable in slot 1)
                 OtbItemType { group: 5, flags: FLAG_MOVEABLE_OTB | FLAG_PICKUPABLE_OTB, server_id: 500, client_id: 5741,
                     always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                // backpack: container (group 2), moveable + pickupable. Not on any tile.
+                OtbItemType { group: 2, flags: FLAG_MOVEABLE_OTB | FLAG_PICKUPABLE_OTB, server_id: 600, client_id: 1988,
+                    always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
             ],
         };
 
@@ -5566,6 +5581,7 @@ mod tests {
           <item id="300" name="gold coin" article="a" plural="gold coins"><attribute key="weight" value="10"/><attribute key="showcount" value="1"/></item>
           <item id="400" name="decoration" article="a" plural="decorations"/>
           <item id="500" name="helmet" article="a"><attribute key="slotType" value="head"/></item>
+          <item id="600" name="backpack" article="a"><attribute key="containersize" value="20"/></item>
         </items>"#;
         let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
 
@@ -5652,6 +5668,48 @@ mod tests {
         assert_eq!(count_sid_in_overlays(&g, 200), 1,
             "after hop 3 exactly one stone must exist; overlays: {:?}",
             g.dynamic.iter().map(|(k, v)| (*k, v.server_ids.clone())).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn do_use_item_on_open_container_toggles_closed() {
+        // Issue 4: using (0x82) a container that is already open must CLOSE it
+        // (TFS actions.cpp toggle), not re-send another 0x6E open. A third use
+        // re-opens it. Source is inventory slot 3 (pos_x=0xFFFF, pos_y=3, no 0x40).
+        let mut g = Game::new(move_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // Put the backpack (sid 600) in inventory slot 3.
+        g.players.get_mut(&player).unwrap().inventory[2] = Some(InvItem {
+            server_id: 600, client_id: 1988, count: None, animated: false,
+        });
+        drain(&mut rx);
+
+        // 1st use → open. Expect a 0x6E and is_open == true.
+        g.do_use_item(player, 0xFFFF, 3, 0, 0, 0);
+        let pkts = drain(&mut rx);
+        assert!(has_op(&pkts, protocol::container::OP_OPEN_CONTAINER),
+            "first use must push 0x6E open; got {:?}", pkts);
+        let cid = (0u8..16).find(|&c| g.players[&player].open_containers[c as usize].is_some())
+            .expect("a container slot must be allocated");
+        assert!(g.players[&player].open_containers[cid as usize].as_ref().unwrap().is_open,
+            "container must be open after first use");
+
+        // 2nd use → close. Expect a 0x6F and is_open == false (slot retained).
+        g.do_use_item(player, 0xFFFF, 3, 0, 0, 0);
+        let pkts = drain(&mut rx);
+        assert!(has_op(&pkts, protocol::container::OP_CLOSE_CONTAINER),
+            "second use must push 0x6F close; got {:?}", pkts);
+        assert!(!has_op(&pkts, protocol::container::OP_OPEN_CONTAINER),
+            "second use must NOT re-send 0x6E open; got {:?}", pkts);
+        assert!(!g.players[&player].open_containers[cid as usize].as_ref().unwrap().is_open,
+            "container must be closed (but retained) after second use");
+
+        // 3rd use → re-open the retained slot.
+        g.do_use_item(player, 0xFFFF, 3, 0, 0, 0);
+        let pkts = drain(&mut rx);
+        assert!(has_op(&pkts, protocol::container::OP_OPEN_CONTAINER),
+            "third use must re-open with 0x6E; got {:?}", pkts);
+        assert!(g.players[&player].open_containers[cid as usize].as_ref().unwrap().is_open,
+            "container must be open again after third use");
     }
 
     #[test]
