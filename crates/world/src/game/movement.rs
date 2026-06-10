@@ -1523,4 +1523,25 @@ mod tests {
         );
         eprintln!("detector works: {}", sim.first_divergence.unwrap());
     }
+
+    #[test]
+    fn noclip_bypasses_blocked_tiles() {
+        let mut g = Game::new(walk_map());
+        let spawn = Position::new(95, 117, 7);
+        let wall = Position::new(94, 117, 7); // blocked tile in walk_map
+        let (id, mut rx) = add_player(&mut g, spawn);
+        g.players.get_mut(&id).unwrap().gamemaster = true;
+        drain(&mut rx);
+
+        // Without noclip: blocked.
+        g.do_move(id, Direction::West);
+        assert_eq!(g.players.get(&id).unwrap().position, spawn,
+            "blocked tile must reject movement without noclip");
+
+        // With noclip: bypass.
+        g.players.get_mut(&id).unwrap().noclip = true;
+        g.do_move(id, Direction::West);
+        assert_eq!(g.players.get(&id).unwrap().position, wall,
+            "noclip must bypass blocked tiles");
+    }
 }
