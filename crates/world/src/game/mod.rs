@@ -7,6 +7,7 @@
 //! walk move/appear/remove, turn, logout remove).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -23,14 +24,19 @@ use protocol::{enter_world, tile_creature, tile_item, walk};
 use crate::map::StaticMap;
 use crate::{Direction, Position};
 
+use self::lua::LuaRuntime;
+use self::xml_registry::XmlRegistry;
+
 mod chat;
 mod combat;
 mod containers;
 mod gm;
 mod items;
 mod look;
+mod lua;
 mod movement;
 mod session;
+mod xml_registry;
 #[cfg(test)]
 mod test_support;
 
@@ -242,6 +248,21 @@ struct Game {
     /// Channel to the background save worker. `None` in unit tests and until
     /// `spawn()` wires it in. Unbounded so `logout` never blocks the actor.
     save_tx: Option<mpsc::UnboundedSender<SaveRecord>>,
+    /// Lua scripting runtime. `None` when no scripts directory is configured or
+    /// when initialisation failed — the game operates normally without hooks.
+    lua: Option<LuaRuntime>,
+    /// XML item-to-script registry parsed from `actions.xml` / `movements.xml`.
+    registry: XmlRegistry,
+}
+
+/// Configuration for the game actor passed from [`spawn`].
+#[derive(Default)]
+pub struct GameConfig {
+    /// Directory containing `.lua` scripts for the Lua runtime.
+    /// `None` disables scripting at runtime.
+    pub lua_scripts_dir: Option<PathBuf>,
+    /// XML content of `actions.xml` mapping item ids to script hooks.
+    pub actions_xml: String,
 }
 
 impl Game {
@@ -254,6 +275,8 @@ impl Game {
             next_statement_id: 1,
             rng: StdRng::from_entropy(),
             save_tx: None,
+            lua: None,
+            registry: XmlRegistry::default(),
         }
     }
 
@@ -269,6 +292,8 @@ impl Game {
             next_statement_id: 1,
             rng: StdRng::seed_from_u64(seed),
             save_tx: None,
+            lua: None,
+            registry: XmlRegistry::default(),
         }
     }
 
@@ -381,6 +406,14 @@ impl Game {
         Some(creature::add_creature(&view, known, 0))
     }
 
+    /// Drop and re-initialise the Lua runtime so script changes on disk take
+    /// effect without restarting the server.
+    fn do_reload_lua(&mut self) {
+        if let Some(rt) = &mut self.lua {
+            rt.reload();
+        }
+    }
+
     /// Best-effort push to a session. On a full/closed channel the player is
     /// reaped (logged out) so the game loop never blocks and memory never grows
     /// unbounded.
@@ -418,6 +451,7 @@ impl Game {
             Command::CloseContainer { id, cid } => self.do_close_container(id, cid),
             Command::UpArrow { id, cid } => self.do_up_arrow(id, cid),
             Command::Gm { id, text } => self.do_gm_command(id, text),
+            Command::ReloadLua => self.do_reload_lua(),
             // Intercepted in the actor loop (it must break the loop + ack);
             // never reaches `handle`. Arm kept for match exhaustiveness.
             Command::Shutdown { .. } => {}
@@ -612,6 +646,9 @@ enum Command {
     /// Dropping the actor drops `save_tx`, closing the save channel so the DB
     /// drain task can finish. Handled in the actor loop, not in `handle`.
     Shutdown { ack: oneshot::Sender<()> },
+    /// Drop and re-initialise the Lua runtime so script changes on disk take
+    /// effect without restarting the server.
+    ReloadLua,
 }
 
 /// Cloneable handle to the running world.
@@ -723,6 +760,11 @@ impl WorldHandle {
             let _ = rx.await;
         }
     }
+
+    /// Send a command to reload all Lua scripts from disk.
+    pub fn reload_lua(&self) {
+        let _ = self.tx.try_send(Command::ReloadLua);
+    }
 }
 
 /// The outbound channel a session hands the world at login.
@@ -736,7 +778,7 @@ pub fn push_channel() -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
 /// a background task, mapping each record to `persistence::PlayerSave` and
 /// awaiting `store.save_player`. Also spawns the single global combat-tick task
 /// that sends `Command::CombatTick` every `COMBAT_TICK_MS` milliseconds.
-pub fn spawn(map: Arc<StaticMap>) -> (WorldHandle, mpsc::UnboundedReceiver<SaveRecord>) {
+pub fn spawn(map: Arc<StaticMap>, config: GameConfig) -> (WorldHandle, mpsc::UnboundedReceiver<SaveRecord>) {
     let (tx, mut rx) = mpsc::channel::<Command>(64);
     let handle = WorldHandle { tx: tx.clone(), map: Arc::clone(&map) };
 
@@ -764,6 +806,14 @@ pub fn spawn(map: Arc<StaticMap>) -> (WorldHandle, mpsc::UnboundedReceiver<SaveR
     tokio::spawn(async move {
         let mut game = Game::new(map);
         game.save_tx = Some(save_tx);
+        game.lua = config.lua_scripts_dir.map(|d| LuaRuntime::new(&d));
+        game.registry = match XmlRegistry::from_actions_xml(&config.actions_xml) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(%e, "failed to parse actions.xml — using empty registry");
+                XmlRegistry::default()
+            }
+        };
         while let Some(cmd) = rx.recv().await {
             if let Command::Shutdown { ack } = cmd {
                 game.save_all();

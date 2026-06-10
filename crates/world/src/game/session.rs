@@ -227,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_pushes_appear_to_existing_spectator() {
-        let (world, _save_rx) = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
         let (tx_a, mut rx_a) = push_channel();
         let ack_a = world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         // Second player logs in next to A; A must receive a 0x6A appear.
@@ -243,7 +243,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_login_sees_first_in_ack_others() {
-        let (world, _save_rx) = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
         let (tx_a, _rx_a) = push_channel();
         world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, _rx_b) = push_channel();
@@ -289,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn logout_pushes_remove_to_spectator() {
-        let (world, _save_rx) = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
         let (tx_a, mut rx_a) = push_channel();
         world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, _rx_b) = push_channel();
@@ -309,7 +309,7 @@ mod tests {
     async fn shutdown_and_save_persists_online_players_then_stops_actor() {
         // Graceful shutdown through the live actor: shutdown_and_save resolves
         // once the save record is queued, and the actor stops afterwards.
-        let (world, mut save_rx) = spawn(walk_map());
+        let (world, mut save_rx) = spawn(walk_map(), GameConfig::default());
         let (tx_a, _rx_a) = push_channel();
         let ack = world.login("Diego".into(), default_initial(wizard_outfit()), tx_a)
             .await.unwrap();
@@ -334,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_login_on_occupied_spawn_gets_free_tile() {
-        let (world, _save_rx) = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
         let (tx_a, _ra) = push_channel();
         let ack_a = world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, _rb) = push_channel();

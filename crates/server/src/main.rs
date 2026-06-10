@@ -89,7 +89,20 @@ async fn main() -> Result<()> {
     );
     static_map.load_item_metadata(&items, &items_xml);
     let static_map = std::sync::Arc::new(static_map);
-    let (world_handle, mut save_rx) = world::game::spawn(static_map);
+    let actions_xml = std::fs::read_to_string("config/lua/actions.xml")
+        .unwrap_or_else(|e| {
+            warn!(%e, "config/lua/actions.xml not found — script hooks disabled");
+            String::new()
+        });
+    let lua_scripts_dir = std::path::Path::new("config/lua/scripts");
+    let lua_scripts_dir = if lua_scripts_dir.is_dir() {
+        Some(lua_scripts_dir.to_path_buf())
+    } else {
+        warn!("config/lua/scripts/ not found — Lua runtime disabled");
+        None
+    };
+    let game_cfg = world::game::GameConfig { lua_scripts_dir, actions_xml };
+    let (world_handle, mut save_rx) = world::game::spawn(static_map, game_cfg);
     info!(spawn = ?world_handle.map.spawn(), "world loaded");
 
     // Background save worker: drains save records emitted by the world actor on

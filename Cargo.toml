@@ -29,6 +29,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 num-bigint-dig = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+mlua = { version = "0.10", features = ["lua54", "send"] }
 
 [profile.release]
 opt-level = 3

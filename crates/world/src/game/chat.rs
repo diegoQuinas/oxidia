@@ -62,7 +62,7 @@ mod tests {
 
     #[tokio::test]
     async fn say_broadcasts_to_spectator_and_speaker() {
-        let (world, _save_rx) = spawn(walk_map());
+        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
         let (tx_a, mut rx_a) = push_channel();
         let ack_a = world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
         let (tx_b, mut rx_b) = push_channel();

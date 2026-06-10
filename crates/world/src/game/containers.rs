@@ -1,6 +1,7 @@
 //! Container engine for the game actor.
 
 use super::*;
+use super::lua::LuaArgs;
 
 fn matches_source(a: ContainerSource, b: ContainerSource) -> bool {
     match (a, b) {
@@ -174,7 +175,34 @@ impl Game {
         };
 
         let Some(meta) = self.map.item_meta(server_id) else { return };
-        if !meta.is_container { return; }
+        if !meta.is_container {
+            // Non-container item: check the XML registry for a Lua script
+            // binding and dispatch the onUse hook if one exists. This is the
+            // extension point for script-driven item behavior (ladders,
+            // levers, runes, etc.). Container items proceed to the existing
+            // open-container path below.
+            if let Some(ref lua) = self.lua {
+                if self.registry.lookup(server_id).is_some() {
+                    let args = LuaArgs {
+                        player_id: id,
+                        item_id: server_id,
+                        pos_x, pos_y, pos_z, stackpos,
+                    };
+                    if let Err(e) = lua.dispatch("onUse", &args) {
+                        tracing::error!(%server_id, error = %e, "Lua onUse dispatch failed");
+                    }
+                    // Execute any actions the Lua script requested (teleport, etc.).
+                    for action in lua.drain_actions() {
+                        match action {
+                            super::lua::GameAction::Teleport { player_id, landing } => {
+                                self.do_teleport(player_id, landing);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
 
         let capacity = meta.container_capacity.max(1);
         let name = meta.name.clone();
@@ -898,6 +926,85 @@ mod tests {
     // M10.1 do_move_thing tests
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // M11.3 — onUse Lua dispatch integration
+    // -------------------------------------------------------------------------
+
+    /// Create a unique temp directory for a Lua integration test.
+    fn lua_test_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("oxidia-containers-{label}-{seq}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Count how many times `call_count` was incremented by the Lua script.
+    fn lua_call_count(g: &Game) -> i64 {
+        g.lua.as_ref()
+            .and_then(|rt| rt.get_global_i64("call_count"))
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn registered_item_triggers_lua_onuse_dispatch() {
+        // RED: Current do_use_item returns early for non-container items, so
+        // Lua dispatch is never called. This test fails with call_count == 0.
+        let script_dir = lua_test_dir("registered");
+        std::fs::write(
+            script_dir.join("test.lua"),
+            b"call_count = 0\nfunction onUse(args) call_count = call_count + 1 return true end",
+        )
+        .unwrap();
+        let mut g = Game::new(move_map());
+        g.lua = Some(LuaRuntime::new(&script_dir));
+        g.registry = XmlRegistry::from_actions_xml(
+            r#"<actions><action itemid="200" script="test.onUse"/></actions>"#,
+        )
+        .unwrap();
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx);
+
+        // Use the stone (sid 200) at (101,100,7), stackpos 1 (ground + stone).
+        g.do_use_item(player, 101, 100, 7, 1, 0);
+
+        assert_eq!(
+            lua_call_count(&g),
+            1,
+            "onUse must be dispatched exactly once for registered item 200"
+        );
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    #[test]
+    fn unregistered_item_silently_ignored_by_lua_dispatch() {
+        // Triangulation: a non-container item NOT in the XmlRegistry must NOT
+        // trigger Lua dispatch. call_count stays 0.
+        let script_dir = lua_test_dir("unregistered");
+        std::fs::write(
+            script_dir.join("test.lua"),
+            b"call_count = 0\nfunction onUse(args) call_count = call_count + 1 return true end",
+        )
+        .unwrap();
+        let mut g = Game::new(move_map());
+        g.lua = Some(LuaRuntime::new(&script_dir));
+        // Empty registry — no items registered.
+        g.registry = XmlRegistry::default();
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx);
+
+        // Use gold coin (sid 300) at (102,100,7) — NOT registered.
+        g.do_use_item(player, 102, 100, 7, 1, 0);
+
+        assert_eq!(
+            lua_call_count(&g),
+            0,
+            "onUse must NOT be dispatched for unregistered item"
+        );
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
     #[test]
     fn throwing_open_ground_container_follows_and_closes_out_of_range() {
         // New detail: a container opened from the ground and thrown far must close.
@@ -921,5 +1028,71 @@ mod tests {
         assert!(matches!(oc.source, ContainerSource::Ground(p) if p == Position::new(100, 113, 7)),
             "window re-keyed to the destination tile; got {:?}", oc.source);
         assert!(!oc.is_open, "container thrown out of range must close");
+    }
+
+    // -------------------------------------------------------------------------
+    // M11.4 — Teleport integration
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn lua_onuse_teleports_player_upstairs() {
+        // RED: After dispatching to a Lua script that calls do_teleport, the
+        // player must appear on the floor above. Prior to the action-drain
+        // mechanism, the teleport request from Lua is ignored.
+        let script_dir = lua_test_dir("teleport_up");
+        std::fs::write(
+            script_dir.join("test.lua"),
+            b"function onUse(args) do_teleport(args.player_id, args.pos_x, args.pos_y, args.pos_z - 1) return true end",
+        )
+        .unwrap();
+        let mut g = Game::new(move_map());
+        g.lua = Some(LuaRuntime::new(&script_dir));
+        g.registry = XmlRegistry::from_actions_xml(
+            r#"<actions><action itemid="200" script="test.onUse"/></actions>"#,
+        )
+        .unwrap();
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx);
+
+        // Use the stone (sid 200) at (101,100,7), stackpos 1.
+        g.do_use_item(player, 101, 100, 7, 1, 0);
+
+        assert_eq!(
+            g.players[&player].position,
+            Position::new(101, 100, 6),
+            "player must be teleported upstairs (z-1) after using a registered item"
+        );
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    #[test]
+    fn lua_error_during_onuse_does_not_crash_server() {
+        // RED: a Lua script that calls error() must be caught by the dispatch
+        // pcall and logged, not propagated as a Rust panic.
+        let script_dir = lua_test_dir("lua_error");
+        std::fs::write(
+            script_dir.join("test.lua"),
+            b"function onUse(args) error('boom') return true end",
+        )
+        .unwrap();
+        let mut g = Game::new(move_map());
+        g.lua = Some(LuaRuntime::new(&script_dir));
+        g.registry = XmlRegistry::from_actions_xml(
+            r#"<actions><action itemid="200" script="test.onUse"/></actions>"#,
+        )
+        .unwrap();
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx);
+
+        // Must not panic.
+        g.do_use_item(player, 101, 100, 7, 1, 0);
+
+        // Player position unchanged (no teleport happened).
+        assert_eq!(
+            g.players[&player].position,
+            Position::new(100, 100, 7),
+            "player must stay at original position after a Lua error"
+        );
+        let _ = std::fs::remove_dir_all(&script_dir);
     }
 }

@@ -1,0 +1,5 @@
+<actions>
+    <action itemid="1386" script="teleport.onUse"/>
+    <action itemid="1391" script="teleport.onUse"/>
+    <action itemid="384"  script="teleport.onUse"/>
+</actions>

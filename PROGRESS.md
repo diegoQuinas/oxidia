@@ -48,7 +48,7 @@ performance-critical or stable stays native Rust.
 | M10.2 | Inventory & equipment slots: equip/unequip, pickup/drop (ground↔inventory), weight/cap enforcement, persist inventory | ⬜ |
 | M10.3 | Containers (backpack): open/close + nested + move in/out, plus use-to-open (`0x82` use opens a container). Rest of `use` (levers/keys/runes/potions) → M11/Lua | ⬜ |
 | **C** | **Scripting** | |
-| M11 | Lua runtime (mlua): hot-reloadable content hooks (onUse/onStepIn/onSay/…). Includes use-driven floor changes (M6.2: ladders/holes via `teleport.lua` `onUse`) — see `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ⬜ |
+| M11 | Lua runtime (mlua): hot-reloadable content hooks (onUse/onStepIn/onSay/…). Includes use-driven floor changes (M6.2: ladders/holes via `teleport.lua` `onUse`) — see `docs/superpowers/specs/2026-06-07-m6.2-ladders-design.md` | ✅ done |
 | **D** | **PvE → pre-alpha #2** | |
 | M12 | Creatures & monsters: spawns, AI, A* pathfinding | ⬜ |
 | M13 | Loot & corpses | ⬜ |

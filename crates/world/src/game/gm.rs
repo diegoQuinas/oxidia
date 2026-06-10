@@ -19,6 +19,7 @@ enum GmVerb {
     Bring,
     ChangeSex,
     SetLookType,
+    ReloadLua,
 }
 
 impl GmVerb {
@@ -33,6 +34,7 @@ impl GmVerb {
         Self::Bring,
         Self::ChangeSex,
         Self::SetLookType,
+        Self::ReloadLua,
     ];
 
     /// Accepted command words (first is canonical; the rest are aliases).
@@ -47,6 +49,7 @@ impl GmVerb {
             Self::Bring => &["bring"],
             Self::ChangeSex => &["changesex"],
             Self::SetLookType => &["setlooktype"],
+            Self::ReloadLua => &["reload"],
         }
     }
 
@@ -62,6 +65,7 @@ impl GmVerb {
             Self::Bring => "/bring \"player\"",
             Self::ChangeSex => "/changesex \"player\" <male|female>",
             Self::SetLookType => "/setlooktype <id> | /setlooktype \"player\" <id>",
+            Self::ReloadLua => "/reload lua",
         }
     }
 
@@ -77,6 +81,7 @@ impl GmVerb {
             Self::Bring => "Teleport another player to you.",
             Self::ChangeSex => "Change a player's sex (affects outfit catalog).",
             Self::SetLookType => "Set look type on yourself or another player.",
+            Self::ReloadLua => "Reload all Lua scripts from disk without restarting the server.",
         }
     }
 
@@ -158,6 +163,7 @@ impl Game {
             GmVerb::Bring => self.gm_bring(id, &args),
             GmVerb::ChangeSex => self.gm_changesex(id, &args),
             GmVerb::SetLookType => self.gm_setlooktype(id, &args),
+            GmVerb::ReloadLua => self.gm_reload_lua(id),
         }
     }
 
@@ -391,11 +397,19 @@ impl Game {
         self.push_status_message(id, format!("Look type set to {look_type}.").as_bytes());
     }
 
+    /// `/reload lua` — drop and re-initialise the Lua runtime so script changes
+    /// on disk take effect without restarting the server. Reports success/failure
+    /// as a `0xB4` status message to the requesting GM.
+    fn gm_reload_lua(&mut self, id: u32) {
+        self.do_reload_lua();
+        self.push_status_message(id, b"Lua scripts reloaded from disk.");
+    }
+
     /// Place a fresh item on `pos` and broadcast a `0x6A` add to spectators.
     /// Mirrors the destination half of `do_move_thing`: materialize the tile,
     /// insert at the front of the down-items (newest on top), broadcast at the
     /// top down-item stackpos. Replies to `gm_id` on success or failure.
-    fn do_spawn_item(&mut self, gm_id: u32, pos: Position, server_id: u16, count: u16) {
+    pub(crate) fn do_spawn_item(&mut self, gm_id: u32, pos: Position, server_id: u16, count: u16) {
         let Some(meta) = self.map.item_meta(server_id) else {
             self.push_status_message(gm_id, format!("Unknown item id {server_id}.").as_bytes());
             return;
@@ -439,6 +453,57 @@ impl Game {
 mod tests {
     use super::*;
     use super::super::test_support::*;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    fn gm_lua_test_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU16 = AtomicU16::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("oxidia-gm-{label}-{seq}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reload_lua_command_refreshes_lua_state() {
+        // RED: /reload lua does not exist yet. The test expects version=2
+        // after reload, but the unknown command leaves version at 1 → fails.
+        let dir = gm_lua_test_dir("reload");
+        std::fs::write(
+            dir.join("test.lua"),
+            b"version = 1\nfunction onUse(args) return true end",
+        )
+        .unwrap();
+        let mut g = Game::new(walk_map());
+        g.lua = Some(LuaRuntime::new(&dir));
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.players.get_mut(&player).unwrap().gamemaster = true;
+        drain(&mut rx);
+
+        // Confirm initial version.
+        assert_eq!(
+            g.lua.as_ref().unwrap().get_global_i64("version"),
+            Some(1),
+            "Lua state must have version=1 after initial load"
+        );
+
+        // Replace the script file on disk.
+        std::fs::write(
+            dir.join("test.lua"),
+            b"version = 2\nfunction onUse(args) return true end",
+        )
+        .unwrap();
+
+        // Execute /reload lua — the handler does not exist yet (RED).
+        g.do_gm_command(player, "/reload lua".into());
+
+        assert_eq!(
+            g.lua.as_ref().unwrap().get_global_i64("version"),
+            Some(2),
+            "after /reload lua the Lua state must reflect the new script"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tokenize_args_groups_quoted_segments() {

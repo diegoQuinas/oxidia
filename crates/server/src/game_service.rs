@@ -577,7 +577,7 @@ mod tests {
             towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
             waypoints: vec![],
         };
-        let (handle, _save_rx) = world::game::spawn(Arc::new(StaticMap::from_formats(&map, &items)));
+        let (handle, _save_rx) = world::game::spawn(Arc::new(StaticMap::from_formats(&map, &items)), Default::default());
         handle
     }
 
