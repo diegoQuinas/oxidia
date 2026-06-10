@@ -671,4 +671,23 @@ mod tests {
         assert_eq!(g.players.get(&id).unwrap().outfit, orig_outfit);
         assert!(!g.players.get(&id).unwrap().ghost); // noclip does not affect ghost
     }
+
+    #[test]
+    fn noclip_via_command_bypasses_blocked_tile() {
+        let mut g = Game::new(walk_map());
+        let spawn = Position::new(95, 117, 7);
+        let wall = Position::new(94, 117, 7); // blocked tile
+        let (id, mut rx) = add_player(&mut g, spawn);
+        g.players.get_mut(&id).unwrap().gamemaster = true;
+        drain(&mut rx);
+
+        // Send /noclip command → toggles noclip = true
+        g.do_gm_command(id, "/noclip".into());
+        assert!(g.players.get(&id).unwrap().noclip);
+
+        // Now walk through the blocked tile
+        g.do_move(id, Direction::West);
+        assert_eq!(g.players.get(&id).unwrap().position, wall,
+            "/noclip mode must bypass blocked tiles");
+    }
 }
