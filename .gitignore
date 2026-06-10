@@ -24,3 +24,6 @@ debug.log
 
 # git worktrees created for isolated milestone work
 .claude/worktrees/
+
+# Local map files (never committed — binary)
+/world/

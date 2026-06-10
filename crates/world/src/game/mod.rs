@@ -54,7 +54,8 @@ pub const MELEE_ATTACK_INTERVAL_MS: u64 = 2000;
 const COMBAT_TICK_MS: u64 = 250;
 
 /// Ghost looktype for GM ghost mode (placeholder — verify against client .dat).
-const GHOST_LOOKTYPE: u16 = 40;
+/// Ghost looktype from monster "Ghost" (reference/tfs/data/monster/monsters/ghost.xml).
+const GHOST_LOOKTYPE: u16 = 48;
 
 /// TFS `MESSAGE_STATUS_SMALL = 21` (`const.h:190`): white status-bar message.
 /// Used for PZ-rejection ("You may not attack…").
