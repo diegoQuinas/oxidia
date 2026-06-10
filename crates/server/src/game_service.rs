@@ -5,7 +5,7 @@ use anyhow::Result;
 use persistence::{PlayerSave, Store};
 use protocol::map_description::Center;
 use protocol::rsa::RsaPrivateKey;
-use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, outfit as outfit_packets, xtea};
+use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, outfit as outfit_packets, walk, xtea};
 use tokio::io::{AsyncRead, AsyncWrite};
 use world::game::{InitialState, SaveRecord, WorldHandle};
 use world::map::StaticMap;
@@ -459,6 +459,13 @@ where
             if opcode == protocol::container::OP_UP_ARROW {
                 if let Some(cid) = protocol::container::parse_container_cid(&payload[1..]) {
                     world.up_arrow(id, cid).await;
+                }
+                continue;
+            }
+            // 0x64 — client auto-walk / GoTo (parseAutoWalk in TFS).
+            if opcode == 0x64 {
+                if let Some(steps) = walk::parse_auto_walk(&payload[1..]) {
+                    world.auto_walk(id, steps).await;
                 }
                 continue;
             }
