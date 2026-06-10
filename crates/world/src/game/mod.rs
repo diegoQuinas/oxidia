@@ -480,6 +480,7 @@ impl Game {
                 self.do_use_item(id, pos_x, pos_y, pos_z, stackpos, index),
             Command::CloseContainer { id, cid } => self.do_close_container(id, cid),
             Command::UpArrow { id, cid } => self.do_up_arrow(id, cid),
+            Command::AutoWalk { id, steps } => self.do_auto_walk(id, steps),
             Command::Gm { id, text } => self.do_gm_command(id, text),
             Command::ReloadLua => self.do_reload_lua(),
             // Intercepted in the actor loop (it must break the loop + ack);
@@ -672,6 +673,8 @@ enum Command {
     CloseContainer { id: u32, cid: u8 },
     /// Client `0x88`: navigate to the parent container (up-arrow button).
     UpArrow { id: u32, cid: u8 },
+    /// Client `0x64`: auto-walk (GoTo) path from the client.
+    AutoWalk { id: u32, steps: Vec<walk::AutoWalkStep> },
     /// Graceful shutdown: persist every online player, ack, then stop the actor.
     /// Dropping the actor drops `save_tx`, closing the save channel so the DB
     /// drain task can finish. Handled in the actor loop, not in `handle`.
@@ -778,6 +781,11 @@ impl WorldHandle {
     /// Navigate to the parent container (`0x88` up-arrow).
     pub async fn up_arrow(&self, id: u32, cid: u8) {
         let _ = self.tx.send(Command::UpArrow { id, cid }).await;
+    }
+
+    /// Process a `0x64` auto-walk (GoTo) path from the client.
+    pub async fn auto_walk(&self, id: u32, steps: Vec<walk::AutoWalkStep>) {
+        let _ = self.tx.send(Command::AutoWalk { id, steps }).await;
     }
 
     /// Persist every online player, then stop the world actor. Resolves once all

@@ -1,8 +1,33 @@
 //! Movement, turning, and teleport for the game actor.
 
 use super::*;
+use protocol::walk::AutoWalkStep;
+
+/// Map an auto-walk step direction (from client `0x64` GoTo) to the [`Direction`]
+/// used by [`Game::do_move`].
+fn auto_walk_step_to_direction(step: AutoWalkStep) -> Direction {
+    match step {
+        AutoWalkStep::North => Direction::North,
+        AutoWalkStep::East => Direction::East,
+        AutoWalkStep::South => Direction::South,
+        AutoWalkStep::West => Direction::West,
+        AutoWalkStep::NorthEast => Direction::NorthEast,
+        AutoWalkStep::SouthEast => Direction::SouthEast,
+        AutoWalkStep::SouthWest => Direction::SouthWest,
+        AutoWalkStep::NorthWest => Direction::NorthWest,
+    }
+}
 
 impl Game {
+    /// Process a `0x64` auto-walk (GoTo) path from the client.
+    /// Each step is run through [`do_move`] so noclip/ghost bypass applies.
+    pub(super) fn do_auto_walk(&mut self, id: u32, steps: Vec<AutoWalkStep>) {
+        for step in steps {
+            let dir = auto_walk_step_to_direction(step);
+            self.do_move(id, dir);
+        }
+    }
+
     pub(super) fn do_turn(&mut self, id: u32, direction: Direction) {
         let pos = match self.players.get_mut(&id) {
             Some(p) => { p.direction = direction; p.position }

@@ -12,6 +12,43 @@ pub const OP_REMOVE_TILE_THING: u8 = 0x6C;
 pub const OP_FLOOR_CHANGE_UP: u8 = 0xBE;
 pub const OP_FLOOR_CHANGE_DOWN: u8 = 0xBF;
 
+/// Auto-walk / GoTo (`0x64`) direction byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoWalkStep {
+    East,
+    NorthEast,
+    North,
+    NorthWest,
+    West,
+    SouthWest,
+    South,
+    SouthEast,
+}
+
+/// Parse a `0x64` auto-walk (GoTo) body from the client.
+/// Format: [num_dirs u8][dir_byte × num_dirs].
+/// Direction bytes (TFS convention): 1=East, 2=NE, 3=North, 4=NW, 5=West, 6=SW, 7=South, 8=SE.
+pub fn parse_auto_walk(body: &[u8]) -> Option<Vec<AutoWalkStep>> {
+    let num_dirs = *body.first()? as usize;
+    if num_dirs == 0 || body.len() < 1 + num_dirs {
+        return None;
+    }
+    let steps: Vec<AutoWalkStep> = body[1..=num_dirs].iter().filter_map(|&b| {
+        match b {
+            1 => Some(AutoWalkStep::East),
+            2 => Some(AutoWalkStep::NorthEast),
+            3 => Some(AutoWalkStep::North),
+            4 => Some(AutoWalkStep::NorthWest),
+            5 => Some(AutoWalkStep::West),
+            6 => Some(AutoWalkStep::SouthWest),
+            7 => Some(AutoWalkStep::South),
+            8 => Some(AutoWalkStep::SouthEast),
+            _ => None,
+        }
+    }).collect();
+    if steps.is_empty() { None } else { Some(steps) }
+}
+
 const SLICE_NORTH: u8 = 0x65;
 const SLICE_EAST: u8 = 0x66;
 const SLICE_SOUTH: u8 = 0x67;
