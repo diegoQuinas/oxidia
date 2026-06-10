@@ -8,7 +8,8 @@ impl Game {
             Some(p) => { p.direction = direction; p.position }
             None => return,
         };
-        let pkt = walk::creature_turn(id, direction.to_byte());
+        let ghost = self.players.get(&id).map(|p| p.ghost).unwrap_or(false);
+        let pkt = walk::creature_turn(id, direction.to_byte(), if ghost { 1 } else { 0 });
         self.push(id, pkt.clone()); // mover sees own turn
         for spec in self.spectators(pos, id) {
             self.push(spec, pkt.clone());
@@ -159,7 +160,9 @@ impl Game {
                 if d.z != from.z {
                     self.map.has_ground(d)
                 } else {
-                    self.map.is_walkable(d) && !self.tile_occupied(d, id)
+                    // Ghost/noclip mode: GMs bypass all collision.
+                    let bypass = self.players.get(&id).map(|p| p.ghost || p.noclip).unwrap_or(false);
+                    bypass || self.map.is_walkable(d) && !self.tile_occupied(d, id)
                 }
             });
 

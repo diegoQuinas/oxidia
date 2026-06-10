@@ -92,6 +92,9 @@ pub(super) fn add_player(g: &mut Game, pos: Position) -> (u32, mpsc::Receiver<Ve
         attacking: None, last_attack_ms: 0,
         sex: 1, // male (default)
         gamemaster: false,
+        ghost: false,
+        prev_outfit: None,
+        noclip: false,
         inventory: [None; 10],
         open_containers: std::array::from_fn(|_| None),
     });

@@ -41,6 +41,9 @@ impl Game {
             attacking: None, last_attack_ms: 0,
             sex: initial.sex,
             gamemaster: initial.gamemaster,
+            ghost: false,
+            prev_outfit: None,
+            noclip: false,
             inventory,
             open_containers,
         });
@@ -88,6 +91,7 @@ impl Game {
             light_level: 0,
             light_color: 0,
             speed: 220,
+            walkthrough: 0, // ghost is always false at login
         };
         placed.push(PlacedCreature {
             x: position.x, y: position.y, z: position.z,
@@ -450,6 +454,9 @@ mod tests {
             attacking: None, last_attack_ms: 0,
             sex: 1,
             gamemaster: false,
+            ghost: false,
+            prev_outfit: None,
+            noclip: false,
             inventory: [None; 10],
             open_containers: std::array::from_fn(|_| None),
         });
@@ -481,7 +488,10 @@ mod tests {
             name: "Diego".into(), position: pos_a, direction: Direction::North,
             outfit: wizard_outfit(), push_tx: tx_a, known: HashSet::new(),
             health: 90, max_health: 150, fist_skill: 10,
-            attacking: None, last_attack_ms: 0, sex: 1, gamemaster: true,
+            attacking: None, last_attack_ms: 0, sex: 1,             gamemaster: true,
+            ghost: false,
+            prev_outfit: None,
+            noclip: false,
             inventory: [None; 10],
             open_containers: std::array::from_fn(|_| None),
         });
@@ -494,6 +504,9 @@ mod tests {
             outfit: knight(), push_tx: tx_b, known: HashSet::new(),
             health: 145, max_health: 145, fist_skill: 10,
             attacking: None, last_attack_ms: 0, sex: 0, gamemaster: false,
+            ghost: false,
+            prev_outfit: None,
+            noclip: false,
             inventory: [None; 10],
             open_containers: std::array::from_fn(|_| None),
         });
@@ -533,6 +546,9 @@ mod tests {
             direction: Direction::West, outfit: knight(), push_tx: tx,
             known: HashSet::new(), health: 100, max_health: 100, fist_skill: 10,
             attacking: None, last_attack_ms: 0, sex: 1, gamemaster: false,
+            ghost: false,
+            prev_outfit: None,
+            noclip: false,
             inventory: [None; 10],
             open_containers: std::array::from_fn(|_| None),
         });
@@ -561,6 +577,9 @@ mod tests {
             attacking: None, last_attack_ms: 0,
             sex: 1,
             gamemaster: false,
+            ghost: false,
+            prev_outfit: None,
+            noclip: false,
             inventory: [None; 10],
             open_containers: std::array::from_fn(|_| None),
         });

@@ -204,6 +204,9 @@ mod tests {
             attacking: None, last_attack_ms: 0,
             sex: 0, // female
             gamemaster: false,
+            ghost: false,
+            prev_outfit: None,
+            noclip: false,
             inventory: [None; 10],
             open_containers: std::array::from_fn(|_| None),
         });

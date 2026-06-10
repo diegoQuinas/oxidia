@@ -53,6 +53,9 @@ pub const MELEE_ATTACK_INTERVAL_MS: u64 = 2000;
 /// timing granularity is good; cheap enough that the actor is not taxed.
 const COMBAT_TICK_MS: u64 = 250;
 
+/// Ghost looktype for GM ghost mode (placeholder — verify against client .dat).
+const GHOST_LOOKTYPE: u16 = 40;
+
 /// TFS `MESSAGE_STATUS_SMALL = 21` (`const.h:190`): white status-bar message.
 /// Used for PZ-rejection ("You may not attack…").
 const MSG_STATUS_SMALL: u8 = 21;
@@ -228,6 +231,15 @@ struct PlayerState {
     sex: u8,
     /// Gamemaster flag from login; gates look-at debug (item id + position).
     gamemaster: bool,
+    /// Ghost mode: GM invisible to non-GMs, bypasses collision, ghost looktype.
+    /// Runtime-only — reset on login/logout.
+    ghost: bool,
+    /// Previous outfit before ghost mode was toggled on.
+    /// `None` when ghost mode is off.
+    prev_outfit: Option<Outfit>,
+    /// Noclip mode: bypasses collision without invisibility or looktype change.
+    /// Runtime-only — reset on login/logout.
+    noclip: bool,
     /// Equipment slots 1..=10, indexed 0..=9. `None` = empty slot.
     inventory: [Option<InvItem>; 10],
     /// Open container windows, indexed by cid (0..=15). `None` = window not open.
@@ -361,10 +373,18 @@ impl Game {
     /// with what each client actually renders. Use this to notify watchers OF a
     /// tile; use [`Self::visible_from`] for what a watcher AT a tile sees — under
     /// the asymmetric viewport the two directions differ by a tile.
+    ///
+    /// Ghost GM mode: if the excluded player (the mover) is a ghost GM, non-GM
+    /// spectators are filtered out — they cannot see the ghost.
     fn spectators(&self, pos: Position, exclude: u32) -> Vec<u32> {
+        let ghost = self.players.get(&exclude).map(|p| p.ghost).unwrap_or(false);
         self.players
             .iter()
-            .filter(|&(&id, p)| id != exclude && Self::can_see(p.position, pos))
+            .filter(|&(&id, p)| {
+                id != exclude
+                    && Self::can_see(p.position, pos)
+                    && (!ghost || p.gamemaster)
+            })
             .map(|(&id, _)| id)
             .collect()
     }
@@ -372,10 +392,18 @@ impl Game {
     /// Ids of players a viewer standing at `viewer` can see, excluding `exclude`
     /// — the forward direction of [`Self::can_see`]. This is what the moving
     /// player renders in its own view, distinct from [`Self::spectators`].
+    ///
+    /// Ghost GM mode: non-GM viewers see ghost GMs filtered out.
+    /// GM viewers (gamemaster = true) always see ghost GMs.
     fn visible_from(&self, viewer: Position, exclude: u32) -> Vec<u32> {
+        let viewer_is_gm = self.players.get(&exclude).map(|p| p.gamemaster).unwrap_or(false);
         self.players
             .iter()
-            .filter(|&(&id, p)| id != exclude && Self::can_see(viewer, p.position))
+            .filter(|&(&id, p)| {
+                id != exclude
+                    && Self::can_see(viewer, p.position)
+                    && (viewer_is_gm || !p.ghost)
+            })
             .map(|(&id, _)| id)
             .collect()
     }
@@ -385,9 +413,9 @@ impl Game {
     /// and recording the target in the viewer's known-set. Returns `None` if
     /// either player is gone.
     fn introduce(&mut self, viewer: u32, target: u32) -> Option<Vec<u8>> {
-        let (name, dir, outfit) = {
+        let (name, dir, outfit, ghost) = {
             let t = self.players.get(&target)?;
-            (t.name.clone(), t.direction, t.outfit)
+            (t.name.clone(), t.direction, t.outfit, t.ghost)
         };
         let known = {
             let v = self.players.get_mut(&viewer)?;
@@ -402,6 +430,7 @@ impl Game {
             light_level: 0,
             light_color: 0,
             speed: 220,
+            walkthrough: if ghost { 1 } else { 0 },
         };
         Some(creature::add_creature(&view, known, 0))
     }

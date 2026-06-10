@@ -20,6 +20,8 @@ enum GmVerb {
     ChangeSex,
     SetLookType,
     ReloadLua,
+    Ghost,
+    Noclip,
 }
 
 impl GmVerb {
@@ -35,6 +37,8 @@ impl GmVerb {
         Self::ChangeSex,
         Self::SetLookType,
         Self::ReloadLua,
+        Self::Ghost,
+        Self::Noclip,
     ];
 
     /// Accepted command words (first is canonical; the rest are aliases).
@@ -50,6 +54,8 @@ impl GmVerb {
             Self::ChangeSex => &["changesex"],
             Self::SetLookType => &["setlooktype"],
             Self::ReloadLua => &["reload"],
+            Self::Ghost => &["ghost"],
+            Self::Noclip => &["noclip"],
         }
     }
 
@@ -66,6 +72,8 @@ impl GmVerb {
             Self::ChangeSex => "/changesex \"player\" <male|female>",
             Self::SetLookType => "/setlooktype <id> | /setlooktype \"player\" <id>",
             Self::ReloadLua => "/reload lua",
+            Self::Ghost => "/ghost",
+            Self::Noclip => "/noclip",
         }
     }
 
@@ -82,6 +90,8 @@ impl GmVerb {
             Self::ChangeSex => "Change a player's sex (affects outfit catalog).",
             Self::SetLookType => "Set look type on yourself or another player.",
             Self::ReloadLua => "Reload all Lua scripts from disk without restarting the server.",
+            Self::Ghost => "Toggle ghost mode: invisible to non-GMs, bypasses collision, ghost looktype.",
+            Self::Noclip => "Toggle noclip mode: bypasses collision, visible to everyone.",
         }
     }
 
@@ -164,6 +174,8 @@ impl Game {
             GmVerb::ChangeSex => self.gm_changesex(id, &args),
             GmVerb::SetLookType => self.gm_setlooktype(id, &args),
             GmVerb::ReloadLua => self.gm_reload_lua(id),
+            GmVerb::Ghost => self.gm_ghost(id),
+            GmVerb::Noclip => self.gm_noclip(id),
         }
     }
 
@@ -447,6 +459,58 @@ impl Game {
 
         self.push_status_message(gm_id, format!("Created item {server_id}.").as_bytes());
     }
+
+    /// `/ghost` — toggle ghost mode.
+    ///
+    /// When ghost mode is ON:
+    /// - GM is invisible to non-GM players (filtered from spectators)
+    /// - GM bypasses all collision (same as noclip)
+    /// - GM's looktype changes to ghost sprite
+    /// - GM's creature packets carry walkthrough=1
+    ///
+    /// When toggling OFF: restores looktype, re-introduces to non-GM spectators.
+    fn gm_ghost(&mut self, id: u32) {
+        let was_ghost = self.players.get(&id).map(|p| p.ghost).unwrap_or(false);
+        if was_ghost {
+            // Restore previous outfit before re-introducing.
+            let restored = match self.players.get_mut(&id) {
+                Some(p) => {
+                    p.ghost = false;
+                    p.prev_outfit.take().unwrap_or(p.outfit)
+                }
+                None => return,
+            };
+            self.do_change_outfit(id, restored);
+        } else {
+            // Save current outfit and apply ghost looktype.
+            let ghost_outfit = match self.players.get_mut(&id) {
+                Some(p) => {
+                    p.ghost = true;
+                    p.prev_outfit = Some(p.outfit);
+                    Outfit { look_type: GHOST_LOOKTYPE, ..p.outfit }
+                }
+                None => return,
+            };
+            self.do_change_outfit(id, ghost_outfit);
+        }
+        // Broadcast the state change to ALL spectators (they will be filtered
+        // naturally by the ghost-aware spectators()/visible_from()).
+        // TODO: when toggling ghost ON, remove GM from non-GM known-sets.
+        // TODO: when toggling OFF, re-introduce GM to non-GM spectators.
+        let msg = if was_ghost { "Ghost mode OFF." } else { "Ghost mode ON." };
+        self.push_status_message(id, msg.as_bytes());
+    }
+
+    /// `/noclip` — toggle noclip mode.
+    /// When ON: bypasses collision, visible to everyone, no looktype change.
+    fn gm_noclip(&mut self, id: u32) {
+        let noclip = match self.players.get_mut(&id) {
+            Some(p) => { p.noclip = !p.noclip; p.noclip }
+            None => return,
+        };
+        let msg = if noclip { "Noclip mode ON." } else { "Noclip mode OFF." };
+        self.push_status_message(id, msg.as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -547,5 +611,64 @@ mod tests {
         assert!(matches!(GmVerb::from_word("i"), Some(GmVerb::Item))); // alias
         assert!(matches!(GmVerb::from_word("item"), Some(GmVerb::Item)));
         assert!(GmVerb::from_word("nonsense").is_none());
+    }
+
+    #[test]
+    fn ghost_command_toggles_ghost_flag_and_looktype() {
+        let mut g = Game::new(walk_map());
+        let (id, _rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.players.get_mut(&id).unwrap().gamemaster = true;
+
+        // Initial state: ghost = false, normal outfit.
+        assert!(!g.players.get(&id).unwrap().ghost);
+        let orig_outfit = g.players.get(&id).unwrap().outfit;
+
+        // Toggle ON
+        g.do_gm_command(id, "/ghost".into());
+        assert!(g.players.get(&id).unwrap().ghost);
+        assert_eq!(g.players.get(&id).unwrap().outfit.look_type, GHOST_LOOKTYPE);
+        assert_eq!(g.players.get(&id).unwrap().prev_outfit, Some(orig_outfit));
+
+        // Toggle OFF
+        g.do_gm_command(id, "/ghost".into());
+        assert!(!g.players.get(&id).unwrap().ghost);
+        assert_eq!(g.players.get(&id).unwrap().outfit, orig_outfit);
+        assert_eq!(g.players.get(&id).unwrap().prev_outfit, None);
+    }
+
+    #[test]
+    fn ghost_command_rejected_for_non_gm() {
+        let mut g = Game::new(walk_map());
+        let (id, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        drain(&mut rx);
+
+        g.do_gm_command(id, "/ghost".into());
+        // Non-GM commands are silently dropped.
+        assert!(!g.players.get(&id).unwrap().ghost);
+    }
+
+    #[test]
+    fn noclip_command_toggles_noclip_flag() {
+        let mut g = Game::new(walk_map());
+        let (id, _rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.players.get_mut(&id).unwrap().gamemaster = true;
+
+        assert!(!g.players.get(&id).unwrap().noclip);
+        g.do_gm_command(id, "/noclip".into());
+        assert!(g.players.get(&id).unwrap().noclip);
+        g.do_gm_command(id, "/noclip".into());
+        assert!(!g.players.get(&id).unwrap().noclip);
+    }
+
+    #[test]
+    fn noclip_does_not_change_looktype_or_visibility() {
+        let mut g = Game::new(walk_map());
+        let (id, _rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.players.get_mut(&id).unwrap().gamemaster = true;
+        let orig_outfit = g.players.get(&id).unwrap().outfit;
+
+        g.do_gm_command(id, "/noclip".into());
+        assert_eq!(g.players.get(&id).unwrap().outfit, orig_outfit);
+        assert!(!g.players.get(&id).unwrap().ghost); // noclip does not affect ghost
     }
 }

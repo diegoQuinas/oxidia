@@ -56,7 +56,7 @@ pub fn cancel_walk(direction: u8) -> Vec<u8> {
 /// turn on a decorated tile is immune to the same items.otb-vs-`.dat` stackpos
 /// divergence. The trailing `0x0063` block is the replacement creature thing the
 /// client adds back, carrying the new facing.
-pub fn creature_turn(id: u32, direction: u8) -> Vec<u8> {
+pub fn creature_turn(id: u32, direction: u8, walkthrough: u8) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u8(OP_CREATURE_TURN);
     w.write_u16(0xFFFF);
@@ -64,7 +64,7 @@ pub fn creature_turn(id: u32, direction: u8) -> Vec<u8> {
     w.write_u16(0x0063);
     w.write_u32(id);
     w.write_u8(direction);
-    w.write_u8(0x00); // walkthrough
+    w.write_u8(walkthrough); // 0 = normal, 1 = ghost
     w.into_bytes()
 }
 
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn creature_turn_uses_id_form() {
-        let p = creature_turn(0x1000_0000, 1);
+        let p = creature_turn(0x1000_0000, 1, 0);
         assert_eq!(p[0], OP_CREATURE_TURN);
         assert_eq!(u16::from_le_bytes([p[1], p[2]]), 0xFFFF); // id-form marker
         assert_eq!(u32::from_le_bytes([p[3], p[4], p[5], p[6]]), 0x1000_0000); // lookup id

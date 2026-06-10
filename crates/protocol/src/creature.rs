@@ -32,6 +32,8 @@ pub struct CreatureView<'a> {
     pub light_level: u8,
     pub light_color: u8,
     pub speed: u16,
+    /// Walkthrough byte: 0 = normal, 1 = ghost (GM ghost mode).
+    pub walkthrough: u8,
 }
 
 /// `AddOutfit` (protocolgame.cpp:3066). `lookType` then either 5 color/addon
@@ -80,7 +82,7 @@ pub fn add_creature(view: &CreatureView, known: bool, remove_id: u32) -> Vec<u8>
     w.write_u8(0); // speech bubble
     w.write_u8(MARK_UNMARKED);
     w.write_u16(0); // helpers
-    w.write_u8(0); // walkthrough
+    w.write_u8(view.walkthrough); // walkthrough
     w.into_bytes()
 }
 
@@ -102,6 +104,7 @@ mod tests {
             light_level: 0,
             light_color: 0,
             speed: 220,
+            walkthrough: 0,
         }
     }
 
