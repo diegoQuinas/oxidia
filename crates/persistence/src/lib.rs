@@ -613,7 +613,11 @@ mod tests {
         let mut save = default_save("Test Knight");
         save.inventory = vec![(1, 0x0BBB, 1), (10, 0x0BB3, 50)];
         store.save_player(&save).await.unwrap();
-        let loaded = store.load_player("Test Knight").await.unwrap().expect("should be Some");
+        let loaded = store
+            .load_player("Test Knight")
+            .await
+            .unwrap()
+            .expect("should be Some");
         assert_eq!(loaded.inventory, vec![(1, 0x0BBB, 1), (10, 0x0BB3, 50)]);
     }
 

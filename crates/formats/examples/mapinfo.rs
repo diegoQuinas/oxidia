@@ -35,7 +35,10 @@ fn run(otb_path: &str, otbm_path: &str) -> Result<(), Box<dyn std::error::Error>
     let items = formats::otb::parse(&otb_bytes)?;
 
     println!("items.otb  ({otb_path})");
-    println!("  version : {}.{} build {}", items.major_version, items.minor_version, items.build_number);
+    println!(
+        "  version : {}.{} build {}",
+        items.major_version, items.minor_version, items.build_number
+    );
     println!("  items   : {}", items.items.len());
     println!();
 
@@ -73,7 +76,10 @@ fn run(otb_path: &str, otbm_path: &str) -> Result<(), Box<dyn std::error::Error>
     if !map.towns.is_empty() {
         println!("  town list  :");
         for town in &map.towns {
-            println!("    #{:<3} {:<20} temple ({}, {}, {})", town.id, town.name, town.x, town.y, town.z);
+            println!(
+                "    #{:<3} {:<20} temple ({}, {}, {})",
+                town.id, town.name, town.x, town.y, town.z
+            );
         }
     }
 

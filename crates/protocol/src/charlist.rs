@@ -86,7 +86,11 @@ impl CharacterList<'_> {
 /// (TFS uses `0x0B` for >= 1076, otherwise `0x0A`).
 pub fn build_error(message: &str, version: u16) -> Vec<u8> {
     let mut w = MessageWriter::new();
-    w.write_u8(if version >= 1076 { OPCODE_ERROR } else { OPCODE_ERROR_OLD });
+    w.write_u8(if version >= 1076 {
+        OPCODE_ERROR
+    } else {
+        OPCODE_ERROR_OLD
+    });
     w.write_string(message.as_bytes());
     w.into_bytes()
 }
@@ -100,7 +104,11 @@ mod tests {
         CharacterList {
             motd: Some((42, "Welcome!")),
             session_key: "test\ntest\n\n0",
-            world: World { name: "Tibia", host: "127.0.0.1", port: 7172 },
+            world: World {
+                name: "Tibia",
+                host: "127.0.0.1",
+                port: 7172,
+            },
             characters: &[],
             premium_ends_at: 0,
         }
@@ -109,7 +117,10 @@ mod tests {
     #[test]
     fn encodes_motd_session_world_and_characters() {
         let characters = vec!["Test Knight".to_string(), "Test Sorcerer".to_string()];
-        let list = CharacterList { characters: &characters, ..sample() };
+        let list = CharacterList {
+            characters: &characters,
+            ..sample()
+        };
 
         let bytes = list.encode();
         let mut r = MessageReader::new(&bytes);
@@ -142,7 +153,10 @@ mod tests {
 
     #[test]
     fn omits_motd_block_when_absent() {
-        let list = CharacterList { motd: None, ..sample() };
+        let list = CharacterList {
+            motd: None,
+            ..sample()
+        };
         let bytes = list.encode();
         // First opcode must be the session key, not the MOTD.
         assert_eq!(bytes[0], OPCODE_SESSION_KEY);

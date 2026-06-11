@@ -19,9 +19,24 @@ use crate::Position;
 
 /// Actions a Lua script can request. Queued during dispatch, drained by the
 /// caller (e.g. `do_use_item`) which holds `&mut Game` and can execute them.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum GameAction {
-    Teleport { player_id: u32, landing: Position },
+    Teleport {
+        player_id: u32,
+        landing: Position,
+    },
+    Feed {
+        player_id: u32,
+        health_gain: i32,
+        interval_ms: u64,
+        duration_ms: u64,
+        total_heal_cap: i32,
+    },
+    TextMessage {
+        player_id: u32,
+        message_type: u8,
+        text: String,
+    },
 }
 
 /// Arguments dispatched to a Lua callback, passed as a Lua table.
@@ -74,7 +89,11 @@ impl LuaRuntime {
         let lua = Lua::new();
         let actions: Arc<Mutex<Vec<GameAction>>> = Arc::new(Mutex::new(Vec::new()));
         Self::bind_builtins(&lua, Arc::clone(&actions));
-        let rt = Self { lua, scripts_dir: scripts_dir.to_path_buf(), actions };
+        let rt = Self {
+            lua,
+            scripts_dir: scripts_dir.to_path_buf(),
+            actions,
+        };
         rt.load_scripts();
         rt
     }
@@ -105,13 +124,7 @@ impl LuaRuntime {
         let func: Value = globals.get(fn_name)?;
         match func {
             Value::Function(f) => {
-                let table = self.lua.create_table()?;
-                table.set("player_id", args.player_id)?;
-                table.set("item_id", args.item_id)?;
-                table.set("pos_x", args.pos_x)?;
-                table.set("pos_y", args.pos_y)?;
-                table.set("pos_z", args.pos_z)?;
-                table.set("stackpos", args.stackpos)?;
+                let table = self.build_args_table(args)?;
                 let result: Value = f.call(table)?;
                 match result {
                     Value::Boolean(b) => Ok(b),
@@ -123,23 +136,114 @@ impl LuaRuntime {
         }
     }
 
+    /// Dispatch to a namespaced Lua function (e.g. `"food.onUse"`).
+    ///
+    /// Parses `script_name` as `"table.function"`, looks up the table in globals
+    /// and calls the function on it. Falls back to [`dispatch`] for flat names.
+    ///
+    /// This is the primary dispatch path for registered item scripts, ensuring
+    /// multiple scripts (food.lua, teleport.lua, etc.) can coexist without
+    /// clobbering each other's `onUse` global.
+    pub fn dispatch_namespaced(&self, script_name: &str, args: &LuaArgs) -> Result<bool, LuaError> {
+        let (table_name, method) = match script_name.split_once('.') {
+            Some(pair) => pair,
+            None => return self.dispatch(script_name, args),
+        };
+        let globals = self.lua.globals();
+        let table_val: Value = globals.get(table_name)?;
+        match table_val {
+            Value::Table(t) => {
+                let func: Value = t.get(method)?;
+                match func {
+                    Value::Function(f) => {
+                        let table = self.build_args_table(args)?;
+                        let result: Value = f.call(table)?;
+                        match result {
+                            Value::Boolean(b) => Ok(b),
+                            Value::Nil => Ok(false),
+                            _ => Ok(true),
+                        }
+                    }
+                    _ => Ok(false),
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Build an args table for dispatching. Shared by [`dispatch`] and
+    /// [`dispatch_namespaced`].
+    fn build_args_table(&self, args: &LuaArgs) -> Result<mlua::Table, LuaError> {
+        let table = self.lua.create_table()?;
+        table.set("player_id", args.player_id)?;
+        table.set("item_id", args.item_id)?;
+        table.set("pos_x", args.pos_x)?;
+        table.set("pos_y", args.pos_y)?;
+        table.set("pos_z", args.pos_z)?;
+        table.set("stackpos", args.stackpos)?;
+        Ok(table)
+    }
+
     /// Register built-in Rust functions in the Lua global table so scripts can
     /// request game actions (e.g. teleporting a player). Each closure captures a
     /// clone of `actions` via `Rc` and pushes a [`GameAction`] on invocation.
     ///
     /// Called from both `new` and `reload` so every fresh Lua state gets bindings.
     fn bind_builtins(lua: &Lua, actions: Arc<Mutex<Vec<GameAction>>>) {
+        let teleport_actions = Arc::clone(&actions);
         let do_teleport = lua
             .create_function(move |_, (id, x, y, z): (u32, u16, u16, u8)| {
-                actions.lock().unwrap().push(GameAction::Teleport {
+                teleport_actions.lock().unwrap().push(GameAction::Teleport {
                     player_id: id,
                     landing: Position::new(x, y, z),
                 });
                 Ok(())
             })
             .expect("create_function for do_teleport must not fail");
-        lua.globals().set("do_teleport", do_teleport)
+        lua.globals()
+            .set("do_teleport", do_teleport)
             .expect("set do_teleport global must not fail");
+
+        let feed_actions = Arc::clone(&actions);
+        let do_feed = lua
+            .create_function(
+                move |_,
+                      (player_id, health_gain, interval_ms, duration_ms, total_heal_cap): (
+                    u32,
+                    i32,
+                    u64,
+                    u64,
+                    i32,
+                )| {
+                    feed_actions.lock().unwrap().push(GameAction::Feed {
+                        player_id,
+                        health_gain,
+                        interval_ms,
+                        duration_ms,
+                        total_heal_cap,
+                    });
+                    Ok(())
+                },
+            )
+            .expect("create_function for do_feed must not fail");
+        lua.globals()
+            .set("do_feed", do_feed)
+            .expect("set do_feed global must not fail");
+
+        let text_actions = Arc::clone(&actions);
+        let do_send_text_message = lua
+            .create_function(move |_, (id, msg_type, text): (u32, u8, String)| {
+                text_actions.lock().unwrap().push(GameAction::TextMessage {
+                    player_id: id,
+                    message_type: msg_type,
+                    text,
+                });
+                Ok(())
+            })
+            .expect("create_function for do_send_text_message must not fail");
+        lua.globals()
+            .set("do_send_text_message", do_send_text_message)
+            .expect("set do_send_text_message global must not fail");
     }
 
     /// Drain all queued actions since the last call. Called by the game actor
@@ -157,7 +261,9 @@ impl LuaRuntime {
         if !self.scripts_dir.is_dir() {
             return;
         }
-        let Ok(entries) = std::fs::read_dir(&self.scripts_dir) else { return };
+        let Ok(entries) = std::fs::read_dir(&self.scripts_dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "lua") {
@@ -198,7 +304,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU16, Ordering};
 
-    use super::{LuaArgs, LuaRuntime};
+    use super::{GameAction, LuaArgs, LuaRuntime};
 
     /// Create a fresh temp directory for a test case.
     fn test_dir(label: &str) -> std::path::PathBuf {
@@ -211,7 +317,14 @@ mod tests {
     }
 
     fn sample_args() -> LuaArgs {
-        LuaArgs { player_id: 1, item_id: 1386, pos_x: 100, pos_y: 100, pos_z: 7, stackpos: 0 }
+        LuaArgs {
+            player_id: 1,
+            item_id: 1386,
+            pos_x: 100,
+            pos_y: 100,
+            pos_z: 7,
+            stackpos: 0,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -221,7 +334,11 @@ mod tests {
     #[test]
     fn new_loads_scripts_and_dispatch_calls_function() {
         let dir = test_dir("load");
-        fs::write(dir.join("test.lua"), b"function onUse(args) return true end").unwrap();
+        fs::write(
+            dir.join("test.lua"),
+            b"function onUse(args) return true end",
+        )
+        .unwrap();
         let rt = LuaRuntime::new(&dir);
         let result = rt.dispatch("onUse", &sample_args()).unwrap();
         assert!(result, "dispatch of registered onUse must return true");
@@ -235,10 +352,17 @@ mod tests {
     #[test]
     fn dispatch_returns_false_for_missing_function() {
         let dir = test_dir("missing_fn");
-        fs::write(dir.join("test.lua"), b"function onUse(args) return true end").unwrap();
+        fs::write(
+            dir.join("test.lua"),
+            b"function onUse(args) return true end",
+        )
+        .unwrap();
         let rt = LuaRuntime::new(&dir);
         let result = rt.dispatch("nonexistent", &sample_args()).unwrap();
-        assert!(!result, "dispatch of missing function must return Ok(false)");
+        assert!(
+            !result,
+            "dispatch of missing function must return Ok(false)"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -249,15 +373,26 @@ mod tests {
     #[test]
     fn reload_reflects_new_script_content() {
         let dir = test_dir("reload");
-        fs::write(dir.join("test.lua"), b"function onUse(args) return false end").unwrap();
+        fs::write(
+            dir.join("test.lua"),
+            b"function onUse(args) return false end",
+        )
+        .unwrap();
         let mut rt = LuaRuntime::new(&dir);
         // First version: returns false
         assert!(!rt.dispatch("onUse", &sample_args()).unwrap());
 
         // Replace script with new implementation
-        fs::write(dir.join("test.lua"), b"function onUse(args) return true end").unwrap();
+        fs::write(
+            dir.join("test.lua"),
+            b"function onUse(args) return true end",
+        )
+        .unwrap();
         rt.reload();
-        assert!(rt.dispatch("onUse", &sample_args()).unwrap(), "after reload new script must be active");
+        assert!(
+            rt.dispatch("onUse", &sample_args()).unwrap(),
+            "after reload new script must be active"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -284,7 +419,11 @@ mod tests {
     #[test]
     fn dispatch_returns_false_when_callback_returns_false() {
         let dir = test_dir("returns_false");
-        fs::write(dir.join("test.lua"), b"function onUse(args) return false end").unwrap();
+        fs::write(
+            dir.join("test.lua"),
+            b"function onUse(args) return false end",
+        )
+        .unwrap();
         let rt = LuaRuntime::new(&dir);
         let result = rt.dispatch("onUse", &sample_args()).unwrap();
         assert!(!result, "callback returning false must yield Ok(false)");
@@ -319,10 +458,339 @@ mod tests {
                 return args.player_id == 1 and args.item_id == 1386
             end
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         let rt = LuaRuntime::new(&dir);
         let result = rt.dispatch("onUse", &sample_args()).unwrap();
         assert!(result, "callback that validates args must succeed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // PHASE 2: do_feed binding pushes GameAction::Feed
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn do_feed_pushes_feed_action_with_correct_params() {
+        // RED: do_feed(pid, hg, interval, dur, cap) must push a GameAction::Feed
+        // with the same fields.
+        let dir = test_dir("do_feed");
+        fs::write(
+            dir.join("test.lua"),
+            br#"
+            function onUse(args)
+                do_feed(args.player_id, 8, 2000, 60000, 240)
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+        rt.dispatch("onUse", &sample_args()).unwrap();
+        let actions = rt.drain_actions();
+        assert_eq!(actions.len(), 1, "exactly one action must be queued");
+        match &actions[0] {
+            GameAction::Feed {
+                player_id,
+                health_gain,
+                interval_ms,
+                duration_ms,
+                total_heal_cap,
+            } => {
+                assert_eq!(*player_id, 1, "player_id must be 1");
+                assert_eq!(*health_gain, 8, "health_gain must be 8");
+                assert_eq!(*interval_ms, 2000, "interval_ms must be 2000");
+                assert_eq!(*duration_ms, 60000, "duration_ms must be 60000");
+                assert_eq!(*total_heal_cap, 240, "total_heal_cap must be 240");
+            }
+            other => panic!("expected GameAction::Feed, got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn do_feed_with_zero_values_still_queues_action() {
+        // Edge case: zero health_gain or duration should still queue a Feed action.
+        let dir = test_dir("do_feed_zero");
+        fs::write(
+            dir.join("test.lua"),
+            br#"
+            function onUse(args)
+                do_feed(args.player_id, 0, 0, 0, 0)
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+        rt.dispatch("onUse", &sample_args()).unwrap();
+        let actions = rt.drain_actions();
+        assert_eq!(
+            actions.len(),
+            1,
+            "zero-value feed must still queue an action"
+        );
+        match &actions[0] {
+            GameAction::Feed {
+                player_id,
+                health_gain,
+                ..
+            } => {
+                assert_eq!(*player_id, 1);
+                assert_eq!(*health_gain, 0);
+            }
+            other => panic!("expected GameAction::Feed, got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // EAT: do_send_text_message binding pushes GameAction::TextMessage
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn do_send_text_message_queues_textmessage_action() {
+        // EAT-04: RED — do_send_text_message(pid, 13, "Glup") must push a
+        // GameAction::TextMessage with matching fields.
+        let dir = test_dir("do_text_msg");
+        fs::write(
+            dir.join("test.lua"),
+            br#"
+            function onUse(args)
+                do_send_text_message(args.player_id, 13, "Glup")
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+        rt.dispatch("onUse", &sample_args()).unwrap();
+        let actions = rt.drain_actions();
+        assert_eq!(actions.len(), 1, "exactly one action must be queued");
+        match &actions[0] {
+            GameAction::TextMessage {
+                player_id,
+                message_type,
+                text,
+            } => {
+                assert_eq!(*player_id, 1, "player_id must be 1");
+                assert_eq!(*message_type, 13, "message_type must be 13");
+                assert_eq!(text, "Glup", "text must be 'Glup'");
+            }
+            other => panic!("expected GameAction::TextMessage, got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn do_send_text_message_without_call_does_not_queue_action() {
+        // Triangulation: a script that does NOT call do_send_text_message
+        // must NOT queue a TextMessage action.
+        let dir = test_dir("text_msg_skipped");
+        fs::write(
+            dir.join("test.lua"),
+            b"function onUse(args) return true end",
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+        rt.dispatch("onUse", &sample_args()).unwrap();
+        let actions = rt.drain_actions();
+        assert!(
+            actions.is_empty(),
+            "no actions must be queued when do_send_text_message is not called"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn do_send_text_message_multiple_calls_queue_multiple_actions() {
+        // Triangulation: calling do_send_text_message twice must queue
+        // two TextMessage actions.
+        let dir = test_dir("text_msg_multi");
+        fs::write(
+            dir.join("test.lua"),
+            br#"
+            function onUse(args)
+                do_send_text_message(args.player_id, 13, "Glup")
+                do_send_text_message(args.player_id, 13, "Chomp")
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+        rt.dispatch("onUse", &sample_args()).unwrap();
+        let actions = rt.drain_actions();
+        assert_eq!(actions.len(), 2, "exactly 2 actions must be queued");
+        match &actions[0] {
+            GameAction::TextMessage { text, .. } => {
+                assert_eq!(text, "Glup", "first message must be 'Glup'");
+            }
+            other => panic!("expected TextMessage, got {:?}", other),
+        }
+        match &actions[1] {
+            GameAction::TextMessage { text, .. } => {
+                assert_eq!(text, "Chomp", "second message must be 'Chomp'");
+            }
+            other => panic!("expected TextMessage, got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn do_feed_is_not_called_when_script_does_not_invoke_it() {
+        // Script must NOT queue a Feed action when do_feed is not called.
+        let dir = test_dir("do_feed_skipped");
+        fs::write(
+            dir.join("test.lua"),
+            b"function onUse(args) return true end",
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+        rt.dispatch("onUse", &sample_args()).unwrap();
+        let actions = rt.drain_actions();
+        assert!(
+            actions.is_empty(),
+            "no actions must be queued when do_feed is not called"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // ISSUE 1: Namespaced dispatch (food.onUse, teleport.onUse)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_namespaced_looks_up_table_method() {
+        // dispatch_namespaced("food.onUse", args) must look up the `food`
+        // global table and call `food.onUse(args)`.
+        let dir = test_dir("ns_table_method");
+        fs::write(
+            dir.join("food.lua"),
+            br#"food = {}
+            function food.onUse(args)
+                return args.item_id == 1386
+            end"#,
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+        let args = LuaArgs {
+            player_id: 1,
+            item_id: 1386,
+            pos_x: 100,
+            pos_y: 100,
+            pos_z: 7,
+            stackpos: 0,
+        };
+        let result = rt.dispatch_namespaced("food.onUse", &args).unwrap();
+        assert!(result, "namespaced dispatch must find and call food.onUse");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_namespaced_returns_false_for_missing_table() {
+        // When the table doesn't exist, dispatch_namespaced returns Ok(false).
+        let dir = test_dir("ns_missing_table");
+        fs::write(dir.join("food.lua"), b"food = {}").unwrap();
+        let rt = LuaRuntime::new(&dir);
+        let result = rt
+            .dispatch_namespaced("nonexistent.onUse", &sample_args())
+            .unwrap();
+        assert!(!result, "missing table must yield Ok(false)");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_namespaced_returns_false_for_missing_method() {
+        // When the table exists but the method doesn't, returns Ok(false).
+        let dir = test_dir("ns_missing_method");
+        fs::write(dir.join("test.lua"), b"food = {}").unwrap();
+        let rt = LuaRuntime::new(&dir);
+        let result = rt
+            .dispatch_namespaced("food.onUse", &sample_args())
+            .unwrap();
+        assert!(!result, "table without method must yield Ok(false)");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_namespaced_falls_back_to_flat_for_no_dot() {
+        // A script name without a dot falls back to flat dispatch.
+        let dir = test_dir("ns_fallback");
+        fs::write(
+            dir.join("test.lua"),
+            b"function onUse(args) return true end",
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+        let result = rt.dispatch_namespaced("onUse", &sample_args()).unwrap();
+        assert!(result, "flat name must fall back to regular dispatch");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_namespaced_two_scripts_coexist() {
+        // Both food and teleport tables can coexist in the same Lua state.
+        let dir = test_dir("ns_coexist");
+        fs::write(
+            dir.join("food.lua"),
+            br#"food = {}
+            function food.onUse(args)
+                do_feed(args.player_id, 8, 2000, 60000, 240)
+                return true
+            end"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("teleport.lua"),
+            br#"teleport = {}
+            function teleport.onUse(args)
+                do_teleport(args.player_id, 100, 100, 7)
+                return true
+            end"#,
+        )
+        .unwrap();
+        let rt = LuaRuntime::new(&dir);
+
+        // Dispatch food.onUse → should queue a Feed action
+        let food_args = LuaArgs {
+            player_id: 1,
+            item_id: 2666,
+            pos_x: 100,
+            pos_y: 100,
+            pos_z: 7,
+            stackpos: 0,
+        };
+        let result = rt.dispatch_namespaced("food.onUse", &food_args).unwrap();
+        assert!(result, "food.onUse must dispatch successfully");
+
+        // Dispatch teleport.onUse → should queue a Teleport action
+        let tele_args = LuaArgs {
+            player_id: 1,
+            item_id: 1386,
+            pos_x: 100,
+            pos_y: 100,
+            pos_z: 7,
+            stackpos: 0,
+        };
+        let result = rt
+            .dispatch_namespaced("teleport.onUse", &tele_args)
+            .unwrap();
+        assert!(result, "teleport.onUse must dispatch successfully");
+
+        // Drain and verify both actions are present
+        let actions = rt.drain_actions();
+        assert_eq!(actions.len(), 2, "both scripts should have queued actions");
+
+        let has_feed = actions.iter().any(|a| matches!(a, GameAction::Feed { .. }));
+        let has_tele = actions
+            .iter()
+            .any(|a| matches!(a, GameAction::Teleport { .. }));
+        assert!(has_feed, "food.onUse must have queued a Feed action");
+        assert!(
+            has_tele,
+            "teleport.onUse must have queued a Teleport action"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

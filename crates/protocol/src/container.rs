@@ -49,7 +49,14 @@ pub fn parse_use_item(body: &[u8]) -> Option<UseItem> {
     let sprite_id = r.read_u16().ok()?;
     let stackpos = r.read_u8().ok()?;
     let index = r.read_u8().ok()?;
-    Some(UseItem { pos_x, pos_y, pos_z, sprite_id, stackpos, index })
+    Some(UseItem {
+        pos_x,
+        pos_y,
+        pos_z,
+        sprite_id,
+        stackpos,
+        index,
+    })
 }
 
 /// Parse an inbound `0x87` close-container or `0x88` up-arrow body: `[cid u8]`.
@@ -68,7 +75,11 @@ pub struct ContainerWireItem {
 
 impl ContainerWireItem {
     pub fn as_wire(&self) -> WireItem {
-        WireItem { client_id: self.client_id, subtype: self.subtype, animated: self.animated }
+        WireItem {
+            client_id: self.client_id,
+            subtype: self.subtype,
+            animated: self.animated,
+        }
     }
 }
 
@@ -144,7 +155,11 @@ pub fn update_container_item(cid: u8, slot: u16, item: &ContainerWireItem) -> Ve
 /// `replacement`: when removing slot 0 the next item slides up; pass the new
 /// slot-0 item so the client can render it correctly.  `None` means the
 /// container is now empty (or the removed slot was the last one).
-pub fn remove_container_item(cid: u8, slot: u16, replacement: Option<&ContainerWireItem>) -> Vec<u8> {
+pub fn remove_container_item(
+    cid: u8,
+    slot: u16,
+    replacement: Option<&ContainerWireItem>,
+) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u8(OP_REMOVE_CONTAINER_ITEM);
     w.write_u8(cid);
@@ -163,10 +178,22 @@ mod tests {
     #[test]
     fn open_container_layout() {
         let items = [
-            ContainerWireItem { client_id: 100, subtype: None, animated: false },
-            ContainerWireItem { client_id: 200, subtype: Some(5), animated: false },
+            ContainerWireItem {
+                client_id: 100,
+                subtype: None,
+                animated: false,
+            },
+            ContainerWireItem {
+                client_id: 200,
+                subtype: Some(5),
+                animated: false,
+            },
         ];
-        let bag = WireItem { client_id: 1988, subtype: None, animated: false };
+        let bag = WireItem {
+            client_id: 1988,
+            subtype: None,
+            animated: false,
+        };
         let pkt = open_container(0, &bag, "backpack", 20, false, &items);
         assert_eq!(pkt[0], OP_OPEN_CONTAINER);
         assert_eq!(pkt[1], 0); // cid
@@ -178,7 +205,7 @@ mod tests {
         let name = std::str::from_utf8(&pkt[7..7 + name_len]).unwrap();
         assert_eq!(name, "backpack");
         let base = 7 + name_len;
-        assert_eq!(pkt[base], 20);   // capacity
+        assert_eq!(pkt[base], 20); // capacity
         assert_eq!(pkt[base + 1], 0); // has_parent = false
         assert_eq!(pkt[base + 2], 1); // is_unlocked
         assert_eq!(pkt[base + 3], 0); // has_pagination
@@ -191,7 +218,11 @@ mod tests {
     fn open_container_animated_bag_includes_phase_byte() {
         // Animated containers (e.g. backpack of holding) must include 0xFE after
         // the 0xFF mark so OTClient parses the name at the correct offset.
-        let bag = WireItem { client_id: 2872, subtype: None, animated: true };
+        let bag = WireItem {
+            client_id: 2872,
+            subtype: None,
+            animated: true,
+        };
         let pkt = open_container(1, &bag, "backpack of holding", 20, true, &[]);
         assert_eq!(pkt[0], OP_OPEN_CONTAINER);
         assert_eq!(pkt[1], 1); // cid
@@ -210,7 +241,11 @@ mod tests {
 
     #[test]
     fn add_update_remove_layouts() {
-        let item = ContainerWireItem { client_id: 100, subtype: None, animated: false };
+        let item = ContainerWireItem {
+            client_id: 100,
+            subtype: None,
+            animated: false,
+        };
         let add = add_container_item(1, 0, &item);
         assert_eq!(add[0], OP_ADD_CONTAINER_ITEM);
         assert_eq!(add[1], 1); // cid
@@ -239,11 +274,11 @@ mod tests {
     fn parse_use_item_layout() {
         let mut body = Vec::new();
         body.extend_from_slice(&0xFFFFu16.to_le_bytes()); // x
-        body.extend_from_slice(&3u16.to_le_bytes());       // y (slot 3)
-        body.push(0);                                       // z
-        body.extend_from_slice(&1988u16.to_le_bytes());    // sprite_id
-        body.push(2);                                       // stackpos
-        body.push(0);                                       // index
+        body.extend_from_slice(&3u16.to_le_bytes()); // y (slot 3)
+        body.push(0); // z
+        body.extend_from_slice(&1988u16.to_le_bytes()); // sprite_id
+        body.push(2); // stackpos
+        body.push(0); // index
         let u = parse_use_item(&body).unwrap();
         assert_eq!(u.pos_x, 0xFFFF);
         assert_eq!(u.pos_y, 3);

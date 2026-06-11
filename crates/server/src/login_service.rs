@@ -112,7 +112,10 @@ mod tests {
 
     /// Read one response frame and XTEA-decrypt it back to a payload.
     async fn recv_response<R: AsyncRead + Unpin>(client: &mut R, key: [u32; 4]) -> Vec<u8> {
-        let inner = net::frame::read_frame(client).await.unwrap().expect("a response frame");
+        let inner = net::frame::read_frame(client)
+            .await
+            .unwrap()
+            .expect("a response frame");
         let body = frame::verify(&inner).unwrap();
         xtea::decrypt_message(body, &xtea::expand_key(&key)).unwrap()
     }
@@ -136,7 +139,10 @@ mod tests {
         assert_eq!(r.read_string().unwrap(), b"7\nHello tester");
         assert_eq!(r.read_u8().unwrap(), protocol::charlist::OPCODE_SESSION_KEY);
         let _session = r.read_string().unwrap();
-        assert_eq!(r.read_u8().unwrap(), protocol::charlist::OPCODE_CHARACTER_LIST);
+        assert_eq!(
+            r.read_u8().unwrap(),
+            protocol::charlist::OPCODE_CHARACTER_LIST
+        );
         assert_eq!(r.read_u8().unwrap(), 1); // world count
         assert_eq!(r.read_u8().unwrap(), 0); // world id
         assert_eq!(r.read_string().unwrap(), b"Rusted");

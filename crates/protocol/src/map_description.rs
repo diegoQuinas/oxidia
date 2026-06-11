@@ -32,7 +32,11 @@ pub struct WireItem {
 impl WireItem {
     /// A plain item: just a client id, no count/fluid/animation bytes.
     pub fn plain(client_id: u16) -> Self {
-        Self { client_id, subtype: None, animated: false }
+        Self {
+            client_id,
+            subtype: None,
+            animated: false,
+        }
     }
 }
 
@@ -111,7 +115,9 @@ pub fn encode_slice<S: TileSource>(
 ) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u8(opcode);
-    get_map_description(&mut w, anchor_x, anchor_y, center_z, width, height, src, creatures);
+    get_map_description(
+        &mut w, anchor_x, anchor_y, center_z, width, height, src, creatures,
+    );
     w.into_bytes()
 }
 
@@ -142,7 +148,18 @@ fn get_map_description<S: TileSource>(
     let (startz, endz, zstep) = floor_range(center_z);
     let mut nz = startz;
     loop {
-        floor_description(w, anchor_x, anchor_y, nz, center_z - nz, width, height, &mut skip, src, creatures);
+        floor_description(
+            w,
+            anchor_x,
+            anchor_y,
+            nz,
+            center_z - nz,
+            width,
+            height,
+            &mut skip,
+            src,
+            creatures,
+        );
         if nz == endz {
             break;
         }
@@ -195,7 +212,9 @@ pub(crate) fn floor_description<S: TileSource>(
                     w.write_u16(0x0000);
                     let mut things: u8 = 0;
                     for item in slices.pre_creature {
-                        if things == 10 { break; }
+                        if things == 10 {
+                            break;
+                        }
                         add_item(w, item);
                         things += 1;
                     }
@@ -207,7 +226,9 @@ pub(crate) fn floor_description<S: TileSource>(
                     }
                     if things < 10 {
                         for item in slices.post_creature {
-                            if things == 10 { break; }
+                            if things == 10 {
+                                break;
+                            }
                             add_item(w, item);
                             things += 1;
                         }
@@ -387,10 +408,7 @@ mod tests {
                     let t = g_idx % floor_size;
                     let nx = t / height;
                     let ny = t % height;
-                    found.insert(
-                        (anchor_x + nx + offset, anchor_y + ny + offset, nz),
-                        ids,
-                    );
+                    found.insert((anchor_x + nx + offset, anchor_y + ny + offset, nz), ids);
                 }
             } else {
                 skip -= 1;
@@ -403,7 +421,15 @@ mod tests {
     #[test]
     fn header_carries_center_position() {
         let stub = MapStub::ground_only(HashMap::new());
-        let bytes = encode(Center { x: 1000, y: 1000, z: 7 }, &stub, &[]);
+        let bytes = encode(
+            Center {
+                x: 1000,
+                y: 1000,
+                z: 7,
+            },
+            &stub,
+            &[],
+        );
         assert_eq!(bytes[0], OPCODE_MAP_DESCRIPTION);
         assert_eq!(u16::from_le_bytes([bytes[1], bytes[2]]), 1000);
         assert_eq!(u16::from_le_bytes([bytes[3], bytes[4]]), 1000);
@@ -413,14 +439,33 @@ mod tests {
     #[test]
     fn empty_map_is_only_skip_flushes() {
         let stub = MapStub::ground_only(HashMap::new());
-        let bytes = encode(Center { x: 1000, y: 1000, z: 7 }, &stub, &[]);
-        let found = decode_stream(&bytes, Center { x: 1000, y: 1000, z: 7 });
+        let bytes = encode(
+            Center {
+                x: 1000,
+                y: 1000,
+                z: 7,
+            },
+            &stub,
+            &[],
+        );
+        let found = decode_stream(
+            &bytes,
+            Center {
+                x: 1000,
+                y: 1000,
+                z: 7,
+            },
+        );
         assert!(found.is_empty());
     }
 
     #[test]
     fn single_ground_tile_at_center_round_trips() {
-        let center = Center { x: 1000, y: 1000, z: 7 };
+        let center = Center {
+            x: 1000,
+            y: 1000,
+            z: 7,
+        };
         let mut m = HashMap::new();
         m.insert((1000, 1000, 7), 4526u16);
         let stub = MapStub::ground_only(m);
@@ -432,7 +477,11 @@ mod tests {
 
     #[test]
     fn creature_bytes_follow_the_center_ground_item() {
-        let center = Center { x: 1000, y: 1000, z: 7 };
+        let center = Center {
+            x: 1000,
+            y: 1000,
+            z: 7,
+        };
         let mut m = HashMap::new();
         m.insert((1000, 1000, 7), 4526u16);
         let stub = MapStub::ground_only(m);
@@ -465,19 +514,30 @@ mod tests {
 
     #[test]
     fn multi_item_tile_round_trips_in_wire_order() {
-        let center = Center { x: 1000, y: 1000, z: 7 };
+        let center = Center {
+            x: 1000,
+            y: 1000,
+            z: 7,
+        };
         let mut stacks = HashMap::new();
         stacks.insert((1000, 1000, 7), plain_stack(&[4526, 1000, 1001, 2000], 3));
         let stub = MapStub { stacks };
         let bytes = encode(center, &stub, &[]);
         let found = decode_stream(&bytes, center);
-        assert_eq!(found.get(&(1000, 1000, 7)), Some(&vec![4526, 1000, 1001, 2000]));
+        assert_eq!(
+            found.get(&(1000, 1000, 7)),
+            Some(&vec![4526, 1000, 1001, 2000])
+        );
         assert_eq!(found.len(), 1);
     }
 
     #[test]
     fn tile_stack_caps_at_ten_things() {
-        let center = Center { x: 1000, y: 1000, z: 7 };
+        let center = Center {
+            x: 1000,
+            y: 1000,
+            z: 7,
+        };
         let ids: Vec<u16> = (1..=12u16).collect();
         let mut stacks = HashMap::new();
         stacks.insert((1000, 1000, 7), plain_stack(&ids, 12));
@@ -489,14 +549,23 @@ mod tests {
 
     #[test]
     fn creature_splices_between_top_and_down_items() {
-        let center = Center { x: 1000, y: 1000, z: 7 };
+        let center = Center {
+            x: 1000,
+            y: 1000,
+            z: 7,
+        };
         let mut stacks = HashMap::new();
         stacks.insert((1000, 1000, 7), plain_stack(&[4526, 1059, 2000], 2));
         let stub = MapStub { stacks };
-        let creature = PlacedCreature { x: 1000, y: 1000, z: 7, bytes: vec![0x61, 0x00, 0xAA, 0xBB] };
+        let creature = PlacedCreature {
+            x: 1000,
+            y: 1000,
+            z: 7,
+            bytes: vec![0x61, 0x00, 0xAA, 0xBB],
+        };
         let bytes = encode(center, &stub, std::slice::from_ref(&creature));
-        let top = [0x23, 0x04, 0xFF];   // 1059 = 0x0423
-        let down = [0xD0, 0x07, 0xFF];  // 2000 = 0x07D0
+        let top = [0x23, 0x04, 0xFF]; // 1059 = 0x0423
+        let down = [0xD0, 0x07, 0xFF]; // 2000 = 0x07D0
         let ti = find_subsequence(&bytes, &top).expect("top item present");
         let ci = find_subsequence(&bytes, &creature.bytes).expect("creature present");
         let di = find_subsequence(&bytes, &down).expect("down item present");
@@ -538,7 +607,11 @@ mod tests {
                     let mut ids = Vec::new();
                     loop {
                         let v = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
-                        if v >= 0xFF00 { skip = i32::from(v & 0x00FF); p += 2; break; }
+                        if v >= 0xFF00 {
+                            skip = i32::from(v & 0x00FF);
+                            p += 2;
+                            break;
+                        }
                         assert_eq!(bytes[p + 2], MARK_UNMARKED);
                         ids.push(v);
                         p += 3;
@@ -562,7 +635,11 @@ mod tests {
     #[test]
     fn underground_center_uses_pm2_band() {
         // A tile on floor 9 with the player centered at z=9 must be encoded.
-        let center = Center { x: 1000, y: 1000, z: 9 };
+        let center = Center {
+            x: 1000,
+            y: 1000,
+            z: 9,
+        };
         let mut m = HashMap::new();
         m.insert((1000, 1000, 9), 4526u16);
         let stub = MapStub::ground_only(m);
@@ -577,11 +654,23 @@ mod tests {
     fn add_item_emits_count_and_animation_bytes() {
         // A tile whose items exercise the conditional per-item bytes:
         // ground (plain), a stackable item (count byte), an animated item (0xFE).
-        let center = Center { x: 1000, y: 1000, z: 7 };
+        let center = Center {
+            x: 1000,
+            y: 1000,
+            z: 7,
+        };
         let stack = vec![
             WireItem::plain(4526),
-            WireItem { client_id: 0x0ABC, subtype: Some(5), animated: false },
-            WireItem { client_id: 0x0B73, subtype: None, animated: true },
+            WireItem {
+                client_id: 0x0ABC,
+                subtype: Some(5),
+                animated: false,
+            },
+            WireItem {
+                client_id: 0x0B73,
+                subtype: None,
+                animated: true,
+            },
         ];
         let mut stacks = HashMap::new();
         stacks.insert((1000, 1000, 7), (stack, 2usize));

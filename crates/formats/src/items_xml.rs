@@ -132,9 +132,15 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
         }
         let mut attrs = ItemXmlAttrs::default();
         // Element attributes on <item …>.
-        if let Some(v) = item.attribute("name") { attrs.name = v.to_string(); }
-        if let Some(v) = item.attribute("article") { attrs.article = v.to_string(); }
-        if let Some(v) = item.attribute("plural") { attrs.plural = v.to_string(); }
+        if let Some(v) = item.attribute("name") {
+            attrs.name = v.to_string();
+        }
+        if let Some(v) = item.attribute("article") {
+            attrs.article = v.to_string();
+        }
+        if let Some(v) = item.attribute("plural") {
+            attrs.plural = v.to_string();
+        }
         // <attribute key=… value=…> children.
         for attr in item.children().filter(|n| n.has_tag_name("attribute")) {
             let key = attr.attribute("key").unwrap_or("");
@@ -148,8 +154,8 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
             } else if key.eq_ignore_ascii_case("weight") {
                 attrs.weight = value.parse::<u32>().unwrap_or(0);
             } else if key.eq_ignore_ascii_case("showcount") {
-                attrs.show_count = !value.eq_ignore_ascii_case("0")
-                    && !value.eq_ignore_ascii_case("false");
+                attrs.show_count =
+                    !value.eq_ignore_ascii_case("0") && !value.eq_ignore_ascii_case("false");
             } else if key.eq_ignore_ascii_case("slotType") {
                 attrs.slot_type = value.to_ascii_lowercase();
             } else if key.eq_ignore_ascii_case("weaponType") {
@@ -161,15 +167,31 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
         for id in ids {
             let entry = by_server_id.entry(id).or_default();
             entry.floor_change.insert(attrs.floor_change);
-            if !attrs.name.is_empty() { entry.name = attrs.name.clone(); }
-            if !attrs.article.is_empty() { entry.article = attrs.article.clone(); }
-            if !attrs.plural.is_empty() { entry.plural = attrs.plural.clone(); }
-            if !attrs.description.is_empty() { entry.description = attrs.description.clone(); }
-            if attrs.weight != 0 { entry.weight = attrs.weight; }
+            if !attrs.name.is_empty() {
+                entry.name = attrs.name.clone();
+            }
+            if !attrs.article.is_empty() {
+                entry.article = attrs.article.clone();
+            }
+            if !attrs.plural.is_empty() {
+                entry.plural = attrs.plural.clone();
+            }
+            if !attrs.description.is_empty() {
+                entry.description = attrs.description.clone();
+            }
+            if attrs.weight != 0 {
+                entry.weight = attrs.weight;
+            }
             entry.show_count = attrs.show_count;
-            if !attrs.slot_type.is_empty() { entry.slot_type = attrs.slot_type.clone(); }
-            if !attrs.weapon_type.is_empty() { entry.weapon_type = attrs.weapon_type.clone(); }
-            if attrs.container_size != 0 { entry.container_size = attrs.container_size; }
+            if !attrs.slot_type.is_empty() {
+                entry.slot_type = attrs.slot_type.clone();
+            }
+            if !attrs.weapon_type.is_empty() {
+                entry.weapon_type = attrs.weapon_type.clone();
+            }
+            if attrs.container_size != 0 {
+                entry.container_size = attrs.container_size;
+            }
         }
     }
 

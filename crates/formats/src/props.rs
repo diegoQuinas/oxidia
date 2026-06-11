@@ -24,7 +24,10 @@ impl<'a> PropReader<'a> {
 
     /// Read a `u8`.
     pub fn read_u8(&mut self) -> Result<u8, FormatError> {
-        let b = *self.data.get(self.pos).ok_or(FormatError::UnexpectedEof { what: "u8" })?;
+        let b = *self
+            .data
+            .get(self.pos)
+            .ok_or(FormatError::UnexpectedEof { what: "u8" })?;
         self.pos += 1;
         Ok(b)
     }

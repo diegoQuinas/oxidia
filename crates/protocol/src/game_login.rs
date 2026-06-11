@@ -3,9 +3,9 @@
 //! Layout: `[u8 0x0A][u16 os][u16 version][7 skipped bytes][128-byte RSA block]`.
 //! RSA block: `[u8 0][u32x4 xtea][u8 gamemaster][string sessionKey][string name][u32 ts][u8 rnd]`.
 
-use crate::message::{MessageReader, MessageWriter};
-use crate::rsa::{self, RsaError, RsaPrivateKey, RSA_BLOCK_SIZE};
 use crate::ProtocolError;
+use crate::message::{MessageReader, MessageWriter};
+use crate::rsa::{self, RSA_BLOCK_SIZE, RsaError, RsaPrivateKey};
 
 /// ProtocolGame identifier byte (TFS `ProtocolGame::protocolIdentifier` = 0x0A).
 pub const GAME_PROTOCOL_ID: u8 = 0x0A;
@@ -148,7 +148,14 @@ mod tests {
     fn round_trips_a_built_request() {
         let key = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
         let payload = build_request(
-            10, 1098, key, b"test", b"test", b"Test Knight", 0xDEAD_BEEF, 0x7C,
+            10,
+            1098,
+            key,
+            b"test",
+            b"test",
+            b"Test Knight",
+            0xDEAD_BEEF,
+            0x7C,
         )
         .unwrap();
 

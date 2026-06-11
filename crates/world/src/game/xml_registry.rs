@@ -26,18 +26,45 @@ impl XmlRegistry {
         })?;
         let mut map: HashMap<u16, String> = HashMap::new();
         for action in doc.descendants().filter(|n| n.has_tag_name("action")) {
-            let item_id: u16 = action
-                .attribute("itemid")
-                .and_then(|s| s.parse().ok())
-                .ok_or(FormatError::InvalidNode {
-                    what: "action missing valid itemid attribute",
+            let script = action.attribute("script").ok_or(FormatError::InvalidNode {
+                what: "action missing script attribute",
+            })?;
+
+            // Support both single-itemid and fromid/toid range syntax.
+            if let Some(item_id_str) = action.attribute("itemid") {
+                // Single item: <action itemid="N" script="X"/>
+                let item_id: u16 = item_id_str.parse().map_err(|_| FormatError::InvalidNode {
+                    what: "action has invalid itemid attribute",
                 })?;
-            let script = action
-                .attribute("script")
-                .ok_or(FormatError::InvalidNode {
-                    what: "action missing script attribute",
+                map.insert(item_id, script.to_string());
+            } else if let (Some(from_str), Some(to_str)) =
+                (action.attribute("fromid"), action.attribute("toid"))
+            {
+                // Range: <action fromid="A" toid="B" script="X"/>
+                let from_id: u16 = from_str.parse().map_err(|_| FormatError::InvalidNode {
+                    what: "action has invalid fromid attribute",
                 })?;
-            map.insert(item_id, script.to_string());
+                let to_id: u16 = to_str.parse().map_err(|_| FormatError::InvalidNode {
+                    what: "action has invalid toid attribute",
+                })?;
+                if from_id <= to_id {
+                    for id in from_id..=to_id {
+                        map.insert(id, script.to_string());
+                    }
+                } else {
+                    // Inverted range — log warning and skip.
+                    tracing::warn!(
+                        from = from_id,
+                        to = to_id,
+                        script = script,
+                        "fromid > toid in action range, skipping"
+                    );
+                }
+            } else {
+                return Err(FormatError::InvalidNode {
+                    what: "action must have itemid or (fromid + toid) attributes",
+                });
+            }
         }
         Ok(XmlRegistry(map))
     }
@@ -62,6 +89,13 @@ mod tests {
           <action itemid="1386" script="teleport.onUse"/>
           <action itemid="1280" script="teleport.onUse"/>
           <action itemid="8592" script="teleport.onUse"/>
+        </actions>"#
+    }
+
+    fn range_actions_xml() -> &'static str {
+        r#"<actions>
+          <action itemid="1386" script="teleport.onUse"/>
+          <action fromid="2666" toid="2691" script="food.onUse"/>
         </actions>"#
     }
 
@@ -162,6 +196,126 @@ mod tests {
             result.is_err(),
             "action without script attribute must return Err; got {:?}",
             result
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // PHASE 1: fromid / toid range expansion
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fromid_toid_range_expands_all_items_in_range() {
+        // RED: fromid/toid range must expand to individual entries so
+        // every item in the range is registered with the script.
+        let registry = XmlRegistry::from_actions_xml(range_actions_xml())
+            .expect("valid XML with fromid/toid must parse successfully");
+        // First item in range
+        assert_eq!(
+            registry.lookup(2666),
+            Some("food.onUse"),
+            "item 2666 (start of range) must map to food.onUse"
+        );
+        // Middle of range
+        assert_eq!(
+            registry.lookup(2680),
+            Some("food.onUse"),
+            "item 2680 (middle of range) must map to food.onUse"
+        );
+        // Last item in range
+        assert_eq!(
+            registry.lookup(2691),
+            Some("food.onUse"),
+            "item 2691 (end of range) must map to food.onUse"
+        );
+        // Single-itemid entry still works alongside ranges
+        assert_eq!(
+            registry.lookup(1386),
+            Some("teleport.onUse"),
+            "single-itemid entry (1386) must still work alongside ranges"
+        );
+    }
+
+    #[test]
+    fn fromid_toid_single_item_equal_bounds() {
+        // fromid == toid should register exactly one item.
+        let registry = XmlRegistry::from_actions_xml(
+            r#"<actions>
+              <action fromid="2666" toid="2666" script="food.onUse"/>
+            </actions>"#,
+        )
+        .expect("fromid==toid must parse successfully");
+        assert_eq!(
+            registry.lookup(2666),
+            Some("food.onUse"),
+            "single-item range must register the item"
+        );
+    }
+
+    #[test]
+    fn unregistered_item_outside_range_returns_none() {
+        // Item not in any range or single-itemid entry must return None.
+        let registry = XmlRegistry::from_actions_xml(range_actions_xml())
+            .expect("valid XML with fromid/toid must parse successfully");
+        assert_eq!(
+            registry.lookup(3000),
+            None,
+            "item 3000 outside range must return None"
+        );
+        assert_eq!(
+            registry.lookup(1),
+            None,
+            "item 1 (outside range) must return None"
+        );
+    }
+
+    #[test]
+    fn fromid_without_toid_is_rejected() {
+        // fromid without toid is invalid
+        let result = XmlRegistry::from_actions_xml(
+            r#"<actions>
+              <action fromid="2666" script="food.onUse"/>
+            </actions>"#,
+        );
+        assert!(
+            result.is_err(),
+            "action with fromid but no toid must return Err; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn toid_without_fromid_is_rejected() {
+        // toid without fromid is invalid
+        let result = XmlRegistry::from_actions_xml(
+            r#"<actions>
+              <action toid="2691" script="food.onUse"/>
+            </actions>"#,
+        );
+        assert!(
+            result.is_err(),
+            "action with toid but no fromid must return Err; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn fromid_greater_than_toid_is_empty_and_logged() {
+        // When fromid > toid, the range is empty.
+        let registry = XmlRegistry::from_actions_xml(
+            r#"<actions>
+              <action fromid="2691" toid="2666" script="food.onUse"/>
+            </actions>"#,
+        )
+        .expect("inverted range must parse without error (empty expansion)");
+        assert_eq!(
+            registry.lookup(2666),
+            None,
+            "item 2666 must not be registered from inverted range"
+        );
+        assert_eq!(
+            registry.lookup(2691),
+            None,
+            "item 2691 must not be registered from inverted range"
         );
     }
 }

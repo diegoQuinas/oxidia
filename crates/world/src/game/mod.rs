@@ -6,7 +6,7 @@
 //! owns the known-creature set, and broadcasts presence events (login appear,
 //! walk move/appear/remove, turn, logout remove).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,23 +22,31 @@ use protocol::outfit as outfit_packets;
 use protocol::{enter_world, tile_creature, tile_item, walk};
 
 use crate::map::StaticMap;
+use crate::pathfinding;
 use crate::{Direction, Position};
 
+use self::condition::ConditionRegeneration;
 use self::lua::LuaRuntime;
+pub(super) use self::monster::{
+    MonsterDrop, MonsterSpawn, MonsterState, MonsterType, name_hash_looktype, parse_monsters_xml,
+    parse_spawns_xml,
+};
 use self::xml_registry::XmlRegistry;
 
 mod chat;
 mod combat;
+mod condition;
 mod containers;
 mod gm;
 mod items;
 mod look;
 mod lua;
+mod monster;
 mod movement;
 mod session;
-mod xml_registry;
 #[cfg(test)]
 mod test_support;
+mod xml_registry;
 
 /// Outbound channel depth per session. A client that backs this up past the cap
 /// is treated as dead (logged out) rather than blocking the game loop or growing
@@ -53,13 +61,28 @@ pub const MELEE_ATTACK_INTERVAL_MS: u64 = 2000;
 /// timing granularity is good; cheap enough that the actor is not taxed.
 const COMBAT_TICK_MS: u64 = 250;
 
-/// Ghost looktype for GM ghost mode (placeholder — verify against client .dat).
-/// Ghost looktype from monster "Ghost" (reference/tfs/data/monster/monsters/ghost.xml).
-const GHOST_LOOKTYPE: u16 = 48;
+/// How often one bucket of the monster AI fires (10 buckets × 100ms = 1s cycle).
+const MONSTER_AI_TICK_MS: u64 = 100;
+
+/// How often the regeneration tick fires. Matches TFS
+/// `Condition::executeConditions` interval (1s).
+const REGENERATION_TICK_MS: u64 = 1000;
 
 /// TFS `MESSAGE_STATUS_SMALL = 21` (`const.h:190`): white status-bar message.
 /// Used for PZ-rejection ("You may not attack…").
 const MSG_STATUS_SMALL: u8 = 21;
+
+/// Minimum step interval in ms (200ms = 5 steps/s ceiling).
+const MIN_STEP_MS: u64 = 200;
+/// Maximum step interval in ms (2000ms = 0.5 steps/s floor).
+const MAX_STEP_MS: u64 = 2000;
+
+/// Compute the step interval in milliseconds for a given creature speed.
+/// Matches the TFS inverse relationship: higher speed → shorter step time.
+/// Default player speed (220) yields ~454ms → ~2.2 steps/s.
+fn step_time(speed: u16) -> u64 {
+    (110_000 / speed.max(1) as u64).clamp(MIN_STEP_MS, MAX_STEP_MS)
+}
 
 /// TFS `MESSAGE_INFO_DESCR = 22`: green look-description message (`const.h:191`).
 const MSG_INFO_DESCR: u8 = 22;
@@ -67,6 +90,10 @@ const MSG_INFO_DESCR: u8 = 22;
 /// TFS `MESSAGE_STATUS_CONSOLE_BLUE = 4` (`const.h:182`): blue console text.
 /// Used for GM command output (`/help`).
 const MSG_CONSOLE_BLUE: u8 = 4;
+
+/// Ghost sprite looktype used when GM `/ghost` mode is active.
+/// Verify against client `.dat` if visual mismatch occurs.
+const GHOST_LOOKTYPE: u16 = 40;
 
 /// Client viewport extents from the player's tile, matching the 18x14 map
 /// description anchored at center-8 / center-6 (TFS `Map::maxClientViewportX/Y`).
@@ -85,9 +112,9 @@ pub struct PlayerSnapshot {
     /// The outfit the player logged in with (restored or default).
     pub outfit: Outfit,
     /// Current hit points at login (restored or default 150).
-    pub health: u16,
+    pub health: u32,
     /// Maximum hit points at login (restored or default 150).
-    pub max_health: u16,
+    pub max_health: u32,
 }
 
 /// Login result: the new player's snapshot plus the already-in-range players,
@@ -113,9 +140,9 @@ pub struct InitialState {
     /// Visual outfit at login.
     pub outfit: Outfit,
     /// Current hit points.
-    pub health: u16,
+    pub health: u32,
     /// Maximum hit points.
-    pub max_health: u16,
+    pub max_health: u32,
     /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
     /// Selects the gendered outfit catalog served by do_request_outfit.
     pub sex: u8,
@@ -139,9 +166,8 @@ pub struct SaveRecord {
     pub position: Position,
     pub direction: Direction,
     pub outfit: Outfit,
-    pub health: u16,
-    pub max_health: u16,
-    /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
+    pub health: u32,
+    pub max_health: u32,
     pub sex: u8,
     /// Equipped items at logout: `(slot 1..=10, server_id, count)`.
     pub inventory: Vec<(u8, u16, u8)>,
@@ -216,9 +242,9 @@ struct PlayerState {
     known: HashSet<u32>,
     // --- M7 combat fields ---
     /// Current hit points.
-    health: u16,
+    health: u32,
     /// Maximum hit points (TFS default for a new character = 150).
-    max_health: u16,
+    max_health: u32,
     /// Fist-skill level (TFS default = 10).
     fist_skill: i32,
     /// Id of the current attack target (`None` = not fighting).
@@ -232,19 +258,41 @@ struct PlayerState {
     sex: u8,
     /// Gamemaster flag from login; gates look-at debug (item id + position).
     gamemaster: bool,
-    /// Ghost mode: GM invisible to non-GMs, bypasses collision, ghost looktype.
+    /// Ghost mode: GM invisible to non-GMs, bypasses collision.
     /// Runtime-only — reset on login/logout.
     ghost: bool,
     /// Previous outfit before ghost mode was toggled on.
     /// `None` when ghost mode is off.
     prev_outfit: Option<Outfit>,
-    /// Noclip mode: bypasses collision without invisibility or looktype change.
+    /// Noclip mode: bypasses collision without visibility changes.
     /// Runtime-only — reset on login/logout.
     noclip: bool,
+    /// Movement speed override. Default 220 on login. Runtime-only — not
+    /// persisted; reset on login/logout.
+    speed: u16,
     /// Equipment slots 1..=10, indexed 0..=9. `None` = empty slot.
     inventory: [Option<InvItem>; 10],
     /// Open container windows, indexed by cid (0..=15). `None` = window not open.
     open_containers: [Option<OpenContainer>; 16],
+    /// Creature id this player is auto-following (0xA2 follow). `None` when idle.
+    follow_target: Option<u32>,
+    /// Target position for click-to-move auto-walk (0x64 GoTo). `None` when idle.
+    /// Cleared on arrival, manual move, PZ entry, ESC, or path-failure.
+    /// Mutually exclusive with `follow_target` — setting one clears the other.
+    go_to_position: Option<Position>,
+    /// Consecutive failed repath attempts for go_to_position.
+    /// Reset on successful step; cleared with go_to_position.
+    failed_repaths: Option<u32>,
+    /// Enqueued walk directions consumed one per auto-walk tick.
+    /// Filled by `get_path_matching` when the player has a follow target.
+    list_walk_dir: VecDeque<Direction>,
+    /// Monotonic-ms timestamp of the last successful auto-walk step.
+    /// Used to gate steps by `step_time()` so the player moves at their
+    /// speed-appropriate pace rather than 100ms AI-tick rate.
+    last_walk_ms: u64,
+    /// Active timed conditions (regeneration, etc.). Extended when the
+    /// player eats more food; ticked by `RegenerationTick`.
+    conditions: Vec<ConditionRegeneration>,
 }
 
 struct Game {
@@ -253,7 +301,15 @@ struct Game {
     /// the first item move; reads fall back to `map` for untouched tiles.
     dynamic: std::collections::HashMap<(u16, u16, u8), crate::map::TileStack>,
     players: HashMap<u32, PlayerState>,
+    monsters: HashMap<u32, MonsterState>,
     next_id: u32,
+    #[allow(dead_code)]
+    next_monster_id: u32,
+    /// Auto-incrementing id for spawn entries.
+    #[allow(dead_code)]
+    next_spawn_id: u32,
+    /// Blueprints for monster respawns, keyed by spawn id.
+    spawns: HashMap<u32, MonsterSpawn>,
     next_statement_id: u32,
     /// RNG for combat damage rolls. A single actor-owned RNG keeps the loop
     /// lock-free (no shared state) and is seedable in tests for determinism.
@@ -266,6 +322,12 @@ struct Game {
     lua: Option<LuaRuntime>,
     /// XML item-to-script registry parsed from `actions.xml` / `movements.xml`.
     registry: XmlRegistry,
+    /// Monster type blueprints keyed by name (e.g. "Ice Golem").
+    monster_types: HashMap<String, MonsterType>,
+    /// Current monotonic time in milliseconds. Updated by tick commands
+    /// (CombatTick, RegenerationTick, etc.). Used by time-sensitive operations
+    /// like food regeneration and condition management.
+    now_ms: u64,
 }
 
 /// Configuration for the game actor passed from [`spawn`].
@@ -276,6 +338,10 @@ pub struct GameConfig {
     pub lua_scripts_dir: Option<PathBuf>,
     /// XML content of `actions.xml` mapping item ids to script hooks.
     pub actions_xml: String,
+    /// XML content of `config/monsters.xml` — monster type blueprints.
+    pub monsters_xml: String,
+    /// XML content of `world/map-spawn.xml` — monster spawn points.
+    pub spawns_xml: String,
 }
 
 impl Game {
@@ -284,12 +350,18 @@ impl Game {
             map,
             dynamic: std::collections::HashMap::new(),
             players: HashMap::new(),
+            monsters: HashMap::new(),
             next_id: 0x1000_0000,
+            next_monster_id: 0x4000_0000,
+            next_spawn_id: 1,
+            spawns: HashMap::new(),
             next_statement_id: 1,
             rng: StdRng::from_entropy(),
             save_tx: None,
             lua: None,
             registry: XmlRegistry::default(),
+            monster_types: HashMap::new(),
+            now_ms: 0,
         }
     }
 
@@ -301,18 +373,111 @@ impl Game {
             map,
             dynamic: std::collections::HashMap::new(),
             players: HashMap::new(),
+            monsters: HashMap::new(),
             next_id: 0x1000_0000,
+            next_monster_id: 0x4000_0000,
+            next_spawn_id: 1,
+            spawns: HashMap::new(),
             next_statement_id: 1,
             rng: StdRng::seed_from_u64(seed),
             save_tx: None,
             lua: None,
             registry: XmlRegistry::default(),
+            monster_types: HashMap::new(),
+            now_ms: 0,
         }
+    }
+
+    /// Parse spawns XML, register spawn points, and create initial monsters.
+    fn load_spawns(&mut self, xml: &str, _now_ms: u64) {
+        let entries = match parse_spawns_xml(xml) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(%e, "failed to parse spawns.xml — no monster spawns loaded");
+                return;
+            }
+        };
+        let mut warned_types = HashSet::new();
+        for spawn in entries {
+            // Case-insensitive lookup in monster type registry.
+            if let Some(t) = self.monster_types.get(&spawn.name.to_ascii_lowercase()) {
+                let sid = self.next_spawn_id;
+                self.next_spawn_id += 1;
+                let spawn_entry = MonsterSpawn {
+                    position: spawn.position,
+                    respawn_interval_ms: spawn.respawn_interval_ms,
+                    respawn_at_ms: None,
+                    name: t.name.clone(),
+                    look_type: t.look_type,
+                    health: t.health,
+                    max_health: t.max_health,
+                    speed: t.speed,
+                    attack: t.attack,
+                    loot: t.loot.clone(),
+                    target_distance: t.target_distance,
+                };
+                self.spawns.insert(sid, spawn_entry);
+
+                // Create the initial monster immediately.
+                let mid = self.next_monster_id;
+                self.next_monster_id += 1;
+                let monster = MonsterState {
+                    name: t.name.clone(),
+                    position: spawn.position,
+                    direction: Direction::South,
+                    health: t.health,
+                    max_health: t.max_health,
+                    speed: t.speed,
+                    look_type: t.look_type,
+                    attacking: None,
+                    last_attack_ms: 0,
+                    attack: t.attack,
+                    loot: t.loot.clone(),
+                    spawn_id: Some(sid),
+                    list_walk_dir: VecDeque::new(),
+                    follow_target: None,
+                    target_distance: t.target_distance,
+                };
+                self.monsters.insert(mid, monster);
+            } else {
+                // No type registered → log warning once per type, spawn with defaults.
+                if warned_types.insert(spawn.name.to_ascii_lowercase()) {
+                    tracing::warn!(name = %spawn.name, "unknown monster type — spawning with hardcoded defaults");
+                }
+                let sid = self.next_spawn_id;
+                self.next_spawn_id += 1;
+                self.spawns.insert(sid, spawn.clone());
+                let mid = self.next_monster_id;
+                self.next_monster_id += 1;
+                let monster = MonsterState {
+                    name: spawn.name.clone(),
+                    position: spawn.position,
+                    direction: Direction::South,
+                    health: 50,
+                    max_health: 50,
+                    speed: 200,
+                    look_type: name_hash_looktype(&spawn.name),
+                    attacking: None,
+                    last_attack_ms: 0,
+                    attack: 7,
+                    loot: vec![],
+                    spawn_id: Some(sid),
+                    list_walk_dir: VecDeque::new(),
+                    follow_target: None,
+                    target_distance: 0,
+                };
+                self.monsters.insert(mid, monster);
+            }
+        }
+        tracing::info!(count = %self.spawns.len(), monsters = %self.monsters.len(), "spawns loaded");
     }
 
     /// A merged read view (overlay + static) for the map encoder.
     fn merged(&self) -> crate::map::MergedTiles<'_> {
-        crate::map::MergedTiles { base: self.map.as_ref(), dynamic: &self.dynamic }
+        crate::map::MergedTiles {
+            base: self.map.as_ref(),
+            dynamic: &self.dynamic,
+        }
     }
 
     /// Ensure `pos` has a dynamic (owned, mutable) stack, cloning the static one
@@ -323,7 +488,10 @@ impl Game {
             return true;
         }
         match self.map.tile_stack_clone(pos) {
-            Some(st) => { self.dynamic.insert(key, st); true }
+            Some(st) => {
+                self.dynamic.insert(key, st);
+                true
+            }
             None => false,
         }
     }
@@ -375,16 +543,14 @@ impl Game {
     /// tile; use [`Self::visible_from`] for what a watcher AT a tile sees — under
     /// the asymmetric viewport the two directions differ by a tile.
     ///
-    /// Ghost GM mode: if the excluded player (the mover) is a ghost GM, non-GM
-    /// spectators are filtered out — they cannot see the ghost.
+    /// Ghost GM mode: if the excluded player (the subject at `pos`) is a ghost GM,
+    /// non-GM viewers are filtered out — they cannot see the ghost.
     fn spectators(&self, pos: Position, exclude: u32) -> Vec<u32> {
         let ghost = self.players.get(&exclude).map(|p| p.ghost).unwrap_or(false);
         self.players
             .iter()
             .filter(|&(&id, p)| {
-                id != exclude
-                    && Self::can_see(p.position, pos)
-                    && (!ghost || p.gamemaster)
+                id != exclude && Self::can_see(p.position, pos) && (!ghost || p.gamemaster)
             })
             .map(|(&id, _)| id)
             .collect()
@@ -397,13 +563,15 @@ impl Game {
     /// Ghost GM mode: non-GM viewers see ghost GMs filtered out.
     /// GM viewers (gamemaster = true) always see ghost GMs.
     fn visible_from(&self, viewer: Position, exclude: u32) -> Vec<u32> {
-        let viewer_is_gm = self.players.get(&exclude).map(|p| p.gamemaster).unwrap_or(false);
+        let viewer_is_gm = self
+            .players
+            .get(&exclude)
+            .map(|p| p.gamemaster)
+            .unwrap_or(false);
         self.players
             .iter()
             .filter(|&(&id, p)| {
-                id != exclude
-                    && Self::can_see(viewer, p.position)
-                    && (viewer_is_gm || !p.ghost)
+                id != exclude && Self::can_see(viewer, p.position) && (viewer_is_gm || !p.ghost)
             })
             .map(|(&id, _)| id)
             .collect()
@@ -411,27 +579,38 @@ impl Game {
 
     /// Build the creature-thing bytes for `target` as seen by `viewer`, choosing
     /// `0x62` (short) if the viewer already knows the target, else `0x61` (full)
-    /// and recording the target in the viewer's known-set. Returns `None` if
-    /// either player is gone.
+    /// and recording the target in the viewer's known-set. Works for both players
+    /// and monsters as the target. The viewer MUST be a player (monsters have no
+    /// known-set or session). Returns `None` if either is gone.
     fn introduce(&mut self, viewer: u32, target: u32) -> Option<Vec<u8>> {
-        let (name, dir, outfit, ghost) = {
-            let t = self.players.get(&target)?;
-            (t.name.clone(), t.direction, t.outfit, t.ghost)
-        };
+        let name = self.creature_name(target)?.to_owned();
+        let dir = self.creature_direction(target)?;
+        let outfit = self.creature_outfit(target)?;
+        let ctype = self.creature_type_byte(target);
+        // Only players have a known-set; monsters are never viewers.
         let known = {
             let v = self.players.get_mut(&viewer)?;
-            !v.known.insert(target) // insert returns true if newly added
+            !v.known.insert(target)
+        };
+        let hp = self.creature_health_percent(target);
+        let spd = self.creature_speed(target);
+        // Walkthrough byte: 1 for ghost GMs, 0 for everyone else.
+        let walkthrough: u8 = if self.players.get(&target).map(|p| p.ghost).unwrap_or(false) {
+            1
+        } else {
+            0
         };
         let view = CreatureView {
             id: target,
             name: name.as_bytes(),
-            health_percent: 100,
+            health_percent: hp,
             direction: dir.to_byte(),
             outfit,
             light_level: 0,
             light_color: 0,
-            speed: 220,
-            walkthrough: if ghost { 1 } else { 0 },
+            speed: spd,
+            creature_type: ctype,
+            walkthrough,
         };
         Some(creature::add_creature(&view, known, 0))
     }
@@ -442,6 +621,107 @@ impl Game {
         if let Some(rt) = &mut self.lua {
             rt.reload();
         }
+    }
+
+    // -----------------------------------------------------------------
+    // M12.1 — Creature-agnostic helpers (players + monsters)
+    // -----------------------------------------------------------------
+
+    /// Look up any creature's name, checking players first then monsters.
+    fn creature_name(&self, id: u32) -> Option<&str> {
+        if let Some(p) = self.players.get(&id) {
+            return Some(&p.name);
+        }
+        self.monsters.get(&id).map(|m| m.name.as_str())
+    }
+
+    /// Look up any creature's outfit (monsters get a simple look_type outfit).
+    fn creature_outfit(&self, id: u32) -> Option<Outfit> {
+        if let Some(p) = self.players.get(&id) {
+            return Some(p.outfit);
+        }
+        self.monsters.get(&id).map(|m| Outfit {
+            look_type: m.look_type,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            mount: 0,
+        })
+    }
+
+    /// Look up any creature's direction.
+    fn creature_direction(&self, id: u32) -> Option<Direction> {
+        if let Some(p) = self.players.get(&id) {
+            return Some(p.direction);
+        }
+        self.monsters.get(&id).map(|m| m.direction)
+    }
+
+    /// Look up any creature's position.
+    fn creature_position(&self, id: u32) -> Option<Position> {
+        if let Some(p) = self.players.get(&id) {
+            return Some(p.position);
+        }
+        self.monsters.get(&id).map(|m| m.position)
+    }
+
+    /// Health percent for any creature (0..100).
+    fn creature_health_percent(&self, id: u32) -> u8 {
+        if let Some(p) = self.players.get(&id) {
+            if p.max_health == 0 {
+                return 0;
+            }
+            return ((p.health * 100) / p.max_health).min(100) as u8;
+        }
+        self.monsters
+            .get(&id)
+            .map(|m| m.health_percent())
+            .unwrap_or(0)
+    }
+
+    /// Walk speed for any creature.
+    fn creature_speed(&self, id: u32) -> u16 {
+        if let Some(p) = self.players.get(&id) {
+            return p.speed;
+        }
+        self.monsters.get(&id).map(|m| m.speed).unwrap_or(200)
+    }
+
+    /// Wire creature type byte (player=0, monster=1).
+    fn creature_type_byte(&self, id: u32) -> u8 {
+        if self.players.contains_key(&id) {
+            return creature::CREATURETYPE_PLAYER;
+        }
+        if self.monsters.contains_key(&id) {
+            return creature::CREATURETYPE_MONSTER;
+        }
+        creature::CREATURETYPE_PLAYER
+    }
+
+    /// Does any creature (player or monster) exist with this id?
+    fn creature_exists(&self, id: u32) -> bool {
+        self.players.contains_key(&id) || self.monsters.contains_key(&id)
+    }
+
+    /// Ids of monsters whose position is visible from `viewer`.
+    fn monsters_visible_from(&self, viewer: Position) -> Vec<u32> {
+        self.monsters
+            .iter()
+            .filter(|(_, m)| Self::can_see(viewer, m.position))
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Ids of monsters standing on `pos`.
+    #[allow(dead_code)]
+    fn monsters_at(&self, pos: Position) -> Vec<u32> {
+        self.monsters
+            .iter()
+            .filter(|(_, m)| m.position == pos)
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// Best-effort push to a session. On a full/closed channel the player is
@@ -459,28 +739,79 @@ impl Game {
     }
 
     fn handle(&mut self, cmd: Command) {
+        // Capture now_ms from any tick command so time-sensitive operations
+        // (e.g. do_feed) use a consistent time base.
+        if let Command::CombatTick { now_ms } = &cmd {
+            self.now_ms = *now_ms;
+        }
+        if let Command::MonsterAiTick { now_ms, .. } = &cmd {
+            self.now_ms = *now_ms;
+        }
+        if let Command::RegenerationTick { now_ms } = &cmd {
+            self.now_ms = *now_ms;
+        }
+
         match cmd {
-            Command::Login { name, initial, push_tx, reply } => {
+            Command::Login {
+                name,
+                initial,
+                push_tx,
+                reply,
+            } => {
                 let ack = self.login(name, initial, push_tx);
                 let _ = reply.send(ack);
             }
             Command::Logout { id } => self.logout(id),
-            Command::Move { id, direction } => self.do_move(id, direction),
+            Command::Move { id, direction } => {
+                // Clear auto-walk state on any manual movement.
+                if let Some(p) = self.players.get_mut(&id) {
+                    p.follow_target = None;
+                    p.go_to_position = None;
+                    p.list_walk_dir.clear();
+                }
+                self.do_move(id, direction);
+            }
             Command::Turn { id, direction } => self.do_turn(id, direction),
-            Command::Say { id, speak_type, text } => self.do_say(id, speak_type, text),
+            Command::Say {
+                id,
+                speak_type,
+                text,
+            } => self.do_say(id, speak_type, text),
             Command::SetTarget { id, target_id } => self.do_set_target(id, target_id),
+            Command::FollowTarget { id, target_id } => self.do_follow_target(id, target_id),
+            Command::GoToPosition { id, target } => self.do_go_to_position(id, target),
+            Command::GoToSteps { id, steps } => self.do_go_to_steps(id, steps),
+            Command::ClearAutoWalk { id } => self.do_clear_auto_walk(id),
             Command::ChangeOutfit { id, outfit } => self.do_change_outfit(id, outfit),
             Command::RequestOutfit { id } => self.do_request_outfit(id),
             Command::CombatTick { now_ms } => self.on_combat_tick(now_ms),
-            Command::LookAt { id, x, y, z, stackpos } => self.do_look(id, x, y, z, stackpos),
+            Command::MonsterAiTick { bucket, now_ms } => self.on_monster_ai_tick(bucket, now_ms),
+            Command::RegenerationTick { now_ms } => self.on_regen_tick(now_ms),
+            Command::LookAt {
+                id,
+                x,
+                y,
+                z,
+                stackpos,
+            } => self.do_look(id, x, y, z, stackpos),
             Command::LookBattle { id, target_id } => self.do_look_battle(id, target_id),
-            Command::MoveThing { id, from, from_stackpos, to, count } =>
-                self.do_move_thing(id, from, from_stackpos, to, count),
-            Command::UseItem { id, pos_x, pos_y, pos_z, stackpos, index } =>
-                self.do_use_item(id, pos_x, pos_y, pos_z, stackpos, index),
+            Command::MoveThing {
+                id,
+                from,
+                from_stackpos,
+                to,
+                count,
+            } => self.do_move_thing(id, from, from_stackpos, to, count),
+            Command::UseItem {
+                id,
+                pos_x,
+                pos_y,
+                pos_z,
+                stackpos,
+                index,
+            } => self.do_use_item(id, pos_x, pos_y, pos_z, stackpos, index),
             Command::CloseContainer { id, cid } => self.do_close_container(id, cid),
             Command::UpArrow { id, cid } => self.do_up_arrow(id, cid),
-            Command::AutoWalk { id, steps } => self.do_auto_walk(id, steps),
             Command::Gm { id, text } => self.do_gm_command(id, text),
             Command::ReloadLua => self.do_reload_lua(),
             // Intercepted in the actor loop (it must break the loop + ack);
@@ -490,8 +821,11 @@ impl Game {
     }
 
     /// Is a creature (other than `exclude`) standing on `pos`?
+    /// M12.1: only players block movement; monsters are not yet solid.
     fn tile_occupied(&self, pos: Position, exclude: u32) -> bool {
-        self.players.iter().any(|(&pid, p)| pid != exclude && p.position == pos)
+        self.players
+            .iter()
+            .any(|(&pid, p)| pid != exclude && p.position == pos)
     }
 
     /// The wire stackpos a creature with id `exclude` occupies on `pos`, placed
@@ -500,13 +834,19 @@ impl Game {
     /// arises on stair/height landings (FLAG_IGNOREBLOCKCREATURE); the newest
     /// arrival renders on top, matching TFS. Capped at 10 like the wire stack.
     fn creature_stackpos_on(&self, pos: Position, exclude: u32) -> u8 {
-        let base = self.map.creature_stackpos(
-            i32::from(pos.x), i32::from(pos.y), i32::from(pos.z));
+        let base = self
+            .map
+            .creature_stackpos(i32::from(pos.x), i32::from(pos.y), i32::from(pos.z));
         let others = self
             .players
             .iter()
             .filter(|(id, p)| **id != exclude && p.position == pos)
-            .count();
+            .count()
+            + self
+                .monsters
+                .iter()
+                .filter(|(id, m)| **id != exclude && m.position == pos)
+                .count();
         (usize::from(base) + others).min(10) as u8
     }
 
@@ -545,7 +885,9 @@ impl Game {
         for r in 1..=5i32 {
             for dy in -r..=r {
                 for dx in -r..=r {
-                    if dx.abs() != r && dy.abs() != r { continue; }
+                    if dx.abs() != r && dy.abs() != r {
+                        continue;
+                    }
                     if let Some(p) = origin.offset(dx, dy) {
                         if self.map.is_walkable(p) && !self.tile_occupied(p, exclude) {
                             return p;
@@ -557,19 +899,20 @@ impl Game {
         origin
     }
 
-    /// Ids of creatures standing on `pos`, in deterministic id order. Under the
-    /// ≤1-creature-per-tile invariant the vec is length 0 or 1, so the order is
-    /// unambiguous. KNOWN LIMITATION: when 2+ creatures co-occupy a tile (only on
-    /// stair/height landings via `FLAG_IGNOREBLOCKCREATURE`), id order can differ
-    /// from the wire arrival order, so a look at the top creature may resolve to
-    /// the other co-occupant. Both render identically (Level 1, no vocation), so
-    /// only the displayed name can swap; deferred until it matters.
+    /// Ids of creatures (players + monsters) standing on `pos`, in deterministic
+    /// id order.
     fn creatures_on(&self, pos: Position) -> Vec<u32> {
         let mut ids: Vec<u32> = self
             .players
             .iter()
             .filter(|(_, p)| p.position == pos)
             .map(|(&pid, _)| pid)
+            .chain(
+                self.monsters
+                    .iter()
+                    .filter(|(_, m)| m.position == pos)
+                    .map(|(&mid, _)| mid),
+            )
             .collect();
         ids.sort_unstable();
         ids
@@ -641,44 +984,731 @@ impl Game {
         self.push(id, w.into_bytes());
     }
 
+    // -----------------------------------------------------------------
+    // M12.1 Creature A* — Monster AI
+    // -----------------------------------------------------------------
+
+    /// Handle `0xA2` — set or clear the player's auto-follow target.
+    ///
+    /// `target_id == 0` clears follow and walk queue.
+    /// Computes an initial A* path to the target if they are not already adjacent.
+    pub(super) fn do_follow_target(&mut self, id: u32, target_id: u32) {
+        if target_id == 0 {
+            if let Some(p) = self.players.get_mut(&id) {
+                p.follow_target = None;
+                p.list_walk_dir.clear();
+            }
+            return;
+        }
+        // Target must exist and must not be self.
+        if target_id == id || !self.creature_exists(target_id) {
+            return;
+        }
+        let target_pos = match self.creature_position(target_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let player_pos = match self.players.get(&id) {
+            Some(p) => p.position,
+            None => return,
+        };
+        if player_pos.z != target_pos.z {
+            return; // different floor — can't follow
+        }
+        // Already adjacent?
+        let dx = (i32::from(player_pos.x) - i32::from(target_pos.x)).unsigned_abs();
+        let dy = (i32::from(player_pos.y) - i32::from(target_pos.y)).unsigned_abs();
+        if dx.max(dy) <= 1 {
+            return;
+        }
+
+        if let Some(p) = self.players.get_mut(&id) {
+            p.follow_target = Some(target_id);
+        }
+
+        // Compute initial A* path.
+        let creature_positions: Vec<Position> = self
+            .monsters
+            .values()
+            .filter(|m| m.position.z == player_pos.z)
+            .map(|m| m.position)
+            .chain(
+                self.players
+                    .iter()
+                    .filter(|&(pid, p)| *pid != id && p.position.z == player_pos.z)
+                    .map(|(_, p)| p.position),
+            )
+            .collect();
+
+        let params = pathfinding::FindPathParams {
+            full_search: false,
+            clear_sight: false,
+            max_search_dist: 20,
+        };
+        let tpos = target_pos;
+        let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |pos| {
+            let dx = (i32::from(pos.x) - i32::from(tpos.x)).unsigned_abs();
+            let dy = (i32::from(pos.y) - i32::from(tpos.y)).unsigned_abs();
+            dx.max(dy) <= 1
+        });
+
+        let path = self.map.get_path_matching(
+            player_pos,
+            target_pos,
+            &creature_positions,
+            &params,
+            condition,
+        );
+
+        if !path.is_empty() {
+            if let Some(p) = self.players.get_mut(&id) {
+                p.list_walk_dir = path;
+            }
+        }
+    }
+
+    /// Handle `0xBE` — cancel auto-walk and clear goto state.
+    /// Clears `go_to_position`, `list_walk_dir`, and the existing `follow_target`.
+    pub(super) fn do_clear_auto_walk(&mut self, id: u32) {
+        if let Some(p) = self.players.get_mut(&id) {
+            p.go_to_position = None;
+            p.list_walk_dir.clear();
+        }
+    }
+
+    /// Handle `0x64` GoTo — validate target (same-floor, walkable, in-viewport,
+    /// not-PZ, not-already-there), then compute an initial A* path and fill
+    /// `list_walk_dir`.
+    pub(super) fn do_go_to_position(&mut self, id: u32, target: Position) {
+        let (pos, in_pz) = match self.players.get(&id) {
+            Some(p) => (p.position, self.map.is_protection_zone(p.position)),
+            None => return,
+        };
+        // Check PZ: cannot start auto-walk from or into PZ.
+        if in_pz || self.map.is_protection_zone(target) {
+            self.push_cannot_move(id, "You cannot walk there.");
+            return;
+        }
+        if pos.z != target.z {
+            self.push_cannot_move(id, "You cannot walk to a different floor.");
+            return;
+        }
+        if !self.map.is_walkable(target) {
+            self.push_cannot_move(id, "You cannot walk there.");
+            return;
+        }
+        if !Self::can_see(pos, target) {
+            return; // out of view — silently reject (TFS behavior)
+        }
+        if pos == target {
+            return; // already there — no-op
+        }
+
+        // Cancel follow-target and set goto.
+        if let Some(p) = self.players.get_mut(&id) {
+            p.follow_target = None;
+            p.go_to_position = Some(target);
+        }
+
+        // Collect creature positions on the same floor for A* penalties.
+        let creature_positions: Vec<Position> = self
+            .monsters
+            .values()
+            .filter(|m| m.position.z == pos.z)
+            .map(|m| m.position)
+            .chain(
+                self.players
+                    .iter()
+                    .filter(|&(pid, p)| *pid != id && p.position.z == pos.z)
+                    .map(|(_, p)| p.position),
+            )
+            .collect();
+
+        let params = pathfinding::FindPathParams {
+            full_search: false,
+            clear_sight: false,
+            max_search_dist: 20,
+        };
+        let tpos = target;
+        let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |p| p == tpos);
+
+        let path = self
+            .map
+            .get_path_matching(pos, target, &creature_positions, &params, condition);
+
+        if !path.is_empty() {
+            if let Some(p) = self.players.get_mut(&id) {
+                p.list_walk_dir = path;
+            }
+        } else {
+            // No path found — clear goto and notify.
+            if let Some(p) = self.players.get_mut(&id) {
+                p.go_to_position = None;
+            }
+            self.push_cannot_move(id, "There is no way.");
+        }
+    }
+
+    /// Handle raw `0x64` auto-walk steps: derive target from the actor's
+    /// authoritative `p.position`, validate, and run A*. Avoids `last_pos`
+    /// cache drift because the target is derived from the real position,
+    /// not from a stale cache in the reader loop.
+    pub(super) fn do_go_to_steps(&mut self, id: u32, steps: Vec<protocol::walk::AutoWalkStep>) {
+        let start = match self.players.get(&id) {
+            Some(p) => (p.position.x, p.position.y, p.position.z),
+            None => return,
+        };
+        let Some(target_coords) = walk::auto_walk_destination(start, &steps) else {
+            return; // overflow
+        };
+        let target = Position::new(target_coords.0, target_coords.1, target_coords.2);
+
+        // Idempotency guard (Fix 2): skip A* if target is unchanged and queue
+        // is still active.
+        if let Some(p) = self.players.get(&id) {
+            if p.go_to_position == Some(target) && !p.list_walk_dir.is_empty() {
+                return;
+            }
+        }
+
+        self.do_go_to_position(id, target);
+    }
+
+    /// Monster AI tick — processes one bucket of monsters (`id % 10 == bucket`)
+    /// and player auto-walk for players with a follow target.
+    ///
+    /// Each tick fires every 100ms, cycling through buckets 0..9 so every monster
+    /// is processed once per second.
+    pub(super) fn on_monster_ai_tick(&mut self, bucket: u8, now_ms: u64) {
+        self.now_ms = now_ms;
+        // -----------------------------------------------------------------
+        // 1. Monster AI: path-refresh + step
+        // -----------------------------------------------------------------
+        let monster_ids: Vec<u32> = self
+            .monsters
+            .iter()
+            .filter(|&(&id, _)| id % 10 == bucket as u32)
+            .map(|(&id, _)| id)
+            .collect();
+
+        for id in monster_ids {
+            // --- Path refresh ---
+            let (follow_target, needs_refresh, terp, target_distance) = {
+                let m = match self.monsters.get(&id) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                (
+                    m.follow_target,
+                    m.follow_target.is_some() && m.list_walk_dir.is_empty(),
+                    m.position,
+                    m.target_distance,
+                )
+            };
+
+            if needs_refresh {
+                let Some(target_id) = follow_target else {
+                    continue;
+                };
+                let Some(target_pos) = self.creature_position(target_id) else {
+                    if let Some(m) = self.monsters.get_mut(&id) {
+                        m.follow_target = None;
+                    }
+                    continue;
+                };
+                if terp.z != target_pos.z {
+                    continue;
+                }
+
+                // Collect creature positions for pathfinding penalty.
+                let mut creature_positions: Vec<Position> = Vec::new();
+                for (&mid, m) in &self.monsters {
+                    if mid != id && m.position.z == target_pos.z {
+                        creature_positions.push(m.position);
+                    }
+                }
+                for p in self.players.values() {
+                    if p.position.z == target_pos.z {
+                        creature_positions.push(p.position);
+                    }
+                }
+
+                let params = pathfinding::FindPathParams {
+                    full_search: false,
+                    clear_sight: false,
+                    max_search_dist: 20,
+                };
+                let tpos = target_pos;
+                let td = target_distance.max(1) as u32;
+                let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |pos| {
+                    let dx = (i32::from(pos.x) - i32::from(tpos.x)).unsigned_abs();
+                    let dy = (i32::from(pos.y) - i32::from(tpos.y)).unsigned_abs();
+                    dx.max(dy) <= td
+                });
+
+                let path = self.map.get_path_matching(
+                    terp,
+                    target_pos,
+                    &creature_positions,
+                    &params,
+                    condition,
+                );
+                if !path.is_empty() {
+                    if let Some(m) = self.monsters.get_mut(&id) {
+                        m.list_walk_dir = path;
+                    }
+                }
+            }
+
+            // --- Pop direction and step ---
+            let dir = {
+                let m = match self.monsters.get_mut(&id) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                m.list_walk_dir.pop_front()
+            };
+            if let Some(direction) = dir {
+                self.do_move_monster(id, direction);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // 2. Player auto-walk (0xA2 follow + 0x64 GoTo)
+        // -----------------------------------------------------------------
+        let player_ids: Vec<u32> = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.follow_target.is_some() || p.go_to_position.is_some())
+            .map(|(&id, _)| id)
+            .collect();
+
+        for id in player_ids {
+            // Snapshot state.
+            let (follow_target, pos, queue_empty, go_to_target) = {
+                let p = match self.players.get(&id) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                (
+                    p.follow_target,
+                    p.position,
+                    p.list_walk_dir.is_empty(),
+                    p.go_to_position,
+                )
+            };
+
+            if let Some(target_id) = follow_target {
+                // -------------------------------------------------------------
+                // 2a. Auto-follow (0xA2)
+                // -------------------------------------------------------------
+
+                // Target must still exist.
+                let Some(target_pos) = self.creature_position(target_id) else {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.follow_target = None;
+                    }
+                    continue;
+                };
+
+                // Different floor — stop following.
+                if pos.z != target_pos.z {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.follow_target = None;
+                    }
+                    continue;
+                }
+
+                // Player in PZ — stop following.
+                if self.map.is_protection_zone(pos) {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.follow_target = None;
+                        p.list_walk_dir.clear();
+                    }
+                    continue;
+                }
+
+                // Target no longer in view — stop following.
+                if !Self::can_see(pos, target_pos) {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.follow_target = None;
+                        p.list_walk_dir.clear();
+                    }
+                    continue;
+                }
+
+                // Already adjacent — we've arrived.
+                let dx = (i32::from(pos.x) - i32::from(target_pos.x)).unsigned_abs();
+                let dy = (i32::from(pos.y) - i32::from(target_pos.y)).unsigned_abs();
+                if dx.max(dy) <= 1 {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.follow_target = None;
+                        p.list_walk_dir.clear();
+                    }
+                    continue;
+                }
+
+                // Path refresh on empty queue.
+                if queue_empty {
+                    let creature_positions: Vec<Position> = self
+                        .monsters
+                        .values()
+                        .filter(|m| m.position.z == pos.z)
+                        .map(|m| m.position)
+                        .chain(
+                            self.players
+                                .iter()
+                                .filter(|&(pid, p)| *pid != id && p.position.z == pos.z)
+                                .map(|(_, p)| p.position),
+                        )
+                        .collect();
+
+                    let params = pathfinding::FindPathParams {
+                        full_search: false,
+                        clear_sight: false,
+                        max_search_dist: 20,
+                    };
+                    let tpos = target_pos;
+                    let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |p| {
+                        let dx = (i32::from(p.x) - i32::from(tpos.x)).unsigned_abs();
+                        let dy = (i32::from(p.y) - i32::from(tpos.y)).unsigned_abs();
+                        dx.max(dy) <= 1
+                    });
+
+                    let path = self.map.get_path_matching(
+                        pos,
+                        target_pos,
+                        &creature_positions,
+                        &params,
+                        condition,
+                    );
+                    if !path.is_empty() {
+                        if let Some(p) = self.players.get_mut(&id) {
+                            p.list_walk_dir = path;
+                        }
+                    }
+                }
+
+                // Step-time gate: speed determines the interval between steps.
+                if let Some(p) = self.players.get(&id) {
+                    let elapsed = self.now_ms - p.last_walk_ms;
+                    if elapsed < step_time(p.speed) {
+                        continue;
+                    }
+                }
+
+                // Pop direction and walk (step-time gate is checked above).
+                let dir = {
+                    let p = match self.players.get_mut(&id) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    p.list_walk_dir.pop_front()
+                };
+                if let Some(direction) = dir {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.last_walk_ms = self.now_ms;
+                    }
+                    self.do_move(id, direction);
+                }
+            } else if let Some(target) = go_to_target {
+                // -------------------------------------------------------------
+                // 2b. Click-to-move GoTo (0x64)
+                // -------------------------------------------------------------
+
+                // Player in PZ — stop auto-walk.
+                if self.map.is_protection_zone(pos) {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.go_to_position = None;
+                        p.list_walk_dir.clear();
+                    }
+                    continue;
+                }
+
+                // Arrival detection: exact tile match.
+                // The character must step onto the target tile, not stop adjacent.
+                if pos == target {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.go_to_position = None;
+                        p.list_walk_dir.clear();
+                    }
+                    continue;
+                }
+
+                // Repath on empty queue.
+                if queue_empty {
+                    let creature_positions: Vec<Position> = self
+                        .monsters
+                        .values()
+                        .filter(|m| m.position.z == pos.z)
+                        .map(|m| m.position)
+                        .chain(
+                            self.players
+                                .iter()
+                                .filter(|&(pid, p)| *pid != id && p.position.z == pos.z)
+                                .map(|(_, p)| p.position),
+                        )
+                        .collect();
+
+                    let params = pathfinding::FindPathParams {
+                        full_search: false,
+                        clear_sight: false,
+                        max_search_dist: 20,
+                    };
+                    let tpos = target;
+                    let condition: pathfinding::FrozenPathingConditionCall =
+                        Box::new(move |p| p == tpos);
+
+                    let path = self.map.get_path_matching(
+                        pos,
+                        target,
+                        &creature_positions,
+                        &params,
+                        condition,
+                    );
+                    if !path.is_empty() {
+                        if let Some(p) = self.players.get_mut(&id) {
+                            p.list_walk_dir = path;
+                        }
+                    } else {
+                        // Failed repath — increment counter.
+                        let failed = self
+                            .players
+                            .get(&id)
+                            .map(|p| p.failed_repaths.unwrap_or(0) + 1)
+                            .unwrap_or(1);
+                        if failed >= 3 {
+                            if let Some(p) = self.players.get_mut(&id) {
+                                p.go_to_position = None;
+                                p.list_walk_dir.clear();
+                                p.failed_repaths = None;
+                            }
+                            self.push_cannot_move(id, "There is no way.");
+                            continue;
+                        }
+                        if let Some(p) = self.players.get_mut(&id) {
+                            p.failed_repaths = Some(failed);
+                        }
+                        continue; // skip this tick, try again next tick
+                    }
+                }
+
+                // Step-time gate: speed determines the interval between steps.
+                if let Some(p) = self.players.get(&id) {
+                    let elapsed = self.now_ms - p.last_walk_ms;
+                    if elapsed < step_time(p.speed) {
+                        continue;
+                    }
+                }
+
+                // Pop direction and walk.
+                let dir = {
+                    let p = match self.players.get_mut(&id) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    p.list_walk_dir.pop_front()
+                };
+                if let Some(direction) = dir {
+                    if let Some(p) = self.players.get_mut(&id) {
+                        p.last_walk_ms = self.now_ms;
+                    }
+                    // Check if next step would enter PZ.
+                    let next_pos = pos.offset(direction.delta().0, direction.delta().1);
+                    if let Some(np) = next_pos {
+                        if self.map.is_protection_zone(np) {
+                            if let Some(p) = self.players.get_mut(&id) {
+                                p.go_to_position = None;
+                                p.list_walk_dir.clear();
+                            }
+                            self.push_cannot_move(id, "You cannot walk there.");
+                            continue;
+                        }
+                    }
+                    self.do_move(id, direction);
+                }
+            }
+        }
+    }
+
+    /// Regeneration tick — fires every 1000ms and processes HP/mana
+    /// regeneration for all players with active `ConditionRegeneration`.
+    ///
+    /// For each player, every active condition's `execute_tick` is
+    /// called. Expired conditions are removed. If HP or mana changes,
+    /// a `0xA0` stats packet is pushed to the player.
+    pub(super) fn on_regen_tick(&mut self, now_ms: u64) {
+        let player_ids: Vec<u32> = self.players.keys().copied().collect();
+        for pid in player_ids {
+            if !self.players.contains_key(&pid) {
+                continue;
+            }
+            let stats_opt = {
+                let p = self.players.get_mut(&pid).unwrap();
+                let mut hp_change = 0i32;
+
+                p.conditions.retain(|c| !c.is_expired(now_ms));
+                for c in &mut p.conditions {
+                    hp_change += c.execute_tick(now_ms);
+                }
+
+                if hp_change > 0 {
+                    p.health = (p.health as i32 + hp_change)
+                        .min(p.max_health as i32)
+                        .max(0) as u32;
+                }
+
+                if hp_change != 0 {
+                    Some(enter_world::stats(&enter_world::Stats {
+                        health: p.health as u16,
+                        max_health: p.max_health as u16,
+                        free_capacity: 40_000,
+                        total_capacity: 40_000,
+                        experience: 0,
+                        level: 1,
+                        level_percent: 0,
+                        mana: 0,
+                        max_mana: 0,
+                        magic_level: 0,
+                        soul: 100,
+                        stamina_minutes: 2520,
+                        base_speed: p.speed,
+                    }))
+                } else {
+                    None
+                }
+            };
+            if let Some(pkt) = stats_opt {
+                self.push(pid, pkt);
+            }
+        }
+    }
 }
 
 enum Command {
-    Login { name: String, initial: InitialState, push_tx: mpsc::Sender<Vec<u8>>, reply: oneshot::Sender<LoginAck> },
-    Logout { id: u32 },
-    Move { id: u32, direction: Direction },
-    Turn { id: u32, direction: Direction },
-    Say { id: u32, speak_type: SpeakType, text: String },
+    Login {
+        name: String,
+        initial: InitialState,
+        push_tx: mpsc::Sender<Vec<u8>>,
+        reply: oneshot::Sender<LoginAck>,
+    },
+    Logout {
+        id: u32,
+    },
+    Move {
+        id: u32,
+        direction: Direction,
+    },
+    Turn {
+        id: u32,
+        direction: Direction,
+    },
+    Say {
+        id: u32,
+        speak_type: SpeakType,
+        text: String,
+    },
     /// Client `0xA1`: set (or clear) the attacker's target. `target_id == 0` clears.
-    SetTarget { id: u32, target_id: u32 },
+    SetTarget {
+        id: u32,
+        target_id: u32,
+    },
+    /// Client `0xA2`: set (or clear) the player's auto-follow target. `target_id == 0` clears.
+    FollowTarget {
+        id: u32,
+        target_id: u32,
+    },
+    /// Client `0x64`: click-to-move — auto-walk to a resolved target position.
+    GoToPosition {
+        id: u32,
+        target: Position,
+    },
+    /// Client `0x64`: raw auto-walk steps sent to the actor so it derives the
+    /// target from its authoritative `p.position` instead of a stale cache.
+    GoToSteps {
+        id: u32,
+        steps: Vec<protocol::walk::AutoWalkStep>,
+    },
+    /// Client `0xBE` (ESC): cancel auto-walk and clear goto state.
+    ClearAutoWalk {
+        id: u32,
+    },
     /// Client `0xD3`: apply a new outfit and broadcast `0x8E` to spectators.
-    ChangeOutfit { id: u32, outfit: Outfit },
+    ChangeOutfit {
+        id: u32,
+        outfit: Outfit,
+    },
     /// Client `0xD2`: push `0xC8` outfit-window to the requester only.
-    RequestOutfit { id: u32 },
+    RequestOutfit {
+        id: u32,
+    },
     /// Global combat tick fired by the `tokio::time::interval` task.
-    CombatTick { now_ms: u64 },
+    CombatTick {
+        now_ms: u64,
+    },
+    /// Monster AI tick fired every 100ms — processes one bucket (`id % 10 == bucket`).
+    MonsterAiTick {
+        bucket: u8,
+        now_ms: u64,
+    },
+    /// Regeneration tick fired every 1000ms — processes HP/mana regen
+    /// for all players with active `ConditionRegeneration`.
+    RegenerationTick {
+        now_ms: u64,
+    },
     /// Client `0x8C`: look at the thing at `(x,y,z)` stackpos `stackpos`.
-    LookAt { id: u32, x: u16, y: u16, z: u8, stackpos: u8 },
+    LookAt {
+        id: u32,
+        x: u16,
+        y: u16,
+        z: u8,
+        stackpos: u8,
+    },
     /// Client `0x8D`: look at a creature in the battle list by id.
-    LookBattle { id: u32, target_id: u32 },
+    LookBattle {
+        id: u32,
+        target_id: u32,
+    },
     /// Client `0x78`: move a thing from one map position to another (M10.1: ground
     /// items only). `count` is the stackable split amount (ignored for non-stackables).
-    MoveThing { id: u32, from: Position, from_stackpos: u8, to: Position, count: u8 },
+    MoveThing {
+        id: u32,
+        from: Position,
+        from_stackpos: u8,
+        to: Position,
+        count: u8,
+    },
     /// Chat text beginning with `/` from a player. The actor gates on
     /// `PlayerState.gamemaster`, parses the verb, and dispatches to a GM primitive.
-    Gm { id: u32, text: String },
+    Gm {
+        id: u32,
+        text: String,
+    },
     /// Client `0x82`: use item (open container). `index` is the client-requested cid.
-    UseItem { id: u32, pos_x: u16, pos_y: u16, pos_z: u8, stackpos: u8, index: u8 },
+    UseItem {
+        id: u32,
+        pos_x: u16,
+        pos_y: u16,
+        pos_z: u8,
+        stackpos: u8,
+        index: u8,
+    },
     /// Client `0x87`: close a container window.
-    CloseContainer { id: u32, cid: u8 },
+    CloseContainer {
+        id: u32,
+        cid: u8,
+    },
     /// Client `0x88`: navigate to the parent container (up-arrow button).
-    UpArrow { id: u32, cid: u8 },
-    /// Client `0x64`: auto-walk (GoTo) path from the client.
-    AutoWalk { id: u32, steps: Vec<walk::AutoWalkStep> },
+    UpArrow {
+        id: u32,
+        cid: u8,
+    },
     /// Graceful shutdown: persist every online player, ack, then stop the actor.
     /// Dropping the actor drops `save_tx`, closing the save channel so the DB
     /// drain task can finish. Handled in the actor loop, not in `handle`.
-    Shutdown { ack: oneshot::Sender<()> },
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
     /// Drop and re-initialise the Lua runtime so script changes on disk take
     /// effect without restarting the server.
     ReloadLua,
@@ -702,7 +1732,15 @@ impl WorldHandle {
         push_tx: mpsc::Sender<Vec<u8>>,
     ) -> Option<LoginAck> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(Command::Login { name, initial, push_tx, reply }).await.ok()?;
+        self.tx
+            .send(Command::Login {
+                name,
+                initial,
+                push_tx,
+                reply,
+            })
+            .await
+            .ok()?;
         rx.await.ok()
     }
 
@@ -724,13 +1762,42 @@ impl WorldHandle {
     /// Broadcast a chat utterance. Fire-and-forget; the world pushes the
     /// resulting `0xAA` packets to whoever can hear it (including the speaker).
     pub async fn say(&self, id: u32, speak_type: SpeakType, text: String) {
-        let _ = self.tx.send(Command::Say { id, speak_type, text }).await;
+        let _ = self
+            .tx
+            .send(Command::Say {
+                id,
+                speak_type,
+                text,
+            })
+            .await;
     }
 
     /// Set or clear the attacker's melee target (`0xA1`). `target_id == 0` clears.
     /// Fire-and-forget; the world applies the PZ check and fight scheduling.
     pub async fn set_target(&self, id: u32, target_id: u32) {
         let _ = self.tx.send(Command::SetTarget { id, target_id }).await;
+    }
+
+    /// Set or clear the player's auto-follow target (`0xA2`). `target_id == 0` clears.
+    /// Fire-and-forget; the world computes an initial A* path.
+    pub async fn follow_target(&self, id: u32, target_id: u32) {
+        let _ = self.tx.send(Command::FollowTarget { id, target_id }).await;
+    }
+
+    /// Request click-to-move auto-walk (`0x64` GoTo) to a resolved target. Fire-and-forget.
+    pub async fn goto_position(&self, id: u32, target: Position) {
+        let _ = self.tx.send(Command::GoToPosition { id, target }).await;
+    }
+
+    /// Send raw auto-walk steps (`0x64`) so the actor derives the target from
+    /// its authoritative position. Avoids `last_pos` cache drift. Fire-and-forget.
+    pub async fn goto_steps(&self, id: u32, steps: Vec<protocol::walk::AutoWalkStep>) {
+        let _ = self.tx.send(Command::GoToSteps { id, steps }).await;
+    }
+
+    /// Cancel auto-walk (`0xBE` ESC). Fire-and-forget.
+    pub async fn clear_auto_walk(&self, id: u32) {
+        let _ = self.tx.send(Command::ClearAutoWalk { id }).await;
     }
 
     /// Apply a new outfit (`0xD3`) and broadcast `0x8E` to all spectators.
@@ -747,7 +1814,16 @@ impl WorldHandle {
 
     /// Look at a tile thing (`0x8C`). Fire-and-forget; the world pushes `0xB4`.
     pub async fn look(&self, id: u32, x: u16, y: u16, z: u8, stackpos: u8) {
-        let _ = self.tx.send(Command::LookAt { id, x, y, z, stackpos }).await;
+        let _ = self
+            .tx
+            .send(Command::LookAt {
+                id,
+                x,
+                y,
+                z,
+                stackpos,
+            })
+            .await;
     }
 
     /// Look at a creature in the battle list (`0x8D`). Fire-and-forget.
@@ -757,8 +1833,24 @@ impl WorldHandle {
 
     /// Move a thing on the map (`0x78`). Fire-and-forget; the world validates and
     /// pushes tile-update packets to spectators (M10.1: ground items only).
-    pub async fn move_thing(&self, id: u32, from: Position, from_stackpos: u8, to: Position, count: u8) {
-        let _ = self.tx.send(Command::MoveThing { id, from, from_stackpos, to, count }).await;
+    pub async fn move_thing(
+        &self,
+        id: u32,
+        from: Position,
+        from_stackpos: u8,
+        to: Position,
+        count: u8,
+    ) {
+        let _ = self
+            .tx
+            .send(Command::MoveThing {
+                id,
+                from,
+                from_stackpos,
+                to,
+                count,
+            })
+            .await;
     }
 
     /// Forward a `/`-prefixed chat line to the world as a GM command. The actor
@@ -769,8 +1861,26 @@ impl WorldHandle {
     }
 
     /// Use an item (`0x82`). If the item is a container, opens a window.
-    pub async fn use_item(&self, id: u32, pos_x: u16, pos_y: u16, pos_z: u8, stackpos: u8, index: u8) {
-        let _ = self.tx.send(Command::UseItem { id, pos_x, pos_y, pos_z, stackpos, index }).await;
+    pub async fn use_item(
+        &self,
+        id: u32,
+        pos_x: u16,
+        pos_y: u16,
+        pos_z: u8,
+        stackpos: u8,
+        index: u8,
+    ) {
+        let _ = self
+            .tx
+            .send(Command::UseItem {
+                id,
+                pos_x,
+                pos_y,
+                pos_z,
+                stackpos,
+                index,
+            })
+            .await;
     }
 
     /// Close a container window (`0x87`).
@@ -781,11 +1891,6 @@ impl WorldHandle {
     /// Navigate to the parent container (`0x88` up-arrow).
     pub async fn up_arrow(&self, id: u32, cid: u8) {
         let _ = self.tx.send(Command::UpArrow { id, cid }).await;
-    }
-
-    /// Process a `0x64` auto-walk (GoTo) path from the client.
-    pub async fn auto_walk(&self, id: u32, steps: Vec<walk::AutoWalkStep>) {
-        let _ = self.tx.send(Command::AutoWalk { id, steps }).await;
     }
 
     /// Persist every online player, then stop the world actor. Resolves once all
@@ -816,9 +1921,15 @@ pub fn push_channel() -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
 /// a background task, mapping each record to `persistence::PlayerSave` and
 /// awaiting `store.save_player`. Also spawns the single global combat-tick task
 /// that sends `Command::CombatTick` every `COMBAT_TICK_MS` milliseconds.
-pub fn spawn(map: Arc<StaticMap>, config: GameConfig) -> (WorldHandle, mpsc::UnboundedReceiver<SaveRecord>) {
+pub fn spawn(
+    map: Arc<StaticMap>,
+    config: GameConfig,
+) -> (WorldHandle, mpsc::UnboundedReceiver<SaveRecord>) {
     let (tx, mut rx) = mpsc::channel::<Command>(64);
-    let handle = WorldHandle { tx: tx.clone(), map: Arc::clone(&map) };
+    let handle = WorldHandle {
+        tx: tx.clone(),
+        map: Arc::clone(&map),
+    };
 
     // Save channel: unbounded so the actor never blocks on logout.
     let (save_tx, save_rx) = mpsc::unbounded_channel::<SaveRecord>();
@@ -828,14 +1939,55 @@ pub fn spawn(map: Arc<StaticMap>, config: GameConfig) -> (WorldHandle, mpsc::Unb
     // a consistent monotonic reference without touching the system clock.
     let tick_tx = tx.clone();
     tokio::spawn(async move {
-        let mut iv = tokio::time::interval(
-            std::time::Duration::from_millis(COMBAT_TICK_MS));
+        let mut iv = tokio::time::interval(std::time::Duration::from_millis(COMBAT_TICK_MS));
         iv.tick().await; // consume the immediate first tick
         let start = tokio::time::Instant::now();
         loop {
             iv.tick().await;
             let now_ms = start.elapsed().as_millis() as u64;
             if tick_tx.send(Command::CombatTick { now_ms }).await.is_err() {
+                break; // actor dropped → server shutting down
+            }
+        }
+    });
+
+    // Monster AI tick: fires every 100ms, cycling through 10 buckets so each
+    // monster is processed once per second. i.e. bucket 0, 1, …, 9, 0, …
+    let ai_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(std::time::Duration::from_millis(MONSTER_AI_TICK_MS));
+        iv.tick().await; // consume the immediate first tick
+        let start = tokio::time::Instant::now();
+        let mut bucket = 0u8;
+        loop {
+            iv.tick().await;
+            let now_ms = start.elapsed().as_millis() as u64;
+            if ai_tx
+                .send(Command::MonsterAiTick { bucket, now_ms })
+                .await
+                .is_err()
+            {
+                break; // actor dropped → server shutting down
+            }
+            bucket = (bucket + 1) % 10;
+        }
+    });
+
+    // Regeneration tick: fires every 1s, sending RegenerationTick
+    // that processes HP/mana regen for all players with food conditions.
+    let regen_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(std::time::Duration::from_millis(REGENERATION_TICK_MS));
+        iv.tick().await; // consume the immediate first tick
+        let start = tokio::time::Instant::now();
+        loop {
+            iv.tick().await;
+            let now_ms = start.elapsed().as_millis() as u64;
+            if regen_tx
+                .send(Command::RegenerationTick { now_ms })
+                .await
+                .is_err()
+            {
                 break; // actor dropped → server shutting down
             }
         }
@@ -852,6 +2004,14 @@ pub fn spawn(map: Arc<StaticMap>, config: GameConfig) -> (WorldHandle, mpsc::Unb
                 XmlRegistry::default()
             }
         };
+        game.monster_types = match parse_monsters_xml(&config.monsters_xml) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(%e, "failed to parse monsters.xml — using empty type registry");
+                HashMap::new()
+            }
+        };
+        game.load_spawns(&config.spawns_xml, 0);
         while let Some(cmd) = rx.recv().await {
             if let Command::Shutdown { ack } = cmd {
                 game.save_all();
@@ -866,8 +2026,8 @@ pub fn spawn(map: Arc<StaticMap>, config: GameConfig) -> (WorldHandle, mpsc::Unb
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_support::*;
+    use super::*;
 
     // Movement tests live in game::movement::tests.
     // Core helper tests below (they test Game methods defined in this file).
@@ -884,7 +2044,10 @@ mod tests {
         let specs = g.spectators(Position::new(100, 100, 7), a);
         assert!(specs.contains(&b), "edge of viewport is visible");
         assert!(!specs.contains(&c), "beyond the viewport is not visible");
-        assert!(specs.contains(&d), "an overground viewer one floor up sees the z7 tile");
+        assert!(
+            specs.contains(&d),
+            "an overground viewer one floor up sees the z7 tile"
+        );
         assert!(!specs.contains(&a), "self excluded");
     }
 
@@ -897,14 +2060,38 @@ mod tests {
         // misaligns "creature became visible" from the slice that actually reveals
         // it — the creature gets marked known but never transmitted (invisible).
         let c = Position::new(100, 100, 7);
-        assert!(Game::can_see(c, Position::new(109, 100, 7)), "+9 east is visible");
-        assert!(!Game::can_see(c, Position::new(110, 100, 7)), "+10 east is not");
-        assert!(Game::can_see(c, Position::new(92, 100, 7)), "-8 west is visible");
-        assert!(!Game::can_see(c, Position::new(91, 100, 7)), "-9 west is not");
-        assert!(Game::can_see(c, Position::new(100, 107, 7)), "+7 south is visible");
-        assert!(!Game::can_see(c, Position::new(100, 108, 7)), "+8 south is not");
-        assert!(Game::can_see(c, Position::new(100, 94, 7)), "-6 north is visible");
-        assert!(!Game::can_see(c, Position::new(100, 93, 7)), "-7 north is not");
+        assert!(
+            Game::can_see(c, Position::new(109, 100, 7)),
+            "+9 east is visible"
+        );
+        assert!(
+            !Game::can_see(c, Position::new(110, 100, 7)),
+            "+10 east is not"
+        );
+        assert!(
+            Game::can_see(c, Position::new(92, 100, 7)),
+            "-8 west is visible"
+        );
+        assert!(
+            !Game::can_see(c, Position::new(91, 100, 7)),
+            "-9 west is not"
+        );
+        assert!(
+            Game::can_see(c, Position::new(100, 107, 7)),
+            "+7 south is visible"
+        );
+        assert!(
+            !Game::can_see(c, Position::new(100, 108, 7)),
+            "+8 south is not"
+        );
+        assert!(
+            Game::can_see(c, Position::new(100, 94, 7)),
+            "-6 north is visible"
+        );
+        assert!(
+            !Game::can_see(c, Position::new(100, 93, 7)),
+            "-7 north is not"
+        );
     }
 
     #[test]
@@ -916,7 +2103,10 @@ mod tests {
         let (west9, _rw) = add_player(&mut g, Position::new(91, 100, 7)); // pos.x - 9
         let (east9, _re) = add_player(&mut g, Position::new(109, 100, 7)); // pos.x + 9
         let specs = g.spectators(Position::new(100, 100, 7), u32::MAX);
-        assert!(specs.contains(&west9), "a viewer 9 west sees pos at its east edge");
+        assert!(
+            specs.contains(&west9),
+            "a viewer 9 west sees pos at its east edge"
+        );
         assert!(!specs.contains(&east9), "a viewer 9 east cannot see pos");
     }
 
@@ -926,29 +2116,477 @@ mod tests {
         let (viewer, _rv) = add_player(&mut g, Position::new(100, 100, 7));
         let (target, _rt) = add_player(&mut g, Position::new(101, 100, 7));
         let first = g.introduce(viewer, target).unwrap();
-        assert_eq!(u16::from_le_bytes([first[0], first[1]]), 0x0061, "first sighting is full form");
+        assert_eq!(
+            u16::from_le_bytes([first[0], first[1]]),
+            0x0061,
+            "first sighting is full form"
+        );
         let second = g.introduce(viewer, target).unwrap();
-        assert_eq!(u16::from_le_bytes([second[0], second[1]]), 0x0062, "second is short form");
+        assert_eq!(
+            u16::from_le_bytes([second[0], second[1]]),
+            0x0062,
+            "second is short form"
+        );
     }
 
     #[test]
     fn underground_spectator_sees_within_two_floors() {
         // viewer underground at z=9; targets at z=6 (out, >2) and z=11 (in, =2).
-        assert!(!Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 6)), "3 floors below: out");
-        assert!(Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 11)), "2 floors below: in");
-        assert!(Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 7)), "2 floors above: in");
+        assert!(
+            !Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 6)),
+            "3 floors below: out"
+        );
+        assert!(
+            Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 11)),
+            "2 floors below: in"
+        );
+        assert!(
+            Game::can_see(Position::new(100, 100, 9), Position::new(100, 100, 7)),
+            "2 floors above: in"
+        );
     }
 
+    #[test]
+    fn monster_creature_name_rat() {
+        let mut g = Game::new(walk_map());
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        assert_eq!(g.creature_name(mid), Some("Rat"));
+    }
+
+    #[test]
+    fn monster_creature_outfit_uses_look_type() {
+        let mut g = Game::new(walk_map());
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        let outfit = g.creature_outfit(mid).unwrap();
+        assert_eq!(outfit.look_type, 100);
+        assert_eq!(outfit.head, 0);
+        assert_eq!(outfit.body, 0);
+    }
+
+    #[test]
+    fn monster_creature_type_byte_returns_monster() {
+        let mut g = Game::new(walk_map());
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        assert_eq!(
+            g.creature_type_byte(mid),
+            protocol::creature::CREATURETYPE_MONSTER
+        );
+    }
+
+    #[test]
+    fn monster_creature_type_byte_player_returns_player() {
+        let mut g = Game::new(walk_map());
+        let (pid, _) = add_player(&mut g, Position::new(100, 100, 7));
+        assert_eq!(
+            g.creature_type_byte(pid),
+            protocol::creature::CREATURETYPE_PLAYER
+        );
+    }
+
+    #[test]
+    fn monster_creature_exists_for_monster() {
+        let mut g = Game::new(walk_map());
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        assert!(g.creature_exists(mid));
+        assert!(!g.creature_exists(0x9999_9999));
+    }
+
+    #[test]
+    fn monster_visible_from_returns_monster_in_range() {
+        let mut g = Game::new(walk_map());
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        let visible = g.monsters_visible_from(Position::new(100, 100, 7));
+        assert!(visible.contains(&mid), "monster at +1x must be visible");
+    }
+
+    #[test]
+    fn monster_not_visible_from_out_of_range() {
+        let mut g = Game::new(walk_map());
+        add_monster(&mut g, Position::new(200, 200, 7));
+        let visible = g.monsters_visible_from(Position::new(100, 100, 7));
+        assert!(visible.is_empty(), "monster too far must not be visible");
+    }
+
+    #[test]
+    fn monster_creatures_on_includes_monster() {
+        let mut g = Game::new(walk_map());
+        let pid = {
+            let (id, _) = add_player(&mut g, Position::new(100, 100, 7));
+            id
+        };
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        let creatures = g.creatures_on(Position::new(101, 100, 7));
+        assert!(
+            creatures.contains(&mid),
+            "monster must be listed on its tile"
+        );
+        assert!(
+            !creatures.contains(&pid),
+            "different tile creature excluded"
+        );
+    }
+
+    #[test]
+    fn monster_creature_stackpos_advances_for_monster() {
+        let mut g = Game::new(walk_map());
+        let (pid, _) = add_player(&mut g, Position::new(101, 100, 7));
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        // Both on same tile; stackpos = base (1 for ground) + OTHER creatures count.
+        // Player was added first, monster second. For the player: 1 other (monster) = 2.
+        // For the monster: 1 other (player) = 2 as well.
+        let p_sp = g.creature_stackpos_on(Position::new(101, 100, 7), pid);
+        let m_sp = g.creature_stackpos_on(Position::new(101, 100, 7), mid);
+        assert_eq!(p_sp, 2, "player shares tile with monster → stackpos 2");
+        assert_eq!(m_sp, 2, "monster shares tile with player → stackpos 2");
+    }
+
+    #[test]
+    fn monster_introduce_uses_full_form_first_time() {
+        let mut g = Game::new(walk_map());
+        let (viewer, _) = add_player(&mut g, Position::new(100, 100, 7));
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        let first = g.introduce(viewer, mid).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([first[0], first[1]]),
+            0x0061,
+            "first monster sighting is full form"
+        );
+    }
+
+    #[test]
+    fn monster_introduce_uses_monster_creature_type() {
+        let mut g = Game::new(walk_map());
+        let (viewer, _) = add_player(&mut g, Position::new(100, 100, 7));
+        let mid = add_monster(&mut g, Position::new(101, 100, 7));
+        let bytes = g.introduce(viewer, mid).unwrap();
+        // creatureType at known offset in unknown (0x61) form:
+        // [op 2][removeId 4][id 4][creatureType 1][name...]
+        // Byte 10 = first creatureType byte.
+        assert_eq!(
+            bytes[10],
+            protocol::creature::CREATURETYPE_MONSTER,
+            "introduce must emit CREATURETYPE_MONSTER (1) at first creatureType byte"
+        );
+    }
+
+    #[test]
+    fn go_to_position_defaults_to_none_on_login() {
+        let mut g = Game::new(walk_map());
+        let (pid, _) = add_player(&mut g, Position::new(100, 100, 7));
+        assert!(g.players.get(&pid).unwrap().go_to_position.is_none());
+    }
+
+    #[test]
+    fn clear_auto_walk_clears_goto_position_and_queue() {
+        let mut g = Game::new(walk_map());
+        let (pid, _) = add_player(&mut g, Position::new(100, 100, 7));
+        let p = g.players.get_mut(&pid).unwrap();
+        p.go_to_position = Some(Position::new(105, 100, 7));
+        p.list_walk_dir.push_back(Direction::East);
+        let _ = p;
+        // WHEN ClearAutoWalk is handled
+        g.handle(Command::ClearAutoWalk { id: pid });
+        // THEN both goto and queue are cleared
+        let p = g.players.get(&pid).unwrap();
+        assert!(p.go_to_position.is_none());
+        assert!(p.list_walk_dir.is_empty());
+    }
+
+    #[test]
+    fn manual_move_clears_goto_position_and_queue() {
+        let mut g = Game::new(walk_map());
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        {
+            let p = g.players.get_mut(&pid).unwrap();
+            p.go_to_position = Some(Position::new(99, 117, 7));
+            p.list_walk_dir.push_back(Direction::East);
+        }
+        // WHEN manual move command issued
+        g.handle(Command::Move {
+            id: pid,
+            direction: Direction::East,
+        });
+        // NOTE: do_move pushes packets to the receiver; we must drain to keep
+        // the channel alive so the player isn't reaped as a dead session.
+        while rx.try_recv().is_ok() {}
+        // THEN goto and queue are cleared after the move
+        let p = g.players.get(&pid).expect("player must still exist");
+        assert!(
+            p.go_to_position.is_none(),
+            "go_to_position must be cleared on manual move"
+        );
+        assert!(
+            p.list_walk_dir.is_empty(),
+            "walk queue must be cleared on manual move"
+        );
+    }
+
+    #[test]
+    fn do_go_to_position_rejects_different_floor() {
+        let mut g = Game::new(walk_map());
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        // WHEN goto is called with a target on z=8 (player is on z=7)
+        g.do_go_to_position(pid, Position::new(96, 117, 8));
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+        // THEN goto must not be set
+        assert!(
+            p.go_to_position.is_none(),
+            "cross-floor goto must be rejected"
+        );
+    }
+
+    #[test]
+    fn do_go_to_position_rejects_unwalkable_tile() {
+        let mut g = Game::new(walk_map());
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        // (94,117) has a block-solid item in walk_map
+        g.do_go_to_position(pid, Position::new(94, 117, 7));
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+        assert!(
+            p.go_to_position.is_none(),
+            "unwalkable goto must be rejected"
+        );
+    }
+
+    #[test]
+    fn do_go_to_position_rejects_out_of_viewport() {
+        let mut g = Game::new(walk_map());
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        // Far beyond viewport
+        g.do_go_to_position(pid, Position::new(200, 200, 7));
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+        assert!(
+            p.go_to_position.is_none(),
+            "out-of-viewport goto must be rejected"
+        );
+    }
+
+    #[test]
+    fn do_go_to_position_already_there_is_noop() {
+        let mut g = Game::new(walk_map());
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        // Target is exactly where player stands
+        g.do_go_to_position(pid, Position::new(95, 117, 7));
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+        assert!(
+            p.go_to_position.is_none(),
+            "same-tile goto must be rejected"
+        );
+    }
+
+    #[test]
+    fn do_go_to_position_sets_target_and_fills_queue_for_walkable_dest() {
+        let mut g = Game::new(walk_map());
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        // Valid walkable destination within viewport, adjacent tile east
+        g.do_go_to_position(pid, Position::new(96, 117, 7));
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+        // THEN go_to_position is set
+        assert_eq!(p.go_to_position, Some(Position::new(96, 117, 7)));
+        // AND the walk queue has at least one direction
+        assert!(
+            !p.list_walk_dir.is_empty(),
+            "A* path should fill the walk queue"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AI tick auto-walk tests (Task 3.3)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn do_go_to_position_fills_queue_for_distant_target() {
+        // combat_map(false) has tiles at (95..97, 117, 7) all walkable.
+        let mut g = Game::new(combat_map(false));
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        g.do_go_to_position(pid, Position::new(97, 117, 7));
+        while rx.try_recv().is_ok() {}
+        let queue_len = g.players.get(&pid).unwrap().list_walk_dir.len();
+        assert!(
+            queue_len > 0,
+            "queue must be filled for distant target; got {queue_len}"
+        );
+    }
+
+    #[test]
+    fn ai_tick_takes_one_step_toward_go_to_target() {
+        let mut g = Game::new(combat_map(false));
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        // Target at (97,117) — 2 tiles east, so arrival check won't trigger
+        // until after at least one step.
+        g.do_go_to_position(pid, Position::new(97, 117, 7));
+        while rx.try_recv().is_ok() {}
+        assert!(
+            !g.players.get(&pid).unwrap().list_walk_dir.is_empty(),
+            "queue not empty"
+        );
+        let before = g.players.get(&pid).unwrap().position;
+
+        // WHEN AI tick fires
+        g.on_monster_ai_tick(0, 1000);
+        while rx.try_recv().is_ok() {}
+
+        // THEN player moved one step closer
+        let after = g.players.get(&pid).unwrap().position;
+        assert_ne!(
+            before, after,
+            "player should take one step toward goto target"
+        );
+    }
+
+    #[test]
+    fn ai_tick_clears_goto_on_arrival() {
+        let mut g = Game::new(combat_map(false));
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        // Set goto to (97,117) — two tiles east. After tick 1: at (96,117).
+        // Tick 2: step to (97,117). Tick 3: exact arrival.
+        g.do_go_to_position(pid, Position::new(97, 117, 7));
+        while rx.try_recv().is_ok() {}
+        // Tick 1: step to (96,117)
+        g.on_monster_ai_tick(0, 1000);
+        while rx.try_recv().is_ok() {}
+        // Tick 2: step to (97,117) — exact target tile
+        g.on_monster_ai_tick(0, 2000);
+        while rx.try_recv().is_ok() {}
+        // Tick 3: detect arrival at exact position (97,117)
+        g.on_monster_ai_tick(0, 3000);
+        while rx.try_recv().is_ok() {}
+
+        let p = g.players.get(&pid).unwrap();
+        assert!(p.go_to_position.is_none(), "goto cleared on exact arrival");
+    }
+
+    #[test]
+    fn ai_tick_clears_goto_on_pz_entry() {
+        // wide_combat_map_with_pz: (90,117) is PZ, (91..116,117) non-PZ.
+        // Start at (91,117), step west into (90,117)PZ.
+        let mut g = Game::new(wide_combat_map_with_pz());
+        let (pid, mut rx) = add_player(&mut g, Position::new(91, 117, 7));
+        {
+            let p = g.players.get_mut(&pid).unwrap();
+            p.go_to_position = Some(Position::new(80, 117, 7));
+            p.list_walk_dir.push_back(Direction::West);
+        }
+        // Tick: step west onto PZ tile (90,117)
+        g.on_monster_ai_tick(0, 1000);
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+        // After stepping into PZ, goto must be cleared
+        assert!(
+            p.go_to_position.is_none(),
+            "goto must be cleared when stepping into PZ"
+        );
+        assert!(
+            p.list_walk_dir.is_empty(),
+            "walk queue must be cleared when stepping into PZ"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 1 — `last_pos` cache drift: GoToSteps uses authoritative position
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn do_go_to_steps_derives_target_from_authoritative_position() {
+        // GIVEN a player at (95,117,7) who moves manually to (96,117,7)
+        let mut g = Game::new(combat_map(false));
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        g.handle(Command::Move {
+            id: pid,
+            direction: Direction::East,
+        });
+        while rx.try_recv().is_ok() {}
+        assert_eq!(
+            g.players.get(&pid).unwrap().position,
+            Position::new(96, 117, 7)
+        );
+
+        // WHEN GoToSteps is called with [East] — target should be (97,117,7)
+        // based on the authoritative position (96,117,7).
+        let steps = vec![protocol::walk::AutoWalkStep::East];
+        g.handle(Command::GoToSteps { id: pid, steps });
+        while rx.try_recv().is_ok() {}
+
+        // THEN target must be derived from the authoritative position (96,117)
+        // not from the initial spawn (95,117)
+        let p = g.players.get(&pid).unwrap();
+        assert_eq!(
+            p.go_to_position,
+            Some(Position::new(97, 117, 7)),
+            "GoToSteps must derive target from actor's p.position, not a stale cache"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 2 — Redundant A* guard: same target skips A* on second call
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn do_go_to_steps_same_target_skips_astar_on_second_call() {
+        let mut g = Game::new(combat_map(false));
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+
+        // First call with [East, East] steps: should compute A* and fill queue
+        let steps = vec![
+            protocol::walk::AutoWalkStep::East,
+            protocol::walk::AutoWalkStep::East,
+        ];
+        g.handle(Command::GoToSteps {
+            id: pid,
+            steps: steps.clone(),
+        });
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+        assert_eq!(p.go_to_position, Some(Position::new(97, 117, 7)));
+        let first_queue_len = p.list_walk_dir.len();
+        assert!(first_queue_len > 0, "first call should fill the walk queue");
+
+        // Simulate one tick consuming one step
+        {
+            let p = g.players.get_mut(&pid).unwrap();
+            p.list_walk_dir.pop_front();
+        }
+        let reduced_len = g.players.get(&pid).unwrap().list_walk_dir.len();
+
+        // Second call with same steps: guard should skip A*, queue stays reduced
+        g.handle(Command::GoToSteps { id: pid, steps });
+        while rx.try_recv().is_ok() {}
+
+        let p = g.players.get(&pid).unwrap();
+        assert_eq!(
+            p.list_walk_dir.len(),
+            reduced_len,
+            "second call with same target must NOT re-fill the queue (A* guard)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     #[test]
     fn overground_viewer_sees_all_upper_floors_but_not_underground() {
         // TFS canSee: an overground viewer (z<=7) sees every floor 7→0 (so a
         // creature on a higher floor IS visible, projected), but NOT underground.
-        assert!(Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 7)), "same floor");
-        assert!(Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 6)), "one floor up is visible");
+        assert!(
+            Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 7)),
+            "same floor"
+        );
+        assert!(
+            Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 6)),
+            "one floor up is visible"
+        );
         // A higher floor projects by offsetz; at the same x/y it slides out of the
         // viewport, but offset back by the projection it is visible.
-        assert!(Game::can_see(Position::new(100, 100, 7), Position::new(102, 102, 5)), "two floors up, projection-aligned, visible");
-        assert!(!Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 8)), "underground hidden from surface");
+        assert!(
+            Game::can_see(Position::new(100, 100, 7), Position::new(102, 102, 5)),
+            "two floors up, projection-aligned, visible"
+        );
+        assert!(
+            !Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 8)),
+            "underground hidden from surface"
+        );
     }
-
 }

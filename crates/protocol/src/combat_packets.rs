@@ -156,15 +156,7 @@ pub fn death_window(unfair_fight_reduction: u8) -> Vec<u8> {
 /// `text` MUST be non-empty: the 10.98 parser reads the trailing string for the
 /// damage modes and, if it comes back empty, reads *another* string — an empty
 /// payload would desync the stream. Callers always pass a console line.
-pub fn damage_text(
-    mode: u8,
-    x: u16,
-    y: u16,
-    z: u8,
-    value: u32,
-    color: u8,
-    text: &[u8],
-) -> Vec<u8> {
+pub fn damage_text(mode: u8, x: u16, y: u16, z: u8, value: u32, color: u8, text: &[u8]) -> Vec<u8> {
     debug_assert!(!text.is_empty(), "damage_text requires a non-empty string");
     let mut w = MessageWriter::new();
     w.write_u8(OP_TEXT_MESSAGE);
@@ -327,7 +319,10 @@ mod tests {
             let p = death_window(reduction);
             assert_eq!(p[0], OP_DEATH_WINDOW);
             assert_eq!(p[1], 0x00);
-            assert_eq!(p[2], reduction, "round-trip failed for reduction={reduction}");
+            assert_eq!(
+                p[2], reduction,
+                "round-trip failed for reduction={reduction}"
+            );
         }
     }
 
@@ -387,20 +382,51 @@ mod tests {
     fn damage_text_exact_wire_layout() {
         // [0xB4][mode][x u16][y u16][z u8][value u32][color u8][0 u32][0 u8][str u16len+bytes]
         let text = b"You lose 5 hitpoints.";
-        let p = damage_text(MSG_DAMAGE_RECEIVED, 0x0102, 0x0304, 7, 5, TEXTCOLOR_RED, text);
+        let p = damage_text(
+            MSG_DAMAGE_RECEIVED,
+            0x0102,
+            0x0304,
+            7,
+            5,
+            TEXTCOLOR_RED,
+            text,
+        );
 
         let mut i = 0;
-        assert_eq!(p[i], OP_TEXT_MESSAGE, "opcode"); i += 1;
-        assert_eq!(p[i], MSG_DAMAGE_RECEIVED, "mode"); i += 1;
-        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 0x0102, "x"); i += 2;
-        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 0x0304, "y"); i += 2;
-        assert_eq!(p[i], 7, "z"); i += 1;
-        assert_eq!(u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]), 5, "primary value"); i += 4;
-        assert_eq!(p[i], TEXTCOLOR_RED, "primary color"); i += 1;
-        assert_eq!(u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]), 0, "secondary value"); i += 4;
-        assert_eq!(p[i], 0, "secondary color"); i += 1;
-        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), text.len() as u16, "string length"); i += 2;
-        assert_eq!(&p[i..i + text.len()], text, "string body"); i += text.len();
+        assert_eq!(p[i], OP_TEXT_MESSAGE, "opcode");
+        i += 1;
+        assert_eq!(p[i], MSG_DAMAGE_RECEIVED, "mode");
+        i += 1;
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 0x0102, "x");
+        i += 2;
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 0x0304, "y");
+        i += 2;
+        assert_eq!(p[i], 7, "z");
+        i += 1;
+        assert_eq!(
+            u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]),
+            5,
+            "primary value"
+        );
+        i += 4;
+        assert_eq!(p[i], TEXTCOLOR_RED, "primary color");
+        i += 1;
+        assert_eq!(
+            u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]),
+            0,
+            "secondary value"
+        );
+        i += 4;
+        assert_eq!(p[i], 0, "secondary color");
+        i += 1;
+        assert_eq!(
+            u16::from_le_bytes([p[i], p[i + 1]]),
+            text.len() as u16,
+            "string length"
+        );
+        i += 2;
+        assert_eq!(&p[i..i + text.len()], text, "string body");
+        i += text.len();
         assert_eq!(i, p.len(), "no trailing bytes after the string");
     }
 
@@ -424,7 +450,11 @@ mod tests {
         let text = b"x";
         let p = damage_text(MSG_DAMAGE_DEALT, 1, 1, 0, 1, TEXTCOLOR_RED, text);
         let n = p.len();
-        assert_eq!(u16::from_le_bytes([p[n - 3], p[n - 2]]), 1, "string length prefix");
+        assert_eq!(
+            u16::from_le_bytes([p[n - 3], p[n - 2]]),
+            1,
+            "string length prefix"
+        );
         assert_eq!(p[n - 1], b'x', "string body");
     }
 

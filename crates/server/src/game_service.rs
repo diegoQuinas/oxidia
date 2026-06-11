@@ -5,7 +5,10 @@ use anyhow::Result;
 use persistence::{PlayerSave, Store};
 use protocol::map_description::Center;
 use protocol::rsa::RsaPrivateKey;
-use protocol::{chat, combat_packets, creature, enter_world, frame, game_login, outfit as outfit_packets, walk, xtea};
+use protocol::{
+    chat, combat_packets, creature, enter_world, frame, game_login, outfit as outfit_packets, walk,
+    xtea,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use world::game::{InitialState, SaveRecord, WorldHandle};
 use world::map::StaticMap;
@@ -21,7 +24,15 @@ const GM_LOOKTYPE: u16 = 75;
 
 /// Default outfit for a new character (Test Knight look).
 fn knight_outfit() -> creature::Outfit {
-    creature::Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
+    creature::Outfit {
+        look_type: 128,
+        head: 78,
+        body: 69,
+        legs: 58,
+        feet: 76,
+        addons: 0,
+        mount: 0,
+    }
 }
 
 /// Convert a direction byte (0=N,1=E,2=S,3=W) to the `Direction` enum.
@@ -53,8 +64,8 @@ fn player_save_to_initial(save: &PlayerSave) -> InitialState {
             mount: save.look_mount,
         },
         sex: save.sex,
-        health: save.health,
-        max_health: save.health_max,
+        health: u32::from(save.health),
+        max_health: u32::from(save.health_max),
         gamemaster: false,
         inventory: save.inventory.clone(),
         container_items: save.container_items.clone(),
@@ -71,10 +82,10 @@ pub fn save_record_to_player_save(rec: &SaveRecord) -> PlayerSave {
         pos_x: rec.position.x,
         pos_y: rec.position.y,
         pos_z: rec.position.z,
-        level: 1,   // stub: real level comes with M14 progression
-        health: rec.health,
-        health_max: rec.max_health,
-        mana: 0,    // stub: world doesn't track mana yet
+        level: 1, // stub: real level comes with M14 progression
+        health: rec.health as u16,
+        health_max: rec.max_health as u16,
+        mana: 0, // stub: world doesn't track mana yet
         mana_max: 0,
         direction: rec.direction.to_byte(),
         look_type: rec.outfit.look_type,
@@ -140,13 +151,20 @@ pub fn build_enter_world_burst(
         enter_world::EFFECT_TELEPORT,
     ));
     // Inventory: a 0x78 for each equipped slot, 0x79 for the empty ones.
-    let equipped: std::collections::HashMap<u8, (u16, u8)> =
-        player.inventory.iter().map(|&(s, sid, c)| (s, (sid, c))).collect();
+    let equipped: std::collections::HashMap<u8, (u16, u8)> = player
+        .inventory
+        .iter()
+        .map(|&(s, sid, c)| (s, (sid, c)))
+        .collect();
     for slot in 1..=enter_world::INVENTORY_SLOTS {
         match equipped.get(&slot) {
             Some(&(server_id, count)) => {
                 if let Some(meta) = map.item_meta(server_id) {
-                    let subtype = if meta.stackable { Some(count.max(1)) } else { None };
+                    let subtype = if meta.stackable {
+                        Some(count.max(1))
+                    } else {
+                        None
+                    };
                     let wi = protocol::map_description::WireItem {
                         client_id: meta.client_id,
                         subtype,
@@ -255,14 +273,23 @@ where
     let snapshot = ack.snapshot;
 
     // 6. Build + send the enter-world burst as one encrypted frame.
-    let center = Center { x: snapshot.position.x, y: snapshot.position.y, z: snapshot.position.z };
+    let center = Center {
+        x: snapshot.position.x,
+        y: snapshot.position.y,
+        z: snapshot.position.z,
+    };
     let player_info = EnterWorldPlayer {
         id: snapshot.id,
-        health: snapshot.health,
-        max_health: snapshot.max_health,
+        health: snapshot.health as u16,
+        max_health: snapshot.max_health as u16,
         inventory: &login_inventory,
     };
-    let burst = build_enter_world_burst(&player_info, center, &ack.map_description, world.map.as_ref());
+    let burst = build_enter_world_burst(
+        &player_info,
+        center,
+        &ack.map_description,
+        world.map.as_ref(),
+    );
     send_encrypted(&mut stream, &keys, &burst).await?;
     tracing::info!(character = %name, id = snapshot.id, ?center, "player entered game");
 
@@ -278,7 +305,7 @@ where
     // we tear the session down — so the read_frame cancel-safety hazard (which
     // only matters when you keep reading) does not apply.
     let read_result = tokio::select! {
-        res = reader_loop(&mut rd, &keys, world, snapshot.id) => {
+        res = reader_loop(&mut rd, &keys, world, snapshot.id, Some((snapshot.position.x, snapshot.position.y, snapshot.position.z))) => {
             writer.abort();
             res
         }
@@ -324,24 +351,37 @@ fn opcode_action(opcode: u8) -> Option<(Direction, bool)> {
 
 /// The connection-task reader loop: decode inbound walk/turn into fire-and-forget
 /// world commands. Not inside a `select!`, so `read_frame` is never cancelled.
+///
+/// Maintains a best-effort `last_pos` cache so the 0x64 auto-walk handler can
+/// derive the destination from the player's current position + client steps.
 async fn reader_loop<R>(
     rd: &mut R,
     keys: &xtea::RoundKeys,
     world: &WorldHandle,
     id: u32,
+    last_pos: Option<(u16, u16, u8)>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
+    let mut last_pos = last_pos;
     loop {
-        let Some(raw) = net::frame::read_frame(rd).await? else { break };
+        let Some(raw) = net::frame::read_frame(rd).await? else {
+            break;
+        };
         let body = match frame::verify(&raw) {
             Ok(b) => b,
-            Err(e) => { tracing::debug!(?e, "dropping frame with bad checksum"); continue; }
+            Err(e) => {
+                tracing::debug!(?e, "dropping frame with bad checksum");
+                continue;
+            }
         };
         let payload = match xtea::decrypt_message(body, keys) {
             Ok(p) => p,
-            Err(e) => { tracing::debug!(?e, "dropping undecryptable frame"); continue; }
+            Err(e) => {
+                tracing::debug!(?e, "dropping undecryptable frame");
+                continue;
+            }
         };
         if let Some(&opcode) = payload.first() {
             // 0x14 — client "safe logout": the client sends this and waits for the
@@ -384,18 +424,20 @@ where
                 continue;
             }
             // 0xA2 — client follow request (parseFollow, TFS line 979-984).
-            // M7: consume and ignore (no auto-walk follow yet).
             if opcode == combat_packets::OP_FOLLOW {
+                if let Some(target_id) = combat_packets::parse_attack(&payload[1..]) {
+                    world.follow_target(id, target_id).await;
+                }
                 continue;
             }
             // 0xBE — client cancel (ESC / "Stop" hotkey). TFS parseCancelMove ->
             // Game::playerCancelAttackAndFollow clears attack + follow + stops
             // walking. The red attack square is cleared client-side on ESC, but
             // without handling this opcode `attacking` stays set and the combat
-            // tick keeps swinging. We have no follow/auto-walk yet, so clearing
-            // the fight (set_target 0) is the faithful subset.
+            // tick keeps swinging. Clearing fight + auto-walk (goto / follow).
             if opcode == combat_packets::OP_CANCEL_MOVE {
                 world.set_target(id, 0).await;
+                world.clear_auto_walk(id).await;
                 continue;
             }
             // 0xD2 — client requests the outfit-selection window.
@@ -430,13 +472,15 @@ where
             // 0x78 — client move-thing (parseThrow). Ground→ground in M10.1.
             if opcode == 0x78 {
                 if let Some(t) = protocol::move_thing::parse_throw(&payload[1..]) {
-                    world.move_thing(
-                        id,
-                        Position::new(t.from.0, t.from.1, t.from.2),
-                        t.from_stackpos,
-                        Position::new(t.to.0, t.to.1, t.to.2),
-                        t.count,
-                    ).await;
+                    world
+                        .move_thing(
+                            id,
+                            Position::new(t.from.0, t.from.1, t.from.2),
+                            t.from_stackpos,
+                            Position::new(t.to.0, t.to.1, t.to.2),
+                            t.count,
+                        )
+                        .await;
                 }
                 continue;
             }
@@ -444,7 +488,9 @@ where
             // Note: inbound 0x82 = use-item; outbound 0x82 = world-light. No conflict.
             if opcode == protocol::container::OP_USE_ITEM {
                 if let Some(u) = protocol::container::parse_use_item(&payload[1..]) {
-                    world.use_item(id, u.pos_x, u.pos_y, u.pos_z, u.stackpos, u.index).await;
+                    world
+                        .use_item(id, u.pos_x, u.pos_y, u.pos_z, u.stackpos, u.index)
+                        .await;
                 }
                 continue;
             }
@@ -463,16 +509,31 @@ where
                 continue;
             }
             // 0x64 — client auto-walk / GoTo (parseAutoWalk in TFS).
+            // Send raw steps to the actor so it derives the target from its
+            // authoritative position, avoiding the `last_pos` cache drift.
             if opcode == 0x64 {
                 if let Some(steps) = walk::parse_auto_walk(&payload[1..]) {
-                    world.auto_walk(id, steps).await;
+                    world.goto_steps(id, steps).await;
                 }
                 continue;
             }
-            let Some((direction, is_turn)) = opcode_action(opcode) else { continue };
+            let Some((direction, is_turn)) = opcode_action(opcode) else {
+                continue;
+            };
             if is_turn {
                 world.turn_player(id, direction).await;
             } else {
+                // Update best-effort position cache for 0x64 derivation.
+                if let Some(pos) = last_pos {
+                    let (dx, dy) = direction.delta();
+                    let nx = i32::from(pos.0) + dx;
+                    let ny = i32::from(pos.1) + dy;
+                    if (0..=i32::from(u16::MAX)).contains(&nx)
+                        && (0..=i32::from(u16::MAX)).contains(&ny)
+                    {
+                        last_pos = Some((nx as u16, ny as u16, pos.2));
+                    }
+                }
                 world.move_player(id, direction).await;
             }
         }
@@ -525,11 +586,7 @@ where
     Ok(())
 }
 
-async fn send_disconnect<S>(
-    stream: &mut S,
-    keys: &xtea::RoundKeys,
-    message: &str,
-) -> Result<()>
+async fn send_disconnect<S>(stream: &mut S, keys: &xtea::RoundKeys, message: &str) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -553,7 +610,16 @@ mod tests {
             major_version: 3,
             minor_version: 57,
             build_number: 0,
-            items: vec![ItemType { group: 0, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE }],
+            items: vec![ItemType {
+                group: 0,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            }],
         };
         let map = OtbmMap {
             width: 200,
@@ -570,7 +636,11 @@ mod tests {
                     z: 7,
                     flags: 0,
                     house_id: None,
-                    items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
                 },
                 MapTile {
                     x: 96,
@@ -578,13 +648,26 @@ mod tests {
                     z: 7,
                     flags: 0,
                     house_id: None,
-                    items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
                 },
             ],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 95,
+                y: 117,
+                z: 7,
+            }],
             waypoints: vec![],
         };
-        let (handle, _save_rx) = world::game::spawn(Arc::new(StaticMap::from_formats(&map, &items)), Default::default());
+        let (handle, _save_rx) = world::game::spawn(
+            Arc::new(StaticMap::from_formats(&map, &items)),
+            Default::default(),
+        );
         handle
     }
 
@@ -604,7 +687,9 @@ mod tests {
             let store = store.clone();
             tokio::spawn(async move {
                 let rsa = RsaPrivateKey::open_tibia();
-                handle_game(server, &rsa, &world, &store, ts, rnd).await.unwrap();
+                handle_game(server, &rsa, &world, &store, ts, rnd)
+                    .await
+                    .unwrap();
             })
         };
 
@@ -646,7 +731,10 @@ mod tests {
         let self_len = 29;
         assert_eq!(burst[self_len], enter_world::OP_PENDING_STATE);
         assert_eq!(burst[self_len + 1], enter_world::OP_ENTER_WORLD);
-        assert_eq!(burst[self_len + 2], protocol::map_description::OPCODE_MAP_DESCRIPTION);
+        assert_eq!(
+            burst[self_len + 2],
+            protocol::map_description::OPCODE_MAP_DESCRIPTION
+        );
 
         // Send a walk-east (0x66) and expect a 0x6D creature move back.
         let mut walk_pkt = protocol::message::MessageWriter::new();
@@ -703,7 +791,7 @@ mod tests {
         drop(client);
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            reader_loop(&mut rd, &keys, &world, 1),
+            reader_loop(&mut rd, &keys, &world, 1, None),
         )
         .await;
         assert!(res.is_ok(), "reader_loop must not hang on 0xA1");
@@ -729,7 +817,7 @@ mod tests {
         drop(client);
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            reader_loop(&mut rd, &keys, &world, 1),
+            reader_loop(&mut rd, &keys, &world, 1, None),
         )
         .await;
         assert!(res.is_ok(), "reader_loop must not hang on 0xA2");
@@ -758,7 +846,7 @@ mod tests {
         drop(client);
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            reader_loop(&mut rd, &keys, &world, 1),
+            reader_loop(&mut rd, &keys, &world, 1, None),
         )
         .await;
         assert!(res.is_ok(), "reader_loop must not hang on 0xBE");
@@ -788,10 +876,13 @@ mod tests {
         // drain the opcode and block on the next read_frame forever (timeout).
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            reader_loop(&mut rd, &keys, &world, 1),
+            reader_loop(&mut rd, &keys, &world, 1, None),
         )
         .await;
-        assert!(res.is_ok(), "reader_loop must return on 0x14 without waiting for EOF");
+        assert!(
+            res.is_ok(),
+            "reader_loop must return on 0x14 without waiting for EOF"
+        );
         res.unwrap().unwrap();
     }
 
@@ -855,13 +946,21 @@ mod tests {
     #[test]
     fn save_record_maps_to_player_save_correctly() {
         // RED: save_record_to_player_save maps SaveRecord into PlayerSave.
-        use world::game::SaveRecord;
         use world::Position;
+        use world::game::SaveRecord;
         let rec = SaveRecord {
             name: "Hero".into(),
             position: Position::new(100, 200, 7),
             direction: world::Direction::West,
-            outfit: creature::Outfit { look_type: 128, head: 1, body: 2, legs: 3, feet: 4, addons: 0, mount: 5 },
+            outfit: creature::Outfit {
+                look_type: 128,
+                head: 1,
+                body: 2,
+                legs: 3,
+                feet: 4,
+                addons: 0,
+                mount: 5,
+            },
             health: 80,
             max_health: 160,
             sex: 0, // female
@@ -897,21 +996,43 @@ mod tests {
             minor_version: 57,
             build_number: 0,
             items: vec![ItemType {
-                group: 1, flags: 0, server_id: 100, client_id: 4526,
-                always_on_top: false, top_order: 0, has_height: false,
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
                 floor_change: formats::items_xml::FloorChange::NONE,
             }],
         };
         let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
             tiles: vec![MapTile {
-                x: 100, y: 100, z: 7,
+                x: 100,
+                y: 100,
+                z: 7,
                 flags: 1, // PZ bit
                 house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+                items: vec![MapItem {
+                    id: 100,
+                    count: None,
+                    contents: vec![],
+                }],
             }],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 100,
+                y: 100,
+                z: 7,
+            }],
             waypoints: vec![],
         };
         Arc::new(StaticMap::from_formats(&map, &items))
@@ -920,7 +1041,11 @@ mod tests {
     #[test]
     fn burst_includes_pz_icon_when_spawn_in_protection_zone() {
         let map = pz_test_map();
-        let center = Center { x: 100, y: 100, z: 7 };
+        let center = Center {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
         let player = EnterWorldPlayer {
             id: 0x1000_0000,
             health: 150,
@@ -931,7 +1056,9 @@ mod tests {
         // (map_description is empty here; this test only asserts the PZ icon.)
         // The icons packet [0xA2, lo, hi] for ICON_PIGEON (0x4000) must be present.
         assert!(
-            burst.windows(3).any(|w| w == [enter_world::OP_ICONS, 0x00, 0x40]),
+            burst
+                .windows(3)
+                .any(|w| w == [enter_world::OP_ICONS, 0x00, 0x40]),
             "burst must carry ICON_PIGEON when spawning in a PZ"
         );
     }

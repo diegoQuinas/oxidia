@@ -12,9 +12,9 @@
 //!
 //! Ref: TFS `iomap.cpp` / `iomap.h`.
 
+use crate::FormatError;
 use crate::node::Node;
 use crate::props::PropReader;
-use crate::FormatError;
 
 // Node types (OTBM_NodeTypes_t).
 const OTBM_MAP_DATA: u8 = 2;
@@ -144,7 +144,9 @@ pub fn parse(data: &[u8]) -> Result<OtbmMap, FormatError> {
         .children
         .iter()
         .find(|c| c.kind == OTBM_MAP_DATA)
-        .ok_or(FormatError::InvalidNode { what: "missing OTBM_MAP_DATA node" })?;
+        .ok_or(FormatError::InvalidNode {
+            what: "missing OTBM_MAP_DATA node",
+        })?;
 
     let mut map = OtbmMap {
         width,
@@ -166,7 +168,11 @@ pub fn parse(data: &[u8]) -> Result<OtbmMap, FormatError> {
             OTBM_TILE_AREA => parse_tile_area(node, &mut map.tiles)?,
             OTBM_TOWNS => parse_towns(node, &mut map.towns)?,
             OTBM_WAYPOINTS => parse_waypoints(node, &mut map.waypoints)?,
-            _ => return Err(FormatError::InvalidNode { what: "unknown map-data child node" }),
+            _ => {
+                return Err(FormatError::InvalidNode {
+                    what: "unknown map-data child node",
+                });
+            }
         }
     }
 
@@ -190,7 +196,11 @@ fn parse_map_data_attrs(props: &[u8], map: &mut OtbmMap) -> Result<(), FormatErr
             }
             OTBM_ATTR_EXT_SPAWN_FILE => map.spawn_file = Some(r.read_string()?),
             OTBM_ATTR_EXT_HOUSE_FILE => map.house_file = Some(r.read_string()?),
-            _ => return Err(FormatError::InvalidNode { what: "unknown map-data attribute" }),
+            _ => {
+                return Err(FormatError::InvalidNode {
+                    what: "unknown map-data attribute",
+                });
+            }
         }
     }
     Ok(())
@@ -205,7 +215,9 @@ fn parse_tile_area(node: &Node, out: &mut Vec<MapTile>) -> Result<(), FormatErro
 
     for tile_node in &node.children {
         if tile_node.kind != OTBM_TILE && tile_node.kind != OTBM_HOUSETILE {
-            return Err(FormatError::InvalidNode { what: "unknown tile node" });
+            return Err(FormatError::InvalidNode {
+                what: "unknown tile node",
+            });
         }
         out.push(parse_tile(tile_node, base_x, base_y, z)?);
     }
@@ -218,7 +230,11 @@ fn parse_tile(node: &Node, base_x: u16, base_y: u16, z: u8) -> Result<MapTile, F
     let x = base_x + r.read_u8()? as u16;
     let y = base_y + r.read_u8()? as u16;
 
-    let house_id = if node.kind == OTBM_HOUSETILE { Some(r.read_u32()?) } else { None };
+    let house_id = if node.kind == OTBM_HOUSETILE {
+        Some(r.read_u32()?)
+    } else {
+        None
+    };
 
     let mut flags = 0;
     let mut items = Vec::new();
@@ -227,20 +243,37 @@ fn parse_tile(node: &Node, base_x: u16, base_y: u16, z: u8) -> Result<MapTile, F
         match attr {
             OTBM_ATTR_TILE_FLAGS => flags = r.read_u32()?,
             // Inline ground item: Item::CreateItem reads exactly a u16 id.
-            OTBM_ATTR_ITEM => items.push(MapItem { id: r.read_u16()?, count: None, contents: vec![] }),
-            _ => return Err(FormatError::InvalidNode { what: "unknown tile attribute" }),
+            OTBM_ATTR_ITEM => items.push(MapItem {
+                id: r.read_u16()?,
+                count: None,
+                contents: vec![],
+            }),
+            _ => {
+                return Err(FormatError::InvalidNode {
+                    what: "unknown tile attribute",
+                });
+            }
         }
     }
 
     // Stacked items are stored as child OTBM_ITEM nodes.
     for item_node in &node.children {
         if item_node.kind != OTBM_ITEM {
-            return Err(FormatError::InvalidNode { what: "unknown tile child node" });
+            return Err(FormatError::InvalidNode {
+                what: "unknown tile child node",
+            });
         }
         items.push(parse_item(item_node)?);
     }
 
-    Ok(MapTile { x, y, z, flags, house_id, items })
+    Ok(MapTile {
+        x,
+        y,
+        z,
+        flags,
+        house_id,
+        items,
+    })
 }
 
 /// Parse an OTBM_ITEM node: leading u16 id, then attributes (we capture COUNT),
@@ -256,31 +289,50 @@ fn parse_item(node: &Node) -> Result<MapItem, FormatError> {
             OTBM_ATTR_COUNT => count = Some(r.read_u8()?),
             // RUNE_CHARGES is a u8 (TFS `item.cpp:366-367` reads it like COUNT),
             // not a u16 — read one byte and discard (not a stack count).
-            OTBM_ATTR_RUNE_CHARGES => { r.read_u8()?; }
-            OTBM_ATTR_ACTION_ID | OTBM_ATTR_UNIQUE_ID | OTBM_ATTR_DEPOT_ID
-            | OTBM_ATTR_CHARGES => { r.read_u16()?; }
-            OTBM_ATTR_TELE_DEST => { r.skip(5)?; } // x u16, y u16, z u8
-            OTBM_ATTR_DURATION | OTBM_ATTR_WRITTENDATE => { r.read_u32()?; }
-            OTBM_ATTR_DECAYING_STATE => { r.read_u8()?; }
-            OTBM_ATTR_TEXT | OTBM_ATTR_DESC | OTBM_ATTR_WRITTENBY => { r.read_string()?; }
+            OTBM_ATTR_RUNE_CHARGES => {
+                r.read_u8()?;
+            }
+            OTBM_ATTR_ACTION_ID | OTBM_ATTR_UNIQUE_ID | OTBM_ATTR_DEPOT_ID | OTBM_ATTR_CHARGES => {
+                r.read_u16()?;
+            }
+            OTBM_ATTR_TELE_DEST => {
+                r.skip(5)?;
+            } // x u16, y u16, z u8
+            OTBM_ATTR_DURATION | OTBM_ATTR_WRITTENDATE => {
+                r.read_u32()?;
+            }
+            OTBM_ATTR_DECAYING_STATE => {
+                r.read_u8()?;
+            }
+            OTBM_ATTR_TEXT | OTBM_ATTR_DESC | OTBM_ATTR_WRITTENBY => {
+                r.read_string()?;
+            }
             _ => break, // unknown attr: stop (leftover bytes ignored, as before)
         }
     }
     let mut contents = Vec::with_capacity(node.children.len());
     for child in &node.children {
         if child.kind != OTBM_ITEM {
-            return Err(FormatError::InvalidNode { what: "unknown contained item node" });
+            return Err(FormatError::InvalidNode {
+                what: "unknown contained item node",
+            });
         }
         contents.push(parse_item(child)?);
     }
-    Ok(MapItem { id, count, contents })
+    Ok(MapItem {
+        id,
+        count,
+        contents,
+    })
 }
 
 /// Parse the TOWNS node.
 fn parse_towns(node: &Node, out: &mut Vec<Town>) -> Result<(), FormatError> {
     for town_node in &node.children {
         if town_node.kind != OTBM_TOWN {
-            return Err(FormatError::InvalidNode { what: "unknown town node" });
+            return Err(FormatError::InvalidNode {
+                what: "unknown town node",
+            });
         }
         let mut r = PropReader::new(&town_node.props);
         let id = r.read_u32()?;
@@ -297,7 +349,9 @@ fn parse_towns(node: &Node, out: &mut Vec<Town>) -> Result<(), FormatError> {
 fn parse_waypoints(node: &Node, out: &mut Vec<Waypoint>) -> Result<(), FormatError> {
     for wp_node in &node.children {
         if wp_node.kind != OTBM_WAYPOINT {
-            return Err(FormatError::InvalidNode { what: "unknown waypoint node" });
+            return Err(FormatError::InvalidNode {
+                what: "unknown waypoint node",
+            });
         }
         let mut r = PropReader::new(&wp_node.props);
         let name = r.read_string()?;
@@ -440,8 +494,22 @@ mod tests {
         assert_eq!(tile.flags, 1);
         assert_eq!(tile.house_id, None);
         assert_eq!(tile.items.len(), 2);
-        assert_eq!(tile.items[0], MapItem { id: 4526, count: None, contents: vec![] });
-        assert_eq!(tile.items[1], MapItem { id: 1234, count: None, contents: vec![] });
+        assert_eq!(
+            tile.items[0],
+            MapItem {
+                id: 4526,
+                count: None,
+                contents: vec![]
+            }
+        );
+        assert_eq!(
+            tile.items[1],
+            MapItem {
+                id: 1234,
+                count: None,
+                contents: vec![]
+            }
+        );
     }
 
     #[test]
@@ -449,11 +517,22 @@ mod tests {
         let map = parse(&synthetic_otbm()).unwrap();
         assert_eq!(
             map.towns,
-            vec![Town { id: 1, name: "Thais".into(), x: 15, y: 25, z: 7 }]
+            vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 15,
+                y: 25,
+                z: 7
+            }]
         );
         assert_eq!(
             map.waypoints,
-            vec![Waypoint { name: "temple".into(), x: 15, y: 25, z: 7 }]
+            vec![Waypoint {
+                name: "temple".into(),
+                x: 15,
+                y: 25,
+                z: 7
+            }]
         );
     }
 
@@ -543,6 +622,9 @@ mod tests {
         let items = &map.tiles[0].items;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, item_id);
-        assert_eq!(items[0].count, None, "unknown trailing attr yields count: None");
+        assert_eq!(
+            items[0].count, None,
+            "unknown trailing attr yields count: None"
+        );
     }
 }

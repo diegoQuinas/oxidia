@@ -41,10 +41,14 @@ pub struct Node {
 pub fn parse_tree(data: &[u8]) -> Result<Node, FormatError> {
     // [u8;4 identifier][0xFE][root-type] ...
     if data.len() < 6 {
-        return Err(FormatError::UnexpectedEof { what: "node header" });
+        return Err(FormatError::UnexpectedEof {
+            what: "node header",
+        });
     }
     if data[4] != START {
-        return Err(FormatError::InvalidNode { what: "missing root start marker" });
+        return Err(FormatError::InvalidNode {
+            what: "missing root start marker",
+        });
     }
     let kind = data[5];
     let mut pos = 6;
@@ -58,23 +62,31 @@ fn parse_node(data: &[u8], pos: &mut usize, kind: u8) -> Result<Node, FormatErro
     let mut props = Vec::new();
     let mut children = Vec::new();
     loop {
-        let byte = *data.get(*pos).ok_or(FormatError::UnexpectedEof { what: "node body" })?;
+        let byte = *data
+            .get(*pos)
+            .ok_or(FormatError::UnexpectedEof { what: "node body" })?;
         match byte {
             START => {
                 *pos += 1;
-                let child_kind =
-                    *data.get(*pos).ok_or(FormatError::UnexpectedEof { what: "child type" })?;
+                let child_kind = *data
+                    .get(*pos)
+                    .ok_or(FormatError::UnexpectedEof { what: "child type" })?;
                 *pos += 1;
                 children.push(parse_node(data, pos, child_kind)?);
             }
             END => {
                 *pos += 1;
-                return Ok(Node { kind, props, children });
+                return Ok(Node {
+                    kind,
+                    props,
+                    children,
+                });
             }
             ESCAPE => {
                 *pos += 1;
-                let literal =
-                    *data.get(*pos).ok_or(FormatError::UnexpectedEof { what: "escaped byte" })?;
+                let literal = *data.get(*pos).ok_or(FormatError::UnexpectedEof {
+                    what: "escaped byte",
+                })?;
                 props.push(literal);
                 *pos += 1;
             }

@@ -7,7 +7,9 @@ impl Game {
     /// TFS "You see …" text, and push `0xB4`. Mirrors `Game::playerLookAt`
     /// (game.cpp:3100): resolve thing, canSee check, distance, describe.
     pub(super) fn do_look(&mut self, id: u32, x: u16, y: u16, z: u8, stackpos: u8) {
-        let Some(looker) = self.players.get(&id) else { return };
+        let Some(looker) = self.players.get(&id) else {
+            return;
+        };
         let looker_pos = looker.position;
         let gm = looker.gamemaster;
         let pos = Position::new(x, y, z);
@@ -37,8 +39,12 @@ impl Game {
 
     /// Handle `0x8D` look-in-battle-list: describe a creature by id.
     pub(super) fn do_look_battle(&mut self, id: u32, target_id: u32) {
-        let Some(looker) = self.players.get(&id) else { return };
-        let Some(target) = self.players.get(&target_id) else { return };
+        let Some(looker) = self.players.get(&id) else {
+            return;
+        };
+        let Some(target) = self.players.get(&target_id) else {
+            return;
+        };
         if !Self::can_see(looker.position, target.position) {
             return;
         }
@@ -128,8 +134,8 @@ impl Game {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_support::*;
+    use super::*;
     use formats::items_xml::{FloorChange, ItemsXml, parse_items_xml};
     use formats::otb::{ItemType as OtbItemType, ItemsOtb};
     use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
@@ -149,7 +155,10 @@ mod tests {
         // Must contain "You see a stone."
         assert!(text.contains("You see a stone."), "text: {text:?}");
         // Adjacent → must show weight line: "It weighs 1.10 oz."
-        assert!(text.contains("It weighs 1.10 oz."), "adjacent item must show weight; text: {text:?}");
+        assert!(
+            text.contains("It weighs 1.10 oz."),
+            "adjacent item must show weight; text: {text:?}"
+        );
     }
 
     #[test]
@@ -163,7 +172,10 @@ mod tests {
         let text = recv_look_text(&mut rx);
         assert!(text.contains("You see a stone."), "text: {text:?}");
         // Distance ≥ 2 → no weight line
-        assert!(!text.contains("weighs"), "far look must NOT show weight; text: {text:?}");
+        assert!(
+            !text.contains("weighs"),
+            "far look must NOT show weight; text: {text:?}"
+        );
     }
 
     #[test]
@@ -174,7 +186,10 @@ mod tests {
         // stackpos 0 = ground at (100,100,7) itself
         g.do_look(looker, 100, 100, 7, 0);
         let text = recv_look_text(&mut rx);
-        assert!(!text.contains("weighs"), "non-pickupable item must not show weight; text: {text:?}");
+        assert!(
+            !text.contains("weighs"),
+            "non-pickupable item must not show weight; text: {text:?}"
+        );
     }
 
     #[test]
@@ -197,19 +212,36 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(PUSH_CAPACITY);
         let target_id = g.next_id;
         g.next_id += 1;
-        g.players.insert(target_id, PlayerState {
-            name: "Alice".into(), position: Position::new(100, 100, 7),
-            direction: Direction::South, outfit: knight(), push_tx: tx2,
-            known: HashSet::new(), health: 150, max_health: 150, fist_skill: 10,
-            attacking: None, last_attack_ms: 0,
-            sex: 0, // female
-            gamemaster: false,
-            ghost: false,
-            prev_outfit: None,
-            noclip: false,
-            inventory: [None; 10],
-            open_containers: std::array::from_fn(|_| None),
-        });
+        g.players.insert(
+            target_id,
+            PlayerState {
+                name: "Alice".into(),
+                position: Position::new(100, 100, 7),
+                direction: Direction::South,
+                outfit: knight(),
+                push_tx: tx2,
+                known: HashSet::new(),
+                health: 150,
+                max_health: 150,
+                fist_skill: 10,
+                attacking: None,
+                last_attack_ms: 0,
+                sex: 0, // female
+                gamemaster: false,
+                ghost: false,
+                prev_outfit: None,
+                noclip: false,
+                speed: 220,
+                inventory: [None; 10],
+                open_containers: std::array::from_fn(|_| None),
+                follow_target: None,
+                go_to_position: None,
+                failed_repaths: None,
+                list_walk_dir: VecDeque::new(),
+                last_walk_ms: 0,
+                conditions: Vec::new(),
+            },
+        );
         // Looker is at the same tile; tile pre_creature_len is 1 (just the ground),
         // creatures = [looker_id, target_id] (sorted). stackpos 1 = first creature
         // (the lower id), stackpos 2 = second. Since both players are at (100,100,7)
@@ -219,12 +251,18 @@ mod tests {
         g.do_look(looker, 100, 100, 7, 2);
         let text = recv_look_text(&mut rx);
         assert!(text.contains("Alice (Level 1)."), "text: {text:?}");
-        assert!(text.contains("She has no vocation."), "female pronoun; text: {text:?}");
+        assert!(
+            text.contains("She has no vocation."),
+            "female pronoun; text: {text:?}"
+        );
         // Now change to male and re-verify.
         g.players.get_mut(&target_id).unwrap().sex = 1;
         g.do_look(looker, 100, 100, 7, 2);
         let text2 = recv_look_text(&mut rx);
-        assert!(text2.contains("He has no vocation."), "male pronoun; text2: {text2:?}");
+        assert!(
+            text2.contains("He has no vocation."),
+            "male pronoun; text2: {text2:?}"
+        );
     }
 
     #[test]
@@ -247,8 +285,10 @@ mod tests {
         // Look at stone (sid 200) at (101,100,7), stackpos 1.
         g.do_look(looker, 101, 100, 7, 1);
         let text = recv_look_text(&mut rx);
-        assert!(text.ends_with("\nItem ID: 200\nPosition: 101, 100, 7"),
-            "GM look must end with Item ID and Position; text: {text:?}");
+        assert!(
+            text.ends_with("\nItem ID: 200\nPosition: 101, 100, 7"),
+            "GM look must end with Item ID and Position; text: {text:?}"
+        );
     }
 
     #[test]
@@ -258,8 +298,14 @@ mod tests {
         // gamemaster = false (default)
         g.do_look(looker, 101, 100, 7, 1);
         let text = recv_look_text(&mut rx);
-        assert!(!text.contains("Item ID:"), "non-GM must not see Item ID; text: {text:?}");
-        assert!(!text.contains("Position:"), "non-GM must not see Position; text: {text:?}");
+        assert!(
+            !text.contains("Item ID:"),
+            "non-GM must not see Item ID; text: {text:?}"
+        );
+        assert!(
+            !text.contains("Position:"),
+            "non-GM must not see Position; text: {text:?}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -269,29 +315,85 @@ mod tests {
     #[test]
     fn do_look_always_on_top_static_item_shows_correct_name() {
         let otb_items = vec![
-            OtbItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
-            OtbItemType { group: 0, flags: 0x0400_2000, server_id: 1386, client_id: 1948,
-                always_on_top: true, top_order: 2, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
+            OtbItemType {
+                group: 0,
+                flags: 0x0400_2000,
+                server_id: 1386,
+                client_id: 1948,
+                always_on_top: true,
+                top_order: 2,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
         ];
-        let otb = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: otb_items };
+        let otb = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: otb_items,
+        };
         let xml_str = r#"<items>
           <item id="1386" article="a" name="ladder"/>
         </items>"#;
         let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
         let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
             tiles: vec![
-                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
-                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None,
+                MapTile {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
+                },
+                MapTile {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
                     items: vec![
-                        MapItem { id: 100, count: None, contents: vec![] },
-                        MapItem { id: 1386, count: None, contents: vec![] }, // always_on_top ladder
-                    ] },
+                        MapItem {
+                            id: 100,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 1386,
+                            count: None,
+                            contents: vec![],
+                        }, // always_on_top ladder
+                    ],
+                },
             ],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 100,
+                y: 100,
+                z: 7,
+            }],
             waypoints: vec![],
         };
         let mut sm = StaticMap::from_formats(&map, &otb);
@@ -304,36 +406,94 @@ mod tests {
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_look(looker, 101, 100, 7, 1);
         let text = recv_look_text(&mut rx);
-        assert!(text.contains("You see a ladder."),
-            "static always_on_top item must resolve as ladder; got: {text:?}");
+        assert!(
+            text.contains("You see a ladder."),
+            "static always_on_top item must resolve as ladder; got: {text:?}"
+        );
     }
 
     #[test]
     fn do_look_always_on_top_static_item_with_creature_on_tile() {
         let otb_items = vec![
-            OtbItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
-            OtbItemType { group: 0, flags: 0x0400_2000, server_id: 1386, client_id: 1948,
-                always_on_top: true, top_order: 2, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
+            OtbItemType {
+                group: 0,
+                flags: 0x0400_2000,
+                server_id: 1386,
+                client_id: 1948,
+                always_on_top: true,
+                top_order: 2,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
         ];
-        let otb = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: otb_items };
+        let otb = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: otb_items,
+        };
         let xml_str = r#"<items>
           <item id="1386" article="a" name="ladder"/>
         </items>"#;
         let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
         let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
             tiles: vec![
-                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
-                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None,
+                MapTile {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
+                },
+                MapTile {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
                     items: vec![
-                        MapItem { id: 100, count: None, contents: vec![] },
-                        MapItem { id: 1386, count: None, contents: vec![] },
-                    ] },
+                        MapItem {
+                            id: 100,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 1386,
+                            count: None,
+                            contents: vec![],
+                        },
+                    ],
+                },
             ],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 100,
+                y: 100,
+                z: 7,
+            }],
             waypoints: vec![],
         };
         let mut sm = StaticMap::from_formats(&map, &otb);
@@ -348,13 +508,17 @@ mod tests {
         // Ladder is at stackpos 1 (pre_creature, before creature)
         g.do_look(looker, 101, 100, 7, 1);
         let text = recv_look_text(&mut rx);
-        assert!(text.contains("You see a ladder."),
-            "must resolve ladder even with creature on tile; got: {text:?}");
+        assert!(
+            text.contains("You see a ladder."),
+            "must resolve ladder even with creature on tile; got: {text:?}"
+        );
         // Verify player is at stackpos 2
         g.do_look(looker, 101, 100, 7, 2);
         let player_text = recv_look_text(&mut rx);
-        assert!(player_text.contains("Tester"),
-            "must resolve creature at stackpos 2; got: {player_text:?}");
+        assert!(
+            player_text.contains("Tester"),
+            "must resolve creature at stackpos 2; got: {player_text:?}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -364,27 +528,65 @@ mod tests {
     #[test]
     fn do_look_spawned_item_shows_correct_name() {
         let otb_items = vec![
-            OtbItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
-            OtbItemType { group: 0, flags: 0x0400_2000, server_id: 1386, client_id: 1948,
-                always_on_top: true, top_order: 2, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
+            OtbItemType {
+                group: 0,
+                flags: 0x0400_2000,
+                server_id: 1386,
+                client_id: 1948,
+                always_on_top: true,
+                top_order: 2,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
         ];
-        let otb = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: otb_items };
+        let otb = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: otb_items,
+        };
         let xml_str = r#"<items>
           <item id="1386" article="a" name="ladder"/>
         </items>"#;
         let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
         let g = |x: u16, y: u16| MapTile {
-            x, y, z: 7, flags: 0, house_id: None,
-            items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+            x,
+            y,
+            z: 7,
+            flags: 0,
+            house_id: None,
+            items: vec![MapItem {
+                id: 100,
+                count: None,
+                contents: vec![],
+            }],
         };
         let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
-            tiles: vec![
-                g(100, 100), g(101, 100),
-            ],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles: vec![g(100, 100), g(101, 100)],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 100,
+                y: 100,
+                z: 7,
+            }],
             waypoints: vec![],
         };
         let mut sm = StaticMap::from_formats(&map, &otb);
@@ -401,34 +603,78 @@ mod tests {
         // (pre=1, creatures=1 → pos 2)
         g.do_look(gm, 100, 100, 7, 2);
         let text = recv_look_text(&mut rx);
-        assert!(text.contains("ladder"), "spawned item look must contain 'ladder'; got: {text:?}");
-        assert!(text.contains("You see a ladder."), "full text must be correct; got: {text:?}");
+        assert!(
+            text.contains("ladder"),
+            "spawned item look must contain 'ladder'; got: {text:?}"
+        );
+        assert!(
+            text.contains("You see a ladder."),
+            "full text must be correct; got: {text:?}"
+        );
     }
 
     #[test]
     fn do_look_spawned_item_after_player_moves_shows_correct_name() {
         let otb_items = vec![
-            OtbItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
-            OtbItemType { group: 0, flags: 0x0400_2000, server_id: 1386, client_id: 1948,
-                always_on_top: true, top_order: 2, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
+            OtbItemType {
+                group: 0,
+                flags: 0x0400_2000,
+                server_id: 1386,
+                client_id: 1948,
+                always_on_top: true,
+                top_order: 2,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
         ];
-        let otb = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: otb_items };
+        let otb = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: otb_items,
+        };
         let xml_str = r#"<items>
           <item id="1386" article="a" name="ladder"/>
         </items>"#;
         let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
         let g = |x: u16, y: u16| MapTile {
-            x, y, z: 7, flags: 0, house_id: None,
-            items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+            x,
+            y,
+            z: 7,
+            flags: 0,
+            house_id: None,
+            items: vec![MapItem {
+                id: 100,
+                count: None,
+                contents: vec![],
+            }],
         };
         let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
-            tiles: vec![
-                g(100, 100), g(101, 100),
-            ],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles: vec![g(100, 100), g(101, 100)],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 100,
+                y: 100,
+                z: 7,
+            }],
             waypoints: vec![],
         };
         let mut sm = StaticMap::from_formats(&map, &otb);
@@ -445,7 +691,10 @@ mod tests {
         // (pre=1, creatures=0 → pos 1)
         g.do_look(gm, 100, 100, 7, 1);
         let text = recv_look_text(&mut rx);
-        assert!(text.contains("ladder"), "spawned item look (no creature) must contain 'ladder'; got: {text:?}");
+        assert!(
+            text.contains("ladder"),
+            "spawned item look (no creature) must contain 'ladder'; got: {text:?}"
+        );
     }
 
     #[test]
@@ -455,6 +704,9 @@ mod tests {
         // (dx = 50 > 9) must produce no packet.
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_look(looker, 150, 100, 7, 0);
-        assert!(rx.try_recv().is_err(), "look outside viewport must push nothing");
+        assert!(
+            rx.try_recv().is_err(),
+            "look outside viewport must push nothing"
+        );
     }
 }

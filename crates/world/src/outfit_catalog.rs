@@ -148,22 +148,38 @@ mod tests {
 
     #[test]
     fn female_catalog_has_55_entries() {
-        assert_eq!(FEMALE.len(), 55, "female catalog must mirror the 55 type=0 entries in outfits.xml");
+        assert_eq!(
+            FEMALE.len(),
+            55,
+            "female catalog must mirror the 55 type=0 entries in outfits.xml"
+        );
     }
 
     #[test]
     fn male_catalog_has_55_entries() {
-        assert_eq!(MALE.len(), 55, "male catalog must mirror the 55 type=1 entries in outfits.xml");
+        assert_eq!(
+            MALE.len(),
+            55,
+            "male catalog must mirror the 55 type=1 entries in outfits.xml"
+        );
     }
 
     #[test]
     fn female_catalog_first_entry_is_136_citizen() {
-        assert_eq!(FEMALE[0], (136, b"Citizen" as &[u8]), "female Citizen is look_type 136");
+        assert_eq!(
+            FEMALE[0],
+            (136, b"Citizen" as &[u8]),
+            "female Citizen is look_type 136"
+        );
     }
 
     #[test]
     fn male_catalog_first_entry_is_128_citizen() {
-        assert_eq!(MALE[0], (128, b"Citizen" as &[u8]), "male Citizen is look_type 128");
+        assert_eq!(
+            MALE[0],
+            (128, b"Citizen" as &[u8]),
+            "male Citizen is look_type 128"
+        );
     }
 
     #[test]

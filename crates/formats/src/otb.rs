@@ -7,9 +7,9 @@
 //!
 //! Ref: TFS `items.cpp::loadFromOtb` and `itemloader.h`.
 
+use crate::FormatError;
 use crate::node::Node;
 use crate::props::PropReader;
-use crate::FormatError;
 
 /// Root attribute: version block.
 const ROOT_ATTR_VERSION: u8 = 0x01;
@@ -133,7 +133,12 @@ pub fn parse(data: &[u8]) -> Result<ItemsOtb, FormatError> {
         items.push(parse_item(item_node)?);
     }
 
-    Ok(ItemsOtb { major_version, minor_version, build_number, items })
+    Ok(ItemsOtb {
+        major_version,
+        minor_version,
+        build_number,
+        items,
+    })
 }
 
 /// Read the root version block: `[u32 flags][u8 ROOT_ATTR_VERSION][u16 len][major][minor][build]`.
@@ -142,7 +147,9 @@ fn parse_version(props: &[u8]) -> Result<(u32, u32, u32), FormatError> {
     let _flags = r.read_u32()?;
     let attr = r.read_u8()?;
     if attr != ROOT_ATTR_VERSION {
-        return Err(FormatError::InvalidNode { what: "expected items.otb version attribute" });
+        return Err(FormatError::InvalidNode {
+            what: "expected items.otb version attribute",
+        });
     }
     let _datalen = r.read_u16()?;
     let major = r.read_u32()?;
@@ -316,16 +323,28 @@ mod tests {
     fn is_moveable_returns_true_when_flag_bit_set() {
         // FLAG_MOVEABLE = bit 6
         let it = item_type_with_flags(FLAG_MOVEABLE);
-        assert!(it.is_moveable(), "item with FLAG_MOVEABLE must report is_moveable()");
-        assert!(!it.is_block_projectile(), "FLAG_MOVEABLE must not set is_block_projectile()");
+        assert!(
+            it.is_moveable(),
+            "item with FLAG_MOVEABLE must report is_moveable()"
+        );
+        assert!(
+            !it.is_block_projectile(),
+            "FLAG_MOVEABLE must not set is_block_projectile()"
+        );
     }
 
     #[test]
     fn is_block_projectile_returns_true_when_flag_bit_set() {
         // FLAG_BLOCK_PROJECTILE = bit 1
         let it = item_type_with_flags(FLAG_BLOCK_PROJECTILE);
-        assert!(it.is_block_projectile(), "item with FLAG_BLOCK_PROJECTILE must report is_block_projectile()");
-        assert!(!it.is_moveable(), "FLAG_BLOCK_PROJECTILE must not set is_moveable()");
+        assert!(
+            it.is_block_projectile(),
+            "item with FLAG_BLOCK_PROJECTILE must report is_block_projectile()"
+        );
+        assert!(
+            !it.is_moveable(),
+            "FLAG_BLOCK_PROJECTILE must not set is_moveable()"
+        );
     }
 
     #[test]
@@ -333,7 +352,10 @@ mod tests {
         // An item with no relevant flags must report both false.
         let it = item_type_with_flags(0);
         assert!(!it.is_moveable(), "no flags → is_moveable() is false");
-        assert!(!it.is_block_projectile(), "no flags → is_block_projectile() is false");
+        assert!(
+            !it.is_block_projectile(),
+            "no flags → is_block_projectile() is false"
+        );
     }
 
     #[test]

@@ -1,41 +1,19 @@
 //! Movement, turning, and teleport for the game actor.
 
 use super::*;
-use protocol::walk::AutoWalkStep;
-
-/// Map an auto-walk step direction (from client `0x64` GoTo) to the [`Direction`]
-/// used by [`Game::do_move`].
-fn auto_walk_step_to_direction(step: AutoWalkStep) -> Direction {
-    match step {
-        AutoWalkStep::North => Direction::North,
-        AutoWalkStep::East => Direction::East,
-        AutoWalkStep::South => Direction::South,
-        AutoWalkStep::West => Direction::West,
-        AutoWalkStep::NorthEast => Direction::NorthEast,
-        AutoWalkStep::SouthEast => Direction::SouthEast,
-        AutoWalkStep::SouthWest => Direction::SouthWest,
-        AutoWalkStep::NorthWest => Direction::NorthWest,
-    }
-}
 
 impl Game {
-    /// Process a `0x64` auto-walk (GoTo) path from the client.
-    /// Each step is run through [`do_move`] so noclip/ghost bypass applies.
-    pub(super) fn do_auto_walk(&mut self, id: u32, steps: Vec<AutoWalkStep>) {
-        for step in steps {
-            let dir = auto_walk_step_to_direction(step);
-            self.do_move(id, dir);
-        }
-    }
-
     pub(super) fn do_turn(&mut self, id: u32, direction: Direction) {
-        let pos = match self.players.get_mut(&id) {
-            Some(p) => { p.direction = direction; p.position }
+        let (pos, ghost) = match self.players.get_mut(&id) {
+            Some(p) => {
+                p.direction = direction;
+                (p.position, p.ghost)
+            }
             None => return,
         };
-        let ghost = self.players.get(&id).map(|p| p.ghost).unwrap_or(false);
-        let pkt = walk::creature_turn(id, direction.to_byte(), if ghost { 1 } else { 0 });
-        self.push(id, pkt.clone()); // mover sees own turn
+        let wt: u8 = if ghost { 1 } else { 0 };
+        let pkt = walk::creature_turn(id, direction.to_byte(), wt);
+        self.push(id, pkt.clone());
         for spec in self.spectators(pos, id) {
             self.push(spec, pkt.clone());
         }
@@ -56,9 +34,10 @@ impl Game {
                 if above_open {
                     if let Some(da) = dest.offset_z(-1) {
                         if self.map.has_ground(da)
-                            && self.map.floor_change_at(
-                                i32::from(da.x), i32::from(da.y), i32::from(da.z),
-                            ).is_empty()
+                            && self
+                                .map
+                                .floor_change_at(i32::from(da.x), i32::from(da.y), i32::from(da.z))
+                                .is_empty()
                         {
                             dest = da;
                         }
@@ -94,66 +73,111 @@ impl Game {
             Some(p) => p.position,
             None => return,
         };
-        if from == to { return; }
-        if let Some(p) = self.players.get_mut(&id) { p.position = to; }
+        if from == to {
+            return;
+        }
+        if let Some(p) = self.players.get_mut(&id) {
+            p.position = to;
+        }
 
         // A teleport can leave an open ground container out of range too.
         self.auto_close_ground_containers(id);
 
         // PZ badge: resend icons if we crossed a protection-zone boundary.
         if self.map.is_protection_zone(from) != self.map.is_protection_zone(to) {
-            let mask = if self.map.is_protection_zone(to) { enter_world::ICON_PIGEON } else { 0 };
+            let mask = if self.map.is_protection_zone(to) {
+                enter_world::ICON_PIGEON
+            } else {
+                0
+            };
             self.push(id, enter_world::icons(mask));
         }
 
         // Spectators of either endpoint: clean remove/add.
         let mut seen: HashSet<u32> = HashSet::new();
-        for s in self.spectators(from, id) { seen.insert(s); }
-        for s in self.spectators(to, id) { seen.insert(s); }
+        for s in self.spectators(from, id) {
+            seen.insert(s);
+        }
+        for s in self.spectators(to, id) {
+            seen.insert(s);
+        }
         for spec in seen {
-            let Some(svpos) = self.players.get(&spec).map(|p| p.position) else { continue };
+            let Some(svpos) = self.players.get(&spec).map(|p| p.position) else {
+                continue;
+            };
             let sees_from = Self::can_see(svpos, from);
             let sees_to = Self::can_see(svpos, to);
             if sees_to {
                 if sees_from {
                     self.push(spec, walk::remove_creature_by_id(id));
-                    if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
+                    if let Some(s) = self.players.get_mut(&spec) {
+                        s.known.remove(&id);
+                    }
                 }
                 if let Some(bytes) = self.introduce(spec, id) {
                     let sp = self.creature_stackpos_on(to, id);
-                    self.push(spec, tile_creature::add_tile_creature((to.x, to.y, to.z), sp, &bytes));
+                    self.push(
+                        spec,
+                        tile_creature::add_tile_creature((to.x, to.y, to.z), sp, &bytes),
+                    );
                 }
             } else if sees_from {
                 self.push(spec, walk::remove_creature_by_id(id));
-                if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
+                if let Some(s) = self.players.get_mut(&spec) {
+                    s.known.remove(&id);
+                }
             }
         }
 
         // Prune the mover's known-set of creatures no longer in view.
-        let left_view: Vec<u32> = self.visible_from(from, id).into_iter()
-            .filter(|oid| self.players.get(oid).is_some_and(|p| !Self::can_see(to, p.position)))
+        let left_view: Vec<u32> = self
+            .visible_from(from, id)
+            .into_iter()
+            .filter(|oid| {
+                self.players
+                    .get(oid)
+                    .is_some_and(|p| !Self::can_see(to, p.position))
+            })
             .collect();
         for oid in left_view {
-            if let Some(mover) = self.players.get_mut(&id) { mover.known.remove(&oid); }
+            if let Some(mover) = self.players.get_mut(&id) {
+                mover.known.remove(&oid);
+            }
         }
 
         // Mover's own view: full 0x64 carrying every in-range player plus self.
         // Build creatures (introduce = &mut self) BEFORE borrowing self.merged().
-        let mut wire_creatures: Vec<PlacedCreature> = self.visible_from(to, id).into_iter()
+        let mut wire_creatures: Vec<PlacedCreature> = self
+            .visible_from(to, id)
+            .into_iter()
             .filter_map(|oid| {
                 let opos = self.players.get(&oid)?.position;
                 let bytes = self.introduce(id, oid)?;
-                Some(PlacedCreature { x: opos.x, y: opos.y, z: opos.z, bytes })
+                Some(PlacedCreature {
+                    x: opos.x,
+                    y: opos.y,
+                    z: opos.z,
+                    bytes,
+                })
             })
             .collect();
         if let Some(bytes) = self.introduce(id, id) {
-            wire_creatures.push(PlacedCreature { x: to.x, y: to.y, z: to.z, bytes });
+            wire_creatures.push(PlacedCreature {
+                x: to.x,
+                y: to.y,
+                z: to.z,
+                bytes,
+            });
         }
         let mut pkt = walk::remove_creature_by_id(id);
         {
             let merged = self.merged();
             pkt.extend(protocol::map_description::encode(
-                protocol::map_description::Center { x: to.x, y: to.y, z: to.z },
+                protocol::map_description::Center {
+                    x: to.x,
+                    y: to.y,
+                    z: to.z,
+                },
                 &merged,
                 &wire_creatures,
             ));
@@ -166,15 +190,28 @@ impl Game {
             Some(p) => (p.position, p.direction),
             None => return,
         };
+        // Ghost || noclip bypasses ALL collision checks.
+        let nocollide = self
+            .players
+            .get(&id)
+            .map(|p| p.ghost || p.noclip)
+            .unwrap_or(false);
         let (dx, dy) = direction.delta();
         let diagonal = matches!(
             direction,
-            Direction::NorthEast | Direction::SouthEast | Direction::SouthWest | Direction::NorthWest
+            Direction::NorthEast
+                | Direction::SouthEast
+                | Direction::SouthWest
+                | Direction::NorthWest
         );
         let dest = from
             .offset(dx, dy)
             .map(|d| self.resolve_vertical(from, d, diagonal))
             .filter(|&d| {
+                // Ghost/noclip bypass walks through walls, creatures, etc.
+                if nocollide {
+                    return self.map.has_ground(d);
+                }
                 // A vertical landing (stair/height redirect) is reached with TFS
                 // FLAG_IGNOREBLOCKITEM | FLAG_IGNOREBLOCKCREATURE (game.cpp:799,815),
                 // so BOTH block-solid items AND a creature standing on the landing
@@ -185,9 +222,7 @@ impl Game {
                 if d.z != from.z {
                     self.map.has_ground(d)
                 } else {
-                    // Ghost/noclip mode: GMs bypass all collision.
-                    let bypass = self.players.get(&id).map(|p| p.ghost || p.noclip).unwrap_or(false);
-                    bypass || self.map.is_walkable(d) && !self.tile_occupied(d, id)
+                    self.map.is_walkable(d) && !self.tile_occupied(d, id)
                 }
             });
 
@@ -215,7 +250,10 @@ impl Game {
             underground = to.z > 7,
             "move ok"
         );
-        if let Some(p) = self.players.get_mut(&id) { p.direction = direction; p.position = to; }
+        if let Some(p) = self.players.get_mut(&id) {
+            p.direction = direction;
+            p.position = to;
+        }
 
         // Walking out of range of an open ground container closes its window (TFS).
         self.auto_close_ground_containers(id);
@@ -223,14 +261,22 @@ impl Game {
         // PZ badge: if the mover crossed a protection-zone boundary, resend the
         // icons packet so the client shows/hides the dove (TFS getClientIcons).
         if self.map.is_protection_zone(from) != self.map.is_protection_zone(to) {
-            let mask = if self.map.is_protection_zone(to) { enter_world::ICON_PIGEON } else { 0 };
+            let mask = if self.map.is_protection_zone(to) {
+                enter_world::ICON_PIGEON
+            } else {
+                0
+            };
             self.push(id, enter_world::icons(mask));
         }
 
         // Spectators that can see either endpoint.
         let mut seen: HashSet<u32> = HashSet::new();
-        for s in self.spectators(from, id) { seen.insert(s); }
-        for s in self.spectators(to, id) { seen.insert(s); }
+        for s in self.spectators(from, id) {
+            seen.insert(s);
+        }
+        for s in self.spectators(to, id) {
+            seen.insert(s);
+        }
 
         for spec in seen {
             let svpos = self.players.get(&spec).map(|p| p.position);
@@ -245,11 +291,15 @@ impl Game {
                     // does a clean remove+add here. id-form remove is unambiguous
                     // under co-occupancy; the add lands the mover on top.
                     self.push(spec, walk::remove_creature_by_id(id));
-                    if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
+                    if let Some(s) = self.players.get_mut(&spec) {
+                        s.known.remove(&id);
+                    }
                     if let Some(bytes) = self.introduce(spec, id) {
                         let dsp = self.creature_stackpos_on(to, id);
-                        self.push(spec, tile_creature::add_tile_creature(
-                            (to.x, to.y, to.z), dsp, &bytes));
+                        self.push(
+                            spec,
+                            tile_creature::add_tile_creature((to.x, to.y, to.z), dsp, &bytes),
+                        );
                     }
                 } else {
                     self.push(spec, walk::creature_move(id, (to.x, to.y, to.z)));
@@ -257,14 +307,18 @@ impl Game {
             } else if sees_to {
                 if let Some(bytes) = self.introduce(spec, id) {
                     let sp = self.creature_stackpos_on(to, id);
-                    self.push(spec, tile_creature::add_tile_creature(
-                        (to.x, to.y, to.z), sp, &bytes));
+                    self.push(
+                        spec,
+                        tile_creature::add_tile_creature((to.x, to.y, to.z), sp, &bytes),
+                    );
                 }
             } else {
                 // sees_from only: creature left this spectator's view. id-form
                 // remove stays correct even if `from` was co-occupied.
                 self.push(spec, walk::remove_creature_by_id(id));
-                if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&id); }
+                if let Some(s) = self.players.get_mut(&spec) {
+                    s.known.remove(&id);
+                }
             }
         }
 
@@ -278,25 +332,61 @@ impl Game {
             .visible_from(from, id)
             .into_iter()
             .filter(|oid| {
-                self.players.get(oid).is_some_and(|p| !Self::can_see(to, p.position))
+                self.players
+                    .get(oid)
+                    .is_some_and(|p| !Self::can_see(to, p.position))
             })
             .collect();
-        let left_view_len = left_view.len();
+        let left_monsters: Vec<u32> = self
+            .monsters_visible_from(from)
+            .into_iter()
+            .filter(|&mid| {
+                self.monsters
+                    .get(&mid)
+                    .is_some_and(|m| !Self::can_see(to, m.position))
+            })
+            .collect();
+        let left_view_len = left_view.len() + left_monsters.len();
         for oid in left_view {
-            if let Some(mover) = self.players.get_mut(&id) { mover.known.remove(&oid); }
+            if let Some(mover) = self.players.get_mut(&id) {
+                mover.known.remove(&oid);
+            }
+        }
+        for mid in left_monsters {
+            if let Some(mover) = self.players.get_mut(&id) {
+                mover.known.remove(&mid);
+            }
         }
 
         // The mover's own view: 0x6D + revealed slices, carrying every other
         // player now in range so they render in the newly exposed tiles.
+        let visible_monsters: Vec<u32> = self.monsters_visible_from(to);
         let mut wire_creatures: Vec<PlacedCreature> = self
             .visible_from(to, id)
             .into_iter()
             .filter_map(|oid| {
                 let opos = self.players.get(&oid)?.position;
                 let bytes = self.introduce(id, oid)?;
-                Some(PlacedCreature { x: opos.x, y: opos.y, z: opos.z, bytes })
+                Some(PlacedCreature {
+                    x: opos.x,
+                    y: opos.y,
+                    z: opos.z,
+                    bytes,
+                })
             })
             .collect();
+        for mid in visible_monsters {
+            if let Some(mpos) = self.monsters.get(&mid).map(|m| m.position) {
+                if let Some(bytes) = self.introduce(id, mid) {
+                    wire_creatures.push(PlacedCreature {
+                        x: mpos.x,
+                        y: mpos.y,
+                        z: mpos.z,
+                        bytes,
+                    });
+                }
+            }
+        }
         let others_count = wire_creatures.len();
 
         // Floor changes whose header is a bare remove (the surface->underground
@@ -314,7 +404,12 @@ impl Game {
         let teleport_like = to.z != from.z && (dx > 1 || dy > 1);
         if boundary || teleport_like {
             if let Some(bytes) = self.introduce(id, id) {
-                wire_creatures.push(PlacedCreature { x: to.x, y: to.y, z: to.z, bytes });
+                wire_creatures.push(PlacedCreature {
+                    x: to.x,
+                    y: to.y,
+                    z: to.z,
+                    bytes,
+                });
             }
         }
         let pkt = {
@@ -328,30 +423,101 @@ impl Game {
             )
         };
         tracing::debug!(
-            id, pkt_len = pkt.len(),
+            id,
+            pkt_len = pkt.len(),
             others = others_count,
             pruned = left_view_len,
             "walk_update pushed to mover"
         );
         self.push(id, pkt);
     }
+
+    /// Move a monster by one tile in `direction`.
+    ///
+    /// Simpler than `do_move`:
+    /// - No known-set management (monsters have no session push_tx)
+    /// - No floor-change resolution (monsters don't use stairs yet)
+    /// - Broadcast `0x6D` creature-move to player spectators; introduce/remove
+    ///   for spectators whose view the monster enters/leaves.
+    pub(super) fn do_move_monster(&mut self, id: u32, direction: Direction) {
+        let from = match self.monsters.get(&id) {
+            Some(m) => m.position,
+            None => return,
+        };
+        let (dx, dy) = direction.delta();
+
+        // Validate walkability: monsters can walk onto tiles occupied by other
+        // monsters (not solid), but players still block.
+        let Some(to) = from
+            .offset(dx, dy)
+            .filter(|&d| self.map.is_walkable(d) && !self.tile_occupied(d, id))
+        else {
+            return; // blocked — skip silently
+        };
+
+        // Commit direction and position.
+        if let Some(m) = self.monsters.get_mut(&id) {
+            m.direction = direction;
+            m.position = to;
+        }
+
+        // Broadcast to player spectators of either endpoint.
+        let mut seen: HashSet<u32> = HashSet::new();
+        for s in self.spectators(from, id) {
+            seen.insert(s);
+        }
+        for s in self.spectators(to, id) {
+            seen.insert(s);
+        }
+
+        for spec in seen {
+            let Some(svpos) = self.players.get(&spec).map(|p| p.position) else {
+                continue;
+            };
+            let sees_from = Self::can_see(svpos, from);
+            let sees_to = Self::can_see(svpos, to);
+
+            if sees_from && sees_to {
+                // Monster stayed in view: incremental move.
+                self.push(spec, walk::creature_move(id, (to.x, to.y, to.z)));
+            } else if sees_to {
+                // Monster entered this player's view: introduce + add_tile.
+                if let Some(bytes) = self.introduce(spec, id) {
+                    let sp = self.creature_stackpos_on(to, id);
+                    self.push(
+                        spec,
+                        tile_creature::add_tile_creature((to.x, to.y, to.z), sp, &bytes),
+                    );
+                }
+            } else if sees_from {
+                // Monster left this player's view: id-form remove.
+                self.push(spec, walk::remove_creature_by_id(id));
+                if let Some(s) = self.players.get_mut(&spec) {
+                    s.known.remove(&id);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_support::*;
-    use std::collections::HashMap;
+    use super::*;
     use crate::map::StaticMap;
     use formats::otb::{ItemType, ItemsOtb};
     use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
+    use std::collections::HashMap;
 
     #[test]
     fn walking_onto_a_down_stair_drops_a_floor() {
         let mut g = Game::new(stair_map());
         let (mover, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_move(mover, Direction::East); // 100,100,7 -> stair 101,100,7 -> land 101,100,8
-        assert_eq!(g.players.get(&mover).unwrap().position, Position::new(101, 100, 8));
+        assert_eq!(
+            g.players.get(&mover).unwrap().position,
+            Position::new(101, 100, 8)
+        );
         // The mover's own client gets a floor-change-down packet (0xBF present).
         let pkt = rx.try_recv().expect("mover gets a packet");
         assert!(pkt.contains(&protocol::walk::OP_FLOOR_CHANGE_DOWN));
@@ -374,7 +540,10 @@ mod tests {
         // must appear AGAIN past the header: the floor block re-adding it.
         let id_le = mover.to_le_bytes();
         let readded = pkt[7..].windows(4).any(|w| w == id_le);
-        assert!(readded, "mover must be re-added on its landing tile after the boundary remove");
+        assert!(
+            readded,
+            "mover must be re-added on its landing tile after the boundary remove"
+        );
     }
 
     #[test]
@@ -383,30 +552,120 @@ mod tests {
         // block-solid item on the landing tile does NOT cancel the descent.
         use formats::items_xml::FloorChange;
         let items = ItemsOtb {
-            major_version: 3, minor_version: 57, build_number: 0,
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
             items: vec![
-                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
-                ItemType { group: 5, flags: 0, server_id: 300, client_id: 2, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::DOWN },
-                ItemType { group: 5, flags: 1 << 0, server_id: 200, client_id: 3, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                ItemType {
+                    group: 1,
+                    flags: 0,
+                    server_id: 100,
+                    client_id: 1,
+                    always_on_top: false,
+                    top_order: 0,
+                    has_height: false,
+                    floor_change: FloorChange::NONE,
+                },
+                ItemType {
+                    group: 5,
+                    flags: 0,
+                    server_id: 300,
+                    client_id: 2,
+                    always_on_top: false,
+                    top_order: 0,
+                    has_height: false,
+                    floor_change: FloorChange::DOWN,
+                },
+                ItemType {
+                    group: 5,
+                    flags: 1 << 0,
+                    server_id: 200,
+                    client_id: 3,
+                    always_on_top: false,
+                    top_order: 0,
+                    has_height: false,
+                    floor_change: FloorChange::NONE,
+                },
             ],
         };
         let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
             tiles: vec![
-                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
-                MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 300, count: None, contents: vec![] }] },
+                MapTile {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
+                },
+                MapTile {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![
+                        MapItem {
+                            id: 100,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 300,
+                            count: None,
+                            contents: vec![],
+                        },
+                    ],
+                },
                 // landing one floor below carries a block-solid item
-                MapTile { x: 101, y: 100, z: 8, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 200, count: None, contents: vec![] }] },
+                MapTile {
+                    x: 101,
+                    y: 100,
+                    z: 8,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![
+                        MapItem {
+                            id: 100,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 200,
+                            count: None,
+                            contents: vec![],
+                        },
+                    ],
+                },
             ],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 100,
+                y: 100,
+                z: 7,
+            }],
             waypoints: vec![],
         };
         let sm = Arc::new(StaticMap::from_formats(&map, &items));
         let mut g = Game::new(sm);
         let (mover, _rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_move(mover, Direction::East);
-        assert_eq!(g.players.get(&mover).unwrap().position, Position::new(101, 100, 8));
+        assert_eq!(
+            g.players.get(&mover).unwrap().position,
+            Position::new(101, 100, 8)
+        );
     }
 
     #[test]
@@ -422,16 +681,22 @@ mod tests {
         let (mover, _rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_move(mover, Direction::East); // stair 101,100,7 -> land on occupied 101,100,8
         assert_eq!(
-            g.players.get(&mover).unwrap().position, landing,
+            g.players.get(&mover).unwrap().position,
+            landing,
             "descent must succeed onto an occupied landing"
         );
         // Both creatures now co-occupy the landing (Tibia stacking).
-        assert_eq!(g.players.get(&b).unwrap().position, landing, "B is still on the landing");
+        assert_eq!(
+            g.players.get(&b).unwrap().position,
+            landing,
+            "B is still on the landing"
+        );
         // The arriving creature renders on top of the one already there:
         // its stackpos is the item base plus the one creature below it.
         let base = g.map.creature_stackpos(101, 100, 8);
         assert_eq!(
-            g.creature_stackpos_on(landing, mover), base + 1,
+            g.creature_stackpos_on(landing, mover),
+            base + 1,
             "the newcomer stacks above the resident creature"
         );
     }
@@ -442,33 +707,105 @@ mod tests {
         // tile above, stepping toward a tile whose floor-above has ground climbs
         // up one floor (TFS game.cpp:792-807).
         use formats::items_xml::FloorChange;
-        let h = |sid| ItemType { group: 5, flags: 1 << 3, server_id: sid, client_id: sid, always_on_top: false, top_order: 0, has_height: true, floor_change: FloorChange::NONE };
+        let h = |sid| ItemType {
+            group: 5,
+            flags: 1 << 3,
+            server_id: sid,
+            client_id: sid,
+            always_on_top: false,
+            top_order: 0,
+            has_height: true,
+            floor_change: FloorChange::NONE,
+        };
         let items = ItemsOtb {
-            major_version: 3, minor_version: 57, build_number: 0,
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
             items: vec![
-                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                ItemType {
+                    group: 1,
+                    flags: 0,
+                    server_id: 100,
+                    client_id: 1,
+                    always_on_top: false,
+                    top_order: 0,
+                    has_height: false,
+                    floor_change: FloorChange::NONE,
+                },
                 h(301),
             ],
         };
         let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
             tiles: vec![
                 // raised tile on z=9: ground + 3 height items -> triggers_up
-                MapTile { x: 100, y: 100, z: 9, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }] },
+                MapTile {
+                    x: 100,
+                    y: 100,
+                    z: 9,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![
+                        MapItem {
+                            id: 100,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 301,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 301,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 301,
+                            count: None,
+                            contents: vec![],
+                        },
+                    ],
+                },
                 // floor above the eastern destination has ground -> climb target
-                MapTile { x: 101, y: 100, z: 8, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
+                MapTile {
+                    x: 101,
+                    y: 100,
+                    z: 8,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
+                },
                 // (100,100,8) intentionally absent so the tile above current is open
             ],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 9 }],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 100,
+                y: 100,
+                z: 9,
+            }],
             waypoints: vec![],
         };
         let sm = Arc::new(StaticMap::from_formats(&map, &items));
         let mut g = Game::new(sm);
         let (mover, mut rx) = add_player(&mut g, Position::new(100, 100, 9));
         g.do_move(mover, Direction::East); // raised z=9 -> climb to 101,100,8
-        assert_eq!(g.players.get(&mover).unwrap().position, Position::new(101, 100, 8));
+        assert_eq!(
+            g.players.get(&mover).unwrap().position,
+            Position::new(101, 100, 8)
+        );
         let pkt = rx.try_recv().expect("mover gets a packet");
         assert!(pkt.contains(&protocol::walk::OP_FLOOR_CHANGE_UP));
     }
@@ -480,31 +817,106 @@ mod tests {
         // viewer see the floor above, so the creature is relocated, not left as a
         // ghost. The old "strict same-floor" can_see sent a (failing) remove.
         use formats::items_xml::FloorChange;
-        let h = |sid| ItemType { group: 5, flags: 1 << 3, server_id: sid, client_id: sid, always_on_top: false, top_order: 0, has_height: true, floor_change: FloorChange::NONE };
+        let h = |sid| ItemType {
+            group: 5,
+            flags: 1 << 3,
+            server_id: sid,
+            client_id: sid,
+            always_on_top: false,
+            top_order: 0,
+            has_height: true,
+            floor_change: FloorChange::NONE,
+        };
         let items = ItemsOtb {
-            major_version: 3, minor_version: 57, build_number: 0,
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
             items: vec![
-                ItemType { group: 1, flags: 0, server_id: 100, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+                ItemType {
+                    group: 1,
+                    flags: 0,
+                    server_id: 100,
+                    client_id: 1,
+                    always_on_top: false,
+                    top_order: 0,
+                    has_height: false,
+                    floor_change: FloorChange::NONE,
+                },
                 h(301),
             ],
         };
         let map = OtbmMap {
-            width: 200, height: 200, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
             tiles: vec![
-                MapTile { x: 100, y: 100, z: 7, flags: 0, house_id: None,
-                    items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }, MapItem { id: 301, count: None, contents: vec![] }] },
-                MapTile { x: 101, y: 100, z: 6, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
+                MapTile {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![
+                        MapItem {
+                            id: 100,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 301,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 301,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 301,
+                            count: None,
+                            contents: vec![],
+                        },
+                    ],
+                },
+                MapTile {
+                    x: 101,
+                    y: 100,
+                    z: 6,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
+                },
             ],
-            towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+            towns: vec![Town {
+                id: 1,
+                name: "Thais".into(),
+                x: 100,
+                y: 100,
+                z: 7,
+            }],
             waypoints: vec![],
         };
         let mut g = Game::new(Arc::new(StaticMap::from_formats(&map, &items)));
         let (mover, _rm) = add_player(&mut g, Position::new(100, 100, 7));
         let (_spec, mut rx) = add_player(&mut g, Position::new(100, 101, 7)); // same floor, adjacent
         g.do_move(mover, Direction::East); // climbs 7 -> 6
-        let pkt = rx.try_recv().expect("spectator should be notified of the climb");
-        assert_eq!(pkt[0], walk::OP_CREATURE_MOVE, "climb is a move, not a ghost-leaving remove");
+        let pkt = rx
+            .try_recv()
+            .expect("spectator should be notified of the climb");
+        assert_eq!(
+            pkt[0],
+            walk::OP_CREATURE_MOVE,
+            "climb is a move, not a ghost-leaving remove"
+        );
         assert_ne!(pkt[0], protocol::tile_creature::OP_REMOVE_TILE_THING);
     }
 
@@ -537,7 +949,10 @@ mod tests {
         // but not from 95 (dx=10). A's westward step drops B out of view.
         let (b, _rb) = add_player(&mut g, Position::new(105, 117, 7));
         g.introduce(a, b).unwrap();
-        assert!(g.players[&a].known.contains(&b), "A knows B after introduce");
+        assert!(
+            g.players[&a].known.contains(&b),
+            "A knows B after introduce"
+        );
 
         g.do_move(a, Direction::West); // 96,117 -> 95,117; B leaves A's view
 
@@ -551,9 +966,15 @@ mod tests {
     async fn move_pushes_creature_move_to_spectator() {
         let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
         let (tx_a, mut rx_a) = push_channel();
-        let ack_a = world.login("A".into(), default_initial(knight()), tx_a).await.unwrap();
+        let ack_a = world
+            .login("A".into(), default_initial(knight()), tx_a)
+            .await
+            .unwrap();
         let (tx_b, mut rx_b) = push_channel();
-        let _ack_b = world.login("B".into(), default_initial(knight()), tx_b).await.unwrap();
+        let _ack_b = world
+            .login("B".into(), default_initial(knight()), tx_b)
+            .await
+            .unwrap();
         // Drain A's appear-of-B packet.
         let _ = rx_a.recv().await.unwrap();
         // A steps east (95,117 -> 96,117); B (a spectator that sees both
@@ -561,7 +982,10 @@ mod tests {
         world.move_player(ack_a.snapshot.id, Direction::East).await;
         let pkt = rx_b.recv().await.unwrap();
         assert_eq!(pkt[0], walk::OP_CREATURE_MOVE);
-        assert_eq!(u32::from_le_bytes([pkt[3], pkt[4], pkt[5], pkt[6]]), ack_a.snapshot.id);
+        assert_eq!(
+            u32::from_le_bytes([pkt[3], pkt[4], pkt[5], pkt[6]]),
+            ack_a.snapshot.id
+        );
     }
 
     #[test]
@@ -592,7 +1016,10 @@ mod tests {
         // A tries to step east onto B's tile -> blocked.
         g.do_move(a, Direction::East);
         // A did not move (still at 95,117); B received no move/appear for A.
-        assert!(rb.try_recv().is_err(), "B should get nothing; A's move was blocked");
+        assert!(
+            rb.try_recv().is_err(),
+            "B should get nothing; A's move was blocked"
+        );
         let _ = b;
     }
 
@@ -604,11 +1031,19 @@ mod tests {
         // Step West into the PZ tile (90,117).
         g.do_move(p, Direction::West);
         let into_pz = drain_find_icons(&mut rp).expect("expected an icons packet entering PZ");
-        assert_eq!(into_pz, [enter_world::OP_ICONS, 0x00, 0x40], "ICON_PIGEON on entering PZ");
+        assert_eq!(
+            into_pz,
+            [enter_world::OP_ICONS, 0x00, 0x40],
+            "ICON_PIGEON on entering PZ"
+        );
         // Step East back out to (91,117).
         g.do_move(p, Direction::East);
         let out_pz = drain_find_icons(&mut rp).expect("expected an icons packet leaving PZ");
-        assert_eq!(out_pz, [enter_world::OP_ICONS, 0x00, 0x00], "icons cleared on leaving PZ");
+        assert_eq!(
+            out_pz,
+            [enter_world::OP_ICONS, 0x00, 0x00],
+            "icons cleared on leaving PZ"
+        );
     }
 
     // ---- underground walk-out-and-back map consistency (live desync repro) ----
@@ -622,41 +1057,105 @@ mod tests {
         let (y0, y1) = (32448u16, 32468u16);
         let mut item_types = Vec::new();
         for x in x0..=x1 {
-            item_types.push(ItemType { group: 1, flags: 0, server_id: 100 + (x - x0), client_id: 1000 + (x - x0), always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
+            item_types.push(ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100 + (x - x0),
+                client_id: 1000 + (x - x0),
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            });
         }
         for y in y0..=y1 {
-            item_types.push(ItemType { group: 1, flags: 0, server_id: 500 + (y - y0), client_id: 2000 + (y - y0), always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
+            item_types.push(ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 500 + (y - y0),
+                client_id: 2000 + (y - y0),
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            });
         }
-        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_types };
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: item_types,
+        };
         let mut tiles = Vec::new();
         for x in x0..=x1 {
             for y in y0..=y1 {
-                tiles.push(MapTile { x, y, z: 8, flags: 0, house_id: None, items: vec![
-                    MapItem { id: 100 + (x - x0), count: None, contents: vec![] }, // ground -> client 1000+dx
-                    MapItem { id: 500 + (y - y0), count: None, contents: vec![] }, // down   -> client 2000+dy
-                ] });
+                tiles.push(MapTile {
+                    x,
+                    y,
+                    z: 8,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![
+                        MapItem {
+                            id: 100 + (x - x0),
+                            count: None,
+                            contents: vec![],
+                        }, // ground -> client 1000+dx
+                        MapItem {
+                            id: 500 + (y - y0),
+                            count: None,
+                            contents: vec![],
+                        }, // down   -> client 2000+dy
+                    ],
+                });
             }
         }
-        let map = OtbmMap { width: 65000, height: 65000, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
-            tiles, towns: vec![Town { id: 1, name: "U".into(), x: 33215, y: 32458, z: 8 }], waypoints: vec![] };
+        let map = OtbmMap {
+            width: 65000,
+            height: 65000,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles,
+            towns: vec![Town {
+                id: 1,
+                name: "U".into(),
+                x: 33215,
+                y: 32458,
+                z: 8,
+            }],
+            waypoints: vec![],
+        };
         Arc::new(StaticMap::from_formats(&map, &items))
     }
 
     fn server_floor8_ids(map: &StaticMap, x: i32, y: i32) -> Vec<u16> {
         match map.tile(x, y, 8) {
-            Some(s) => s.pre_creature.iter().chain(s.post_creature).map(|w| w.client_id).collect(),
+            Some(s) => s
+                .pre_creature
+                .iter()
+                .chain(s.post_creature)
+                .map(|w| w.client_id)
+                .collect(),
             None => Vec::new(),
         }
     }
 
     /// Seed the client cache with the mover's initial 18x14 floor-8 view — the
     /// client already has this before any walk; steps only send edge slices.
-    fn seed_floor8(cache: &mut HashMap<(i32, i32, u8), Vec<u16>>, map: &StaticMap, center: Position) {
+    fn seed_floor8(
+        cache: &mut HashMap<(i32, i32, u8), Vec<u16>>,
+        map: &StaticMap,
+        center: Position,
+    ) {
         for x in (i32::from(center.x) - 8)..=(i32::from(center.x) + 9) {
             for y in (i32::from(center.y) - 6)..=(i32::from(center.y) + 7) {
                 let ids = server_floor8_ids(map, x, y);
-                if !ids.is_empty() { cache.insert((x, y, 8), ids); }
+                if !ids.is_empty() {
+                    cache.insert((x, y, 8), ids);
+                }
             }
         }
     }
@@ -666,8 +1165,16 @@ mod tests {
     /// a `skip` run-length counter persisting across floors, plain `[cid][0xFF]`
     /// items. Fills `cache` at the real world coordinate of each tile.
     #[allow(clippy::too_many_arguments)]
-    fn decode_band_into(cache: &mut HashMap<(i32, i32, u8), Vec<u16>>, bytes: &[u8], pos: &mut usize,
-        anchor_x: i32, anchor_y: i32, center_z: i32, width: i32, height: i32) {
+    fn decode_band_into(
+        cache: &mut HashMap<(i32, i32, u8), Vec<u16>>,
+        bytes: &[u8],
+        pos: &mut usize,
+        anchor_x: i32,
+        anchor_y: i32,
+        center_z: i32,
+        width: i32,
+        height: i32,
+    ) {
         let floors: Vec<i32> = if center_z > 7 {
             ((center_z - 2)..=(center_z + 2).min(15)).collect()
         } else {
@@ -696,8 +1203,17 @@ mod tests {
                     let mut ids = Vec::new();
                     loop {
                         let v = u16::from_le_bytes([bytes[*pos], bytes[*pos + 1]]);
-                        if v >= 0xFF00 { skip = i32::from(v & 0x00FF); *pos += 2; break; }
-                        assert_eq!(bytes[*pos + 2], 0xFF, "expected plain item mark at {}", *pos + 2);
+                        if v >= 0xFF00 {
+                            skip = i32::from(v & 0x00FF);
+                            *pos += 2;
+                            break;
+                        }
+                        assert_eq!(
+                            bytes[*pos + 2],
+                            0xFF,
+                            "expected plain item mark at {}",
+                            *pos + 2
+                        );
                         ids.push(v);
                         *pos += 3;
                     }
@@ -714,8 +1230,17 @@ mod tests {
     /// Apply a same-floor `walk_update` packet to the client cache: skip the
     /// 12-byte 0x6D move header, then decode each directional slice with the same
     /// anchor formulas `walk_update` used to emit them.
-    fn apply_walk_update(cache: &mut HashMap<(i32, i32, u8), Vec<u16>>, pkt: &[u8], before: Position, after: Position) {
-        assert_eq!(pkt[0], protocol::walk::OP_CREATURE_MOVE, "same-floor move uses 0x6D header");
+    fn apply_walk_update(
+        cache: &mut HashMap<(i32, i32, u8), Vec<u16>>,
+        pkt: &[u8],
+        before: Position,
+        after: Position,
+    ) {
+        assert_eq!(
+            pkt[0],
+            protocol::walk::OP_CREATURE_MOVE,
+            "same-floor move uses 0x6D header"
+        );
         let mut pos = 12usize; // [0x6D][0xFFFF][id u32][newx u16][newy u16][newz u8]
         let bx = i32::from(before.x);
         let ax = i32::from(after.x);
@@ -725,10 +1250,10 @@ mod tests {
             let opcode = pkt[pos];
             pos += 1;
             let (anchor_x, anchor_y, width, height) = match opcode {
-                0x66 => (ax + 9, ay - 6, 1, 14),  // EAST
-                0x68 => (ax - 8, ay - 6, 1, 14),  // WEST
-                0x65 => (bx - 8, ay - 6, 18, 1),  // NORTH (anchored on old x)
-                0x67 => (bx - 8, ay + 7, 18, 1),  // SOUTH (anchored on old x)
+                0x66 => (ax + 9, ay - 6, 1, 14), // EAST
+                0x68 => (ax - 8, ay - 6, 1, 14), // WEST
+                0x65 => (bx - 8, ay - 6, 18, 1), // NORTH (anchored on old x)
+                0x67 => (bx - 8, ay + 7, 18, 1), // SOUTH (anchored on old x)
                 other => panic!("unexpected slice opcode {other:#x}"),
             };
             decode_band_into(cache, pkt, &mut pos, anchor_x, anchor_y, cz, width, height);
@@ -752,9 +1277,15 @@ mod tests {
         seed_floor8(&mut cache, g.map.as_ref(), start);
 
         let mut seq = Vec::new();
-        for _ in 0..8 { seq.push(Direction::East); }
-        for _ in 0..8 { seq.push(Direction::West); }
-        for _ in 0..2 { seq.push(Direction::North); }
+        for _ in 0..8 {
+            seq.push(Direction::East);
+        }
+        for _ in 0..8 {
+            seq.push(Direction::West);
+        }
+        for _ in 0..2 {
+            seq.push(Direction::North);
+        }
         for dir in seq {
             let before = g.players[&b].position;
             g.do_move(b, dir);
@@ -776,7 +1307,11 @@ mod tests {
                 }
             }
         }
-        assert!(mismatches.is_empty(), "floor-8 desync after walk-out-and-back:\n{}", mismatches.join("\n"));
+        assert!(
+            mismatches.is_empty(),
+            "floor-8 desync after walk-out-and-back:\n{}",
+            mismatches.join("\n")
+        );
     }
 
     /// Underground room with ground on the full z-2..z+2 band (floors 6..10),
@@ -797,15 +1332,55 @@ mod tests {
             for x in x0..=x1 {
                 for y in y0..=y1 {
                     let id = uid(x, y, z);
-                    item_types.push(ItemType { group: 1, flags: 0, server_id: id, client_id: id, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
-                    tiles.push(MapTile { x, y, z, flags: 0, house_id: None, items: vec![MapItem { id, count: None, contents: vec![] }] });
+                    item_types.push(ItemType {
+                        group: 1,
+                        flags: 0,
+                        server_id: id,
+                        client_id: id,
+                        always_on_top: false,
+                        top_order: 0,
+                        has_height: false,
+                        floor_change: FloorChange::NONE,
+                    });
+                    tiles.push(MapTile {
+                        x,
+                        y,
+                        z,
+                        flags: 0,
+                        house_id: None,
+                        items: vec![MapItem {
+                            id,
+                            count: None,
+                            contents: vec![],
+                        }],
+                    });
                 }
             }
         }
-        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_types };
-        let map = OtbmMap { width: 65000, height: 65000, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
-            tiles, towns: vec![Town { id: 1, name: "U".into(), x: 33215, y: 32458, z: 8 }], waypoints: vec![] };
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: item_types,
+        };
+        let map = OtbmMap {
+            width: 65000,
+            height: 65000,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles,
+            towns: vec![Town {
+                id: 1,
+                name: "U".into(),
+                x: 33215,
+                y: 32458,
+                z: 8,
+            }],
+            waypoints: vec![],
+        };
         Arc::new(StaticMap::from_formats(&map, &items))
     }
 
@@ -830,14 +1405,20 @@ mod tests {
                     // initial full-map description projects each floor by (z-nz).
                     let off = 8 - i32::from(z);
                     let ids = server_floor8_ids_z(g.map.as_ref(), x + off, y + off, z);
-                    if !ids.is_empty() { cache.insert((x + off, y + off, z), ids); }
+                    if !ids.is_empty() {
+                        cache.insert((x + off, y + off, z), ids);
+                    }
                 }
             }
         }
 
         let mut seq = Vec::new();
-        for _ in 0..8 { seq.push(Direction::East); }
-        for _ in 0..8 { seq.push(Direction::West); }
+        for _ in 0..8 {
+            seq.push(Direction::East);
+        }
+        for _ in 0..8 {
+            seq.push(Direction::West);
+        }
         for dir in seq {
             let before = g.players[&b].position;
             g.do_move(b, dir);
@@ -858,18 +1439,34 @@ mod tests {
                     let server = server_floor8_ids_z(g.map.as_ref(), wx, wy, z);
                     let client = cache.get(&(wx, wy, z)).cloned().unwrap_or_default();
                     if client != server {
-                        mismatches.push(format!("({wx},{wy},{z}): client={client:?} server={server:?}"));
+                        mismatches.push(format!(
+                            "({wx},{wy},{z}): client={client:?} server={server:?}"
+                        ));
                     }
                 }
             }
         }
-        assert!(mismatches.is_empty(), "band desync after E/W walk ({} tiles):\n{}",
-            mismatches.len(), mismatches.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
+        assert!(
+            mismatches.is_empty(),
+            "band desync after E/W walk ({} tiles):\n{}",
+            mismatches.len(),
+            mismatches
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     fn server_floor8_ids_z(map: &StaticMap, x: i32, y: i32, z: u8) -> Vec<u16> {
         match map.tile(x, y, i32::from(z)) {
-            Some(s) => s.pre_creature.iter().chain(s.post_creature).map(|w| w.client_id).collect(),
+            Some(s) => s
+                .pre_creature
+                .iter()
+                .chain(s.post_creature)
+                .map(|w| w.client_id)
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -919,8 +1516,14 @@ mod tests {
         /// re-listed becomes detached.
         #[allow(clippy::too_many_arguments)]
         fn decode_stream(
-            &mut self, bytes: &[u8], pos: &mut usize,
-            anchor_x: i32, anchor_y: i32, center_z: i32, width: i32, height: i32,
+            &mut self,
+            bytes: &[u8],
+            pos: &mut usize,
+            anchor_x: i32,
+            anchor_y: i32,
+            center_z: i32,
+            width: i32,
+            height: i32,
         ) {
             let floors: Vec<i32> = if center_z > 7 {
                 ((center_z - 2)..=(center_z + 2).min(15)).collect()
@@ -952,14 +1555,23 @@ mod tests {
                         let mut ids = Vec::new();
                         loop {
                             let v = u16::from_le_bytes([bytes[*pos], bytes[*pos + 1]]);
-                            if v >= 0xFF00 { skip = i32::from(v & 0x00FF); *pos += 2; break; }
+                            if v >= 0xFF00 {
+                                skip = i32::from(v & 0x00FF);
+                                *pos += 2;
+                                break;
+                            }
                             if v == 0x0061 || v == 0x0062 {
                                 // A creature block. Parse it, attach to this tile.
                                 let cid = self.read_creature(bytes, pos, v);
                                 self.creature_tile.insert(cid, coord);
                             } else {
                                 // plain item: [clientId u16][0xFF mark]
-                                assert_eq!(bytes[*pos + 2], 0xFF, "expected plain item mark at {}", *pos + 2);
+                                assert_eq!(
+                                    bytes[*pos + 2],
+                                    0xFF,
+                                    "expected plain item mark at {}",
+                                    *pos + 2
+                                );
                                 ids.push(v);
                                 *pos += 3;
                             }
@@ -979,8 +1591,16 @@ mod tests {
         /// `nz` is the floor and `offset` the projection shift the server used.
         #[allow(clippy::too_many_arguments)]
         fn decode_floor(
-            &mut self, bytes: &[u8], pos: &mut usize, skip: &mut i32,
-            anchor_x: i32, anchor_y: i32, nz: i32, offset: i32, width: i32, height: i32,
+            &mut self,
+            bytes: &[u8],
+            pos: &mut usize,
+            skip: &mut i32,
+            anchor_x: i32,
+            anchor_y: i32,
+            nz: i32,
+            offset: i32,
+            width: i32,
+            height: i32,
         ) {
             let mut idx = 0i32;
             let total = width * height;
@@ -1000,12 +1620,21 @@ mod tests {
                         let mut ids = Vec::new();
                         loop {
                             let v = u16::from_le_bytes([bytes[*pos], bytes[*pos + 1]]);
-                            if v >= 0xFF00 { *skip = i32::from(v & 0x00FF); *pos += 2; break; }
+                            if v >= 0xFF00 {
+                                *skip = i32::from(v & 0x00FF);
+                                *pos += 2;
+                                break;
+                            }
                             if v == 0x0061 || v == 0x0062 {
                                 let cid = self.read_creature(bytes, pos, v);
                                 self.creature_tile.insert(cid, coord);
                             } else {
-                                assert_eq!(bytes[*pos + 2], 0xFF, "expected plain item mark at {}", *pos + 2);
+                                assert_eq!(
+                                    bytes[*pos + 2],
+                                    0xFF,
+                                    "expected plain item mark at {}",
+                                    *pos + 2
+                                );
                                 ids.push(v);
                                 *pos += 3;
                             }
@@ -1024,9 +1653,15 @@ mod tests {
         /// standing there (so a later re-list re-attaches it; no re-list = detach).
         fn clean_tile(&mut self, coord: (i32, i32, u8)) {
             self.cache.remove(&coord);
-            let detached: Vec<u32> = self.creature_tile.iter()
-                .filter(|&(_, &c)| c == coord).map(|(&id, _)| id).collect();
-            for id in detached { self.creature_tile.remove(&id); }
+            let detached: Vec<u32> = self
+                .creature_tile
+                .iter()
+                .filter(|&(_, &c)| c == coord)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in detached {
+                self.creature_tile.remove(&id);
+            }
         }
 
         /// Parse a creature block (0x61 unknown / 0x62 known) exactly as
@@ -1037,28 +1672,34 @@ mod tests {
             let id;
             if marker == 0x0061 {
                 p += 4; // remove_id
-                id = u32::from_le_bytes([bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]]);
+                id = u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]);
                 p += 4;
                 p += 1; // creatureType
-                let name_len = u16::from_le_bytes([bytes[p], bytes[p+1]]) as usize;
+                let name_len = u16::from_le_bytes([bytes[p], bytes[p + 1]]) as usize;
                 p += 2 + name_len;
             } else {
-                id = u32::from_le_bytes([bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]]);
+                id = u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]);
                 p += 4;
             }
             p += 1; // health%
             p += 1; // direction
             // outfit: look_type u16; if !=0 -> 5 bytes else u16 lookTypeEx; then mount u16
-            let look_type = u16::from_le_bytes([bytes[p], bytes[p+1]]);
+            let look_type = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
             p += 2;
-            if look_type != 0 { p += 5; } else { p += 2; }
+            if look_type != 0 {
+                p += 5;
+            } else {
+                p += 2;
+            }
             p += 2; // mount
             p += 1; // light level
             p += 1; // light color
             p += 2; // speed/2
             p += 1; // skull
             p += 1; // party shield
-            if marker == 0x0061 { p += 1; } // guild emblem (unknown only)
+            if marker == 0x0061 {
+                p += 1;
+            } // guild emblem (unknown only)
             p += 1; // creatureType2
             p += 1; // speech bubble
             p += 1; // mark (0xFF)
@@ -1080,12 +1721,18 @@ mod tests {
             match opcode {
                 // 0x6D parseCreatureMove, id-form [0x6D][0xFFFF][id u32][newPos]
                 0x6D => {
-                    let marker = u16::from_le_bytes([pkt[pos], pkt[pos+1]]); pos += 2;
+                    let marker = u16::from_le_bytes([pkt[pos], pkt[pos + 1]]);
+                    pos += 2;
                     assert_eq!(marker, 0xFFFF, "test only emits id-form 0x6D");
-                    let id = u32::from_le_bytes([pkt[pos], pkt[pos+1], pkt[pos+2], pkt[pos+3]]); pos += 4;
-                    let nx = u16::from_le_bytes([pkt[pos], pkt[pos+1]]) as i32; pos += 2;
-                    let ny = u16::from_le_bytes([pkt[pos], pkt[pos+1]]) as i32; pos += 2;
-                    let nz = pkt[pos] as i32; pos += 1;
+                    let id =
+                        u32::from_le_bytes([pkt[pos], pkt[pos + 1], pkt[pos + 2], pkt[pos + 3]]);
+                    pos += 4;
+                    let nx = u16::from_le_bytes([pkt[pos], pkt[pos + 1]]) as i32;
+                    pos += 2;
+                    let ny = u16::from_le_bytes([pkt[pos], pkt[pos + 1]]) as i32;
+                    pos += 2;
+                    let nz = pkt[pos] as i32;
+                    pos += 1;
                     // getCreatureById -> removeThing from CURRENT tile.
                     let removed = sim.creature_tile.remove(&id).is_some();
                     if !removed {
@@ -1094,7 +1741,8 @@ mod tests {
                         if sim.first_divergence.is_none() {
                             sim.first_divergence = Some(format!(
                                 "[{step}] 0x6D parseCreatureMove id={id}: unable to remove creature \
-                                 (localPlayer DETACHED) -> client logs ERROR and drops the move"));
+                                 (localPlayer DETACHED) -> client logs ERROR and drops the move"
+                            ));
                         }
                         return;
                     }
@@ -1103,16 +1751,22 @@ mod tests {
                 }
                 // 0x6C parseTileRemoveThing, id-form [0x6C][0xFFFF][id]
                 0x6C => {
-                    let marker = u16::from_le_bytes([pkt[pos], pkt[pos+1]]); pos += 2;
+                    let marker = u16::from_le_bytes([pkt[pos], pkt[pos + 1]]);
+                    pos += 2;
                     assert_eq!(marker, 0xFFFF, "test only emits id-form 0x6C");
-                    let id = u32::from_le_bytes([pkt[pos], pkt[pos+1], pkt[pos+2], pkt[pos+3]]); pos += 4;
+                    let id =
+                        u32::from_le_bytes([pkt[pos], pkt[pos + 1], pkt[pos + 2], pkt[pos + 3]]);
+                    pos += 4;
                     sim.creature_tile.remove(&id); // detach by id (no central change)
                 }
                 // 0x64 parseMapDescription (full map / teleport): reads pos, sets central.
                 0x64 => {
-                    let cx = u16::from_le_bytes([pkt[pos], pkt[pos+1]]); pos += 2;
-                    let cy = u16::from_le_bytes([pkt[pos], pkt[pos+1]]); pos += 2;
-                    let cz = pkt[pos]; pos += 1;
+                    let cx = u16::from_le_bytes([pkt[pos], pkt[pos + 1]]);
+                    pos += 2;
+                    let cy = u16::from_le_bytes([pkt[pos], pkt[pos + 1]]);
+                    pos += 2;
+                    let cz = pkt[pos];
+                    pos += 1;
                     sim.central = Position::new(cx, cy, cz);
                     let ax = i32::from(cx) - AR_LEFT;
                     let ay = i32::from(cy) - AR_TOP;
@@ -1130,7 +1784,17 @@ mod tests {
                     if newz == 8 {
                         // floors 8,9,10 with offsets -1,-2,-3 (server: nz+i, -i-1).
                         for i in 0..3i32 {
-                            sim.decode_floor(pkt, &mut pos, &mut skip, ax, ay, newz + i, -i - 1, 18, 14);
+                            sim.decode_floor(
+                                pkt,
+                                &mut pos,
+                                &mut skip,
+                                ax,
+                                ay,
+                                newz + i,
+                                -i - 1,
+                                18,
+                                14,
+                            );
                         }
                     } else if newz > 8 && newz < 14 {
                         sim.decode_floor(pkt, &mut pos, &mut skip, ax, ay, newz + 2, -3, 18, 14);
@@ -1158,29 +1822,65 @@ mod tests {
                     sim.central = Position::new(p.x + 1, p.y + 1, p.z - 1);
                 }
                 // Directional slices: shift central, then setMapDescription.
-                0x65 => { // NORTH: central.y -= 1
+                0x65 => {
+                    // NORTH: central.y -= 1
                     sim.central = Position::new(sim.central.x, sim.central.y - 1, sim.central.z);
                     let ax = i32::from(sim.central.x) - AR_LEFT;
                     let ay = i32::from(sim.central.y) - AR_TOP;
-                    sim.decode_stream(pkt, &mut pos, ax, ay, i32::from(sim.central.z), AR_LEFT + AR_RIGHT + 1, 1);
+                    sim.decode_stream(
+                        pkt,
+                        &mut pos,
+                        ax,
+                        ay,
+                        i32::from(sim.central.z),
+                        AR_LEFT + AR_RIGHT + 1,
+                        1,
+                    );
                 }
-                0x66 => { // EAST: central.x += 1
+                0x66 => {
+                    // EAST: central.x += 1
                     sim.central = Position::new(sim.central.x + 1, sim.central.y, sim.central.z);
                     let ax = i32::from(sim.central.x) + AR_RIGHT;
                     let ay = i32::from(sim.central.y) - AR_TOP;
-                    sim.decode_stream(pkt, &mut pos, ax, ay, i32::from(sim.central.z), 1, AR_TOP + AR_BOTTOM + 1);
+                    sim.decode_stream(
+                        pkt,
+                        &mut pos,
+                        ax,
+                        ay,
+                        i32::from(sim.central.z),
+                        1,
+                        AR_TOP + AR_BOTTOM + 1,
+                    );
                 }
-                0x67 => { // SOUTH: central.y += 1
+                0x67 => {
+                    // SOUTH: central.y += 1
                     sim.central = Position::new(sim.central.x, sim.central.y + 1, sim.central.z);
                     let ax = i32::from(sim.central.x) - AR_LEFT;
                     let ay = i32::from(sim.central.y) + AR_BOTTOM;
-                    sim.decode_stream(pkt, &mut pos, ax, ay, i32::from(sim.central.z), AR_LEFT + AR_RIGHT + 1, 1);
+                    sim.decode_stream(
+                        pkt,
+                        &mut pos,
+                        ax,
+                        ay,
+                        i32::from(sim.central.z),
+                        AR_LEFT + AR_RIGHT + 1,
+                        1,
+                    );
                 }
-                0x68 => { // WEST: central.x -= 1
+                0x68 => {
+                    // WEST: central.x -= 1
                     sim.central = Position::new(sim.central.x - 1, sim.central.y, sim.central.z);
                     let ax = i32::from(sim.central.x) - AR_LEFT;
                     let ay = i32::from(sim.central.y) - AR_TOP;
-                    sim.decode_stream(pkt, &mut pos, ax, ay, i32::from(sim.central.z), 1, AR_TOP + AR_BOTTOM + 1);
+                    sim.decode_stream(
+                        pkt,
+                        &mut pos,
+                        ax,
+                        ay,
+                        i32::from(sim.central.z),
+                        1,
+                        AR_TOP + AR_BOTTOM + 1,
+                    );
                 }
                 other => panic!("[{step}] unexpected top-level opcode {other:#x} at pos {pos}"),
             }
@@ -1217,24 +1917,90 @@ mod tests {
             for x in x0..=x1 {
                 for y in y0..=y1 {
                     let cid = uid(x, y, z);
-                    item_types.push(ItemType { group: 1, flags: 0, server_id: cid, client_id: cid, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
-                    let mut items = vec![MapItem { id: cid, count: None, contents: vec![] }];
+                    item_types.push(ItemType {
+                        group: 1,
+                        flags: 0,
+                        server_id: cid,
+                        client_id: cid,
+                        always_on_top: false,
+                        top_order: 0,
+                        has_height: false,
+                        floor_change: FloorChange::NONE,
+                    });
+                    let mut items = vec![MapItem {
+                        id: cid,
+                        count: None,
+                        contents: vec![],
+                    }];
                     if z == 7 && (x, y) == down_stair {
-                        items.push(MapItem { id: SID_DOWN, count: None, contents: vec![] });
+                        items.push(MapItem {
+                            id: SID_DOWN,
+                            count: None,
+                            contents: vec![],
+                        });
                     }
                     if z == 8 && (x, y) == up_stair {
-                        items.push(MapItem { id: SID_UP, count: None, contents: vec![] });
+                        items.push(MapItem {
+                            id: SID_UP,
+                            count: None,
+                            contents: vec![],
+                        });
                     }
-                    tiles.push(MapTile { x, y, z, flags: 0, house_id: None, items });
+                    tiles.push(MapTile {
+                        x,
+                        y,
+                        z,
+                        flags: 0,
+                        house_id: None,
+                        items,
+                    });
                 }
             }
         }
-        item_types.push(ItemType { group: 5, flags: 0, server_id: SID_DOWN, client_id: 59000, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::DOWN });
-        item_types.push(ItemType { group: 5, flags: 0, server_id: SID_UP, client_id: 59001, always_on_top: false, top_order: 0, has_height: false, floor_change: up_flags });
-        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_types };
-        let map = OtbmMap { width: 65000, height: 65000, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
-            tiles, towns: vec![Town { id: 1, name: "U".into(), x: 32027, y: 32196, z: 7 }], waypoints: vec![] };
+        item_types.push(ItemType {
+            group: 5,
+            flags: 0,
+            server_id: SID_DOWN,
+            client_id: 59000,
+            always_on_top: false,
+            top_order: 0,
+            has_height: false,
+            floor_change: FloorChange::DOWN,
+        });
+        item_types.push(ItemType {
+            group: 5,
+            flags: 0,
+            server_id: SID_UP,
+            client_id: 59001,
+            always_on_top: false,
+            top_order: 0,
+            has_height: false,
+            floor_change: up_flags,
+        });
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: item_types,
+        };
+        let map = OtbmMap {
+            width: 65000,
+            height: 65000,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles,
+            towns: vec![Town {
+                id: 1,
+                name: "U".into(),
+                x: 32027,
+                y: 32196,
+                z: 7,
+            }],
+            waypoints: vec![],
+        };
         Arc::new(StaticMap::from_formats(&map, &items))
     }
 
@@ -1250,18 +2016,25 @@ mod tests {
             first_divergence: None,
         };
         let cz = i32::from(start.z);
-        let floors: Vec<i32> = if cz > 7 { ((cz - 2)..=(cz + 2).min(15)).collect() } else { (0..=7).rev().collect() };
+        let floors: Vec<i32> = if cz > 7 {
+            ((cz - 2)..=(cz + 2).min(15)).collect()
+        } else {
+            (0..=7).rev().collect()
+        };
         for nz in floors {
             let off = cz - nz;
             for sx in (i32::from(start.x) - AR_LEFT)..=(i32::from(start.x) + AR_RIGHT) {
                 for sy in (i32::from(start.y) - AR_TOP)..=(i32::from(start.y) + AR_BOTTOM) {
                     let (wx, wy) = (sx + off, sy + off);
                     let ids = server_floor8_ids_z(g.map.as_ref(), wx, wy, nz as u8);
-                    if !ids.is_empty() { sim.cache.insert((wx, wy, nz as u8), ids); }
+                    if !ids.is_empty() {
+                        sim.cache.insert((wx, wy, nz as u8), ids);
+                    }
                 }
             }
         }
-        sim.creature_tile.insert(mover, (i32::from(start.x), i32::from(start.y), start.z));
+        sim.creature_tile
+            .insert(mover, (i32::from(start.x), i32::from(start.y), start.z));
         sim
     }
 
@@ -1269,7 +2042,11 @@ mod tests {
     /// band, returning the first mismatch (sorted for determinism) or None.
     fn first_band_mismatch(g: &Game, sim: &ClientSim, p: Position) -> Option<String> {
         let cz = i32::from(p.z);
-        let floors: Vec<i32> = if cz > 7 { ((cz - 2)..=(cz + 2).min(15)).collect() } else { (0..=7).rev().collect() };
+        let floors: Vec<i32> = if cz > 7 {
+            ((cz - 2)..=(cz + 2).min(15)).collect()
+        } else {
+            (0..=7).rev().collect()
+        };
         let mut mismatches = Vec::new();
         for nz in floors {
             let off = cz - nz;
@@ -1277,9 +2054,16 @@ mod tests {
                 for sy in (i32::from(p.y) - AR_TOP)..=(i32::from(p.y) + AR_BOTTOM) {
                     let (wx, wy) = (sx + off, sy + off);
                     let server = server_floor8_ids_z(g.map.as_ref(), wx, wy, nz as u8);
-                    let client = sim.cache.get(&(wx, wy, nz as u8)).cloned().unwrap_or_default();
+                    let client = sim
+                        .cache
+                        .get(&(wx, wy, nz as u8))
+                        .cloned()
+                        .unwrap_or_default();
                     if client != server {
-                        mismatches.push(((nz, wx, wy), format!("({wx},{wy},{nz}): client={client:?} server={server:?}")));
+                        mismatches.push((
+                            (nz, wx, wy),
+                            format!("({wx},{wy},{nz}): client={client:?} server={server:?}"),
+                        ));
                     }
                 }
             }
@@ -1292,24 +2076,36 @@ mod tests {
     /// OTClient simulator, reporting the FIRST divergence (detach or tile
     /// mismatch). Returns Ok(()) if fully consistent, Err(report) otherwise.
     fn replay(
-        g: &mut Game, mover: u32, rx: &mut mpsc::Receiver<Vec<u8>>, sim: &mut ClientSim,
+        g: &mut Game,
+        mover: u32,
+        rx: &mut mpsc::Receiver<Vec<u8>>,
+        sim: &mut ClientSim,
         seq: &[Direction],
     ) -> Result<(), String> {
         for (i, &dir) in seq.iter().enumerate() {
             let before = g.players[&mover].position;
             g.do_move(mover, dir);
             let after = g.players[&mover].position;
-            let label = format!("step {i} {dir:?} {:?}->{:?}", (before.x, before.y, before.z), (after.x, after.y, after.z));
+            let label = format!(
+                "step {i} {dir:?} {:?}->{:?}",
+                (before.x, before.y, before.z),
+                (after.x, after.y, after.z)
+            );
             let pkt = match rx.try_recv() {
                 Ok(p) => p,
                 Err(_) => {
-                    if before == after { continue; } // blocked step, no packet
+                    if before == after {
+                        continue;
+                    } // blocked step, no packet
                     return Err(format!("[{label}] expected a walk packet but none pushed"));
                 }
             };
             let header = pkt.first().copied().unwrap_or(0);
             let attached_before = sim.localplayer_attached();
-            eprintln!("  {label}: header={header:#x} pkt_len={} attached_before={attached_before}", pkt.len());
+            eprintln!(
+                "  {label}: header={header:#x} pkt_len={} attached_before={attached_before}",
+                pkt.len()
+            );
             sim_apply(sim, &pkt, &label);
             while rx.try_recv().is_ok() {} // drain spectator extras (none: single client)
 
@@ -1318,23 +2114,33 @@ mod tests {
                     "FIRST DIVERGENCE (detach):\n  {div}\n  packet header={header:#x} len={}\n  \
                      localplayer attached: before={attached_before} after=false\n  \
                      client central={:?} server player={:?}",
-                    pkt.len(), (sim.central.x, sim.central.y, sim.central.z), (after.x, after.y, after.z)));
+                    pkt.len(),
+                    (sim.central.x, sim.central.y, sim.central.z),
+                    (after.x, after.y, after.z)
+                ));
             }
             if !sim.localplayer_attached() {
                 return Err(format!(
                     "[{label}] localPlayer DETACHED after applying packet header={header:#x} \
                      len={} (no 0x6D fired yet, but the next move will fail). \
                      client central={:?} server player={:?}",
-                    pkt.len(), (sim.central.x, sim.central.y, sim.central.z), (after.x, after.y, after.z)));
+                    pkt.len(),
+                    (sim.central.x, sim.central.y, sim.central.z),
+                    (after.x, after.y, after.z)
+                ));
             }
             if (sim.central.x, sim.central.y, sim.central.z) != (after.x, after.y, after.z) {
                 return Err(format!(
                     "[{label}] CENTRAL DRIFT: client central={:?} != server player={:?} \
                      (packet header={header:#x})",
-                    (sim.central.x, sim.central.y, sim.central.z), (after.x, after.y, after.z)));
+                    (sim.central.x, sim.central.y, sim.central.z),
+                    (after.x, after.y, after.z)
+                ));
             }
             if let Some(m) = first_band_mismatch(g, sim, after) {
-                return Err(format!("[{label}] BAND MISMATCH (packet header={header:#x}): {m}"));
+                return Err(format!(
+                    "[{label}] BAND MISMATCH (packet header={header:#x}): {m}"
+                ));
             }
         }
         Ok(())
@@ -1351,17 +2157,23 @@ mod tests {
         // "unable to remove creature".
         let start = Position::new(32027, 32196, 7);
         let down_stair = (32028, 32197); // SE neighbor of start
-        let up_stair = (32027, 32197);   // underground; WEST flag -> ascend
+        let up_stair = (32027, 32197); // underground; WEST flag -> ascend
         let map = stair_multifloor(down_stair, up_stair, formats::items_xml::FloorChange::WEST);
         let mut g = Game::new(map);
         let (mover, mut rx) = add_player(&mut g, start);
         while rx.try_recv().is_ok() {}
         let mut sim = seed_initial(&mut g, start, mover);
 
-        eprintln!("down_stair resolves: {:?}",
-            g.map.resolve_floor_change(Position::new(down_stair.0, down_stair.1, 7)));
-        eprintln!("up_stair resolves: {:?}",
-            g.map.resolve_floor_change(Position::new(up_stair.0, up_stair.1, 8)));
+        eprintln!(
+            "down_stair resolves: {:?}",
+            g.map
+                .resolve_floor_change(Position::new(down_stair.0, down_stair.1, 7))
+        );
+        eprintln!(
+            "up_stair resolves: {:?}",
+            g.map
+                .resolve_floor_change(Position::new(up_stair.0, up_stair.1, 8))
+        );
 
         let seq = vec![
             Direction::SouthEast, // descend onto down-stair -> z8
@@ -1390,8 +2202,12 @@ mod tests {
         let (mover, mut rx) = add_player(&mut g, start);
         while rx.try_recv().is_ok() {}
         let mut sim = seed_initial(&mut g, start, mover);
-        let down_land = g.map.resolve_floor_change(Position::new(down_stair.0, down_stair.1, 7));
-        let up_land = g.map.resolve_floor_change(Position::new(up_stair.0, up_stair.1, 8));
+        let down_land = g
+            .map
+            .resolve_floor_change(Position::new(down_stair.0, down_stair.1, 7));
+        let up_land = g
+            .map
+            .resolve_floor_change(Position::new(up_stair.0, up_stair.1, 8));
         let res = replay(&mut g, mover, &mut rx, &mut sim, seq);
         (down_land, up_land, res)
     }
@@ -1407,27 +2223,74 @@ mod tests {
         // (label, down_stair, up_stair, up_flags, step sequence)
         let scenarios: Vec<(&str, (u16, u16), (u16, u16), FC, Vec<Direction>)> = vec![
             // 1-tile SE descend / WEST up-stair SW ascend (the live log geometry).
-            ("diag_SE_down__WEST_up", (32028, 32197), (32027, 32197), FC::WEST,
-             vec![Direction::SouthEast, Direction::West, Direction::SouthWest,
-                  Direction::East, Direction::East]),
+            (
+                "diag_SE_down__WEST_up",
+                (32028, 32197),
+                (32027, 32197),
+                FC::WEST,
+                vec![
+                    Direction::SouthEast,
+                    Direction::West,
+                    Direction::SouthWest,
+                    Direction::East,
+                    Direction::East,
+                ],
+            ),
             // Straight ladder: DOWN step south, NORTH up-stair => straight ascend.
-            ("straight_ladder_S_down__NORTH_up", (32027, 32197), (32027, 32197), FC::NORTH,
-             vec![Direction::South, Direction::North]),
+            (
+                "straight_ladder_S_down__NORTH_up",
+                (32027, 32197),
+                (32027, 32197),
+                FC::NORTH,
+                vec![Direction::South, Direction::North],
+            ),
             // Straight DOWN ladder via plain south step + NORTH ascend straight up.
-            ("straight_S_down__SOUTH_up", (32027, 32197), (32027, 32197), FC::SOUTH,
-             vec![Direction::South, Direction::North]),
+            (
+                "straight_S_down__SOUTH_up",
+                (32027, 32197),
+                (32027, 32197),
+                FC::SOUTH,
+                vec![Direction::South, Direction::North],
+            ),
             // Single EAST up-stair (ascend shifts x west by 1).
-            ("diag_SE_down__EAST_up", (32028, 32197), (32027, 32197), FC::EAST,
-             vec![Direction::SouthEast, Direction::West, Direction::SouthWest,
-                  Direction::East]),
+            (
+                "diag_SE_down__EAST_up",
+                (32028, 32197),
+                (32027, 32197),
+                FC::EAST,
+                vec![
+                    Direction::SouthEast,
+                    Direction::West,
+                    Direction::SouthWest,
+                    Direction::East,
+                ],
+            ),
             // 2-tile ALT up-stair: EAST_ALT lands +2 x (teleport-like ascend).
-            ("diag_SE_down__EAST_ALT_up", (32028, 32197), (32027, 32197), FC::EAST_ALT,
-             vec![Direction::SouthEast, Direction::West, Direction::SouthWest,
-                  Direction::East]),
+            (
+                "diag_SE_down__EAST_ALT_up",
+                (32028, 32197),
+                (32027, 32197),
+                FC::EAST_ALT,
+                vec![
+                    Direction::SouthEast,
+                    Direction::West,
+                    Direction::SouthWest,
+                    Direction::East,
+                ],
+            ),
             // 2-tile ALT up-stair: SOUTH_ALT lands +2 y (teleport-like ascend).
-            ("diag_SE_down__SOUTH_ALT_up", (32028, 32197), (32027, 32197), FC::SOUTH_ALT,
-             vec![Direction::SouthEast, Direction::West, Direction::SouthWest,
-                  Direction::East]),
+            (
+                "diag_SE_down__SOUTH_ALT_up",
+                (32028, 32197),
+                (32027, 32197),
+                FC::SOUTH_ALT,
+                vec![
+                    Direction::SouthEast,
+                    Direction::West,
+                    Direction::SouthWest,
+                    Direction::East,
+                ],
+            ),
         ];
 
         let mut breakers = Vec::new();
@@ -1436,7 +2299,9 @@ mod tests {
             match res {
                 Ok(()) => eprintln!("[{label}] CLEAN  down->{down_land:?} up->{up_land:?}"),
                 Err(report) => {
-                    eprintln!("[{label}] DIVERGES  down->{down_land:?} up->{up_land:?}\n{report}\n");
+                    eprintln!(
+                        "[{label}] DIVERGES  down->{down_land:?} up->{up_land:?}\n{report}\n"
+                    );
                     breakers.push(label.to_string());
                 }
             }
@@ -1466,20 +2331,73 @@ mod tests {
             for x in x0..=x1 {
                 for y in y0..=y1 {
                     let cid = uid(x, y, z);
-                    item_types.push(ItemType { group: 1, flags: 0, server_id: cid, client_id: cid, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE });
-                    let mut items = vec![MapItem { id: cid, count: None, contents: vec![] }];
+                    item_types.push(ItemType {
+                        group: 1,
+                        flags: 0,
+                        server_id: cid,
+                        client_id: cid,
+                        always_on_top: false,
+                        top_order: 0,
+                        has_height: false,
+                        floor_change: FloorChange::NONE,
+                    });
+                    let mut items = vec![MapItem {
+                        id: cid,
+                        count: None,
+                        contents: vec![],
+                    }];
                     if z == down_z && (x, y) == down_stair {
-                        items.push(MapItem { id: SID_DOWN, count: None, contents: vec![] });
+                        items.push(MapItem {
+                            id: SID_DOWN,
+                            count: None,
+                            contents: vec![],
+                        });
                     }
-                    tiles.push(MapTile { x, y, z, flags: 0, house_id: None, items });
+                    tiles.push(MapTile {
+                        x,
+                        y,
+                        z,
+                        flags: 0,
+                        house_id: None,
+                        items,
+                    });
                 }
             }
         }
-        item_types.push(ItemType { group: 5, flags: 0, server_id: SID_DOWN, client_id: 59000, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::DOWN });
-        let items = ItemsOtb { major_version: 3, minor_version: 57, build_number: 0, items: item_types };
-        let map = OtbmMap { width: 65000, height: 65000, major_items: 3, minor_items: 57,
-            description: String::new(), spawn_file: None, house_file: None,
-            tiles, towns: vec![Town { id: 1, name: "U".into(), x: 32027, y: 32196, z: 8 }], waypoints: vec![] };
+        item_types.push(ItemType {
+            group: 5,
+            flags: 0,
+            server_id: SID_DOWN,
+            client_id: 59000,
+            always_on_top: false,
+            top_order: 0,
+            has_height: false,
+            floor_change: FloorChange::DOWN,
+        });
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: item_types,
+        };
+        let map = OtbmMap {
+            width: 65000,
+            height: 65000,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles,
+            towns: vec![Town {
+                id: 1,
+                name: "U".into(),
+                x: 32027,
+                y: 32196,
+                z: 8,
+            }],
+            waypoints: vec![],
+        };
         Arc::new(StaticMap::from_formats(&map, &items))
     }
 
@@ -1499,17 +2417,72 @@ mod tests {
         let (mover, mut rx) = add_player(&mut g, start);
         while rx.try_recv().is_ok() {}
         let mut sim = seed_initial(&mut g, start, mover);
-        eprintln!("down_stair(z8) resolves: {:?}",
-            g.map.resolve_floor_change(Position::new(down_stair.0, down_stair.1, 8)));
+        eprintln!(
+            "down_stair(z8) resolves: {:?}",
+            g.map
+                .resolve_floor_change(Position::new(down_stair.0, down_stair.1, 8))
+        );
         let seq = vec![
-            Direction::East,  // step onto DOWN stair -> z9 (dx=1,dy=0): 0x6D + 0xBF
-            Direction::East,  // a z9 surface step -> would fire 0x6D for the player
+            Direction::East, // step onto DOWN stair -> z9 (dx=1,dy=0): 0x6D + 0xBF
+            Direction::East, // a z9 surface step -> would fire 0x6D for the player
             Direction::West,
         ];
         match replay(&mut g, mover, &mut rx, &mut sim, &seq) {
             Ok(()) => eprintln!("CLEAN: deeper descend keeps player attached"),
             Err(report) => panic!("\nDEEPER DESCEND DIVERGES:\n{report}\n"),
         }
+    }
+
+    #[test]
+    fn monster_known_set_updated_when_mover_sees_monster() {
+        // The mover's view after a move adds visible monsters via introduce(),
+        // which records them in the player's known-set.
+        let mut g = Game::new(walk_map());
+        let (mover, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let mid = add_monster(&mut g, Position::new(96, 117, 7));
+        while rx.try_recv().is_ok() {}
+        // Before the move, the mover does NOT know the monster.
+        assert!(
+            !g.players.get(&mover).unwrap().known.contains(&mid),
+            "mover should not know monster before introduction"
+        );
+        g.do_move(mover, Direction::East);
+        let _pkt = rx.try_recv().expect("mover must receive walk_update");
+        // After the move, the mover knows the monster (introduce was called).
+        assert!(
+            g.players.get(&mover).unwrap().known.contains(&mid),
+            "mover must know monster after walking onto its tile"
+        );
+    }
+
+    #[test]
+    fn monster_out_of_viewport_not_introduced_to_mover() {
+        let mut g = Game::new(walk_map());
+        let (mover, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let mid = add_monster(&mut g, Position::new(200, 200, 7));
+        while rx.try_recv().is_ok() {}
+        g.do_move(mover, Direction::East);
+        let _pkt = rx.try_recv().expect("mover must receive walk_update");
+        assert!(
+            !g.players.get(&mover).unwrap().known.contains(&mid),
+            "far-away monster must NOT be introduced"
+        );
+    }
+
+    #[test]
+    fn monster_does_not_block_movement_m12_1() {
+        let mut g = Game::new(walk_map());
+        let (mover, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let _mid = add_monster(&mut g, Position::new(96, 117, 7));
+        while rx.try_recv().is_ok() {}
+        // M12.1: monsters do NOT block movement. Player walks onto the same tile.
+        g.do_move(mover, Direction::East);
+        let pos = g.players.get(&mover).map(|p| p.position);
+        assert_eq!(
+            pos,
+            Some(Position::new(96, 117, 7)),
+            "player must walk onto monster tile (monsters don't block in M12.1)"
+        );
     }
 
     /// VALIDATION: prove the simulator actually CATCHES a detach (guards against a
@@ -1538,7 +2511,10 @@ mod tests {
         // anchored so it covers (100,100,7): central.x-1=99 after shift, anchor
         // x = central.x-8. Simplertest: directly cleanTile then a 0x6D.
         sim.clean_tile((100, 100, 7));
-        assert!(!sim.localplayer_attached(), "cleanTile must detach the player");
+        assert!(
+            !sim.localplayer_attached(),
+            "cleanTile must detach the player"
+        );
         // Now the server sends a 0x6D move for the (now detached) player.
         let pkt = protocol::walk::creature_move(mover, (101, 100, 7));
         sim_apply(&mut sim, &pkt, "forced-detach probe");
@@ -1549,24 +2525,91 @@ mod tests {
         eprintln!("detector works: {}", sim.first_divergence.unwrap());
     }
 
+    // ===================================================================
+    // Task 3.4 + 3.8: ghost + noclip GM bypass collision on occupied tile
+    // and wall in do_move().
+    // ===================================================================
+
     #[test]
-    fn noclip_bypasses_blocked_tiles() {
+    fn ghost_gm_walks_through_occupied_tile() {
         let mut g = Game::new(walk_map());
-        let spawn = Position::new(95, 117, 7);
-        let wall = Position::new(94, 117, 7); // blocked tile in walk_map
-        let (id, mut rx) = add_player(&mut g, spawn);
-        g.players.get_mut(&id).unwrap().gamemaster = true;
-        drain(&mut rx);
+        // B occupies the tile east of A.
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (_b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
+        g.players.get_mut(&a).unwrap().gamemaster = true;
 
-        // Without noclip: blocked.
-        g.do_move(id, Direction::West);
-        assert_eq!(g.players.get(&id).unwrap().position, spawn,
-            "blocked tile must reject movement without noclip");
+        // Normal move east would be blocked (B is there).
+        g.do_move(a, Direction::East);
+        assert_eq!(
+            g.players[&a].position,
+            Position::new(95, 117, 7),
+            "normal move must be blocked"
+        );
 
-        // With noclip: bypass.
-        g.players.get_mut(&id).unwrap().noclip = true;
-        g.do_move(id, Direction::West);
-        assert_eq!(g.players.get(&id).unwrap().position, wall,
-            "noclip must bypass blocked tiles");
+        // Enable ghost and try again.
+        g.do_gm_command(a, "/ghost".into());
+        g.do_move(a, Direction::East);
+        assert_eq!(
+            g.players[&a].position,
+            Position::new(96, 117, 7),
+            "ghost GM must walk through occupied tile"
+        );
+    }
+
+    #[test]
+    fn ghost_gm_walks_through_wall() {
+        let mut g = Game::new(walk_map());
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        g.players.get_mut(&a).unwrap().gamemaster = true;
+
+        // Spawn is at (95,117). The tile west (94,117) has a wall (block-solid).
+        // Normal move west would be blocked.
+        g.do_move(a, Direction::West);
+        assert_eq!(
+            g.players[&a].position,
+            Position::new(95, 117, 7),
+            "normal move into wall must be blocked"
+        );
+
+        // Enable ghost and try again.
+        g.do_gm_command(a, "/ghost".into());
+        g.do_move(a, Direction::West);
+        assert_eq!(
+            g.players[&a].position,
+            Position::new(94, 117, 7),
+            "ghost GM must walk through wall"
+        );
+    }
+
+    #[test]
+    fn noclip_gm_walks_through_occupied_tile() {
+        let mut g = Game::new(walk_map());
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (_b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
+        g.players.get_mut(&a).unwrap().gamemaster = true;
+
+        // Enable noclip and walk through the occupied tile.
+        g.do_gm_command(a, "/noclip".into());
+        g.do_move(a, Direction::East);
+        assert_eq!(
+            g.players[&a].position,
+            Position::new(96, 117, 7),
+            "noclip GM must walk through occupied tile"
+        );
+    }
+
+    #[test]
+    fn noclip_gm_walks_through_wall() {
+        let mut g = Game::new(walk_map());
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        g.players.get_mut(&a).unwrap().gamemaster = true;
+
+        g.do_gm_command(a, "/noclip".into());
+        g.do_move(a, Direction::West);
+        assert_eq!(
+            g.players[&a].position,
+            Position::new(94, 117, 7),
+            "noclip GM must walk through wall"
+        );
     }
 }

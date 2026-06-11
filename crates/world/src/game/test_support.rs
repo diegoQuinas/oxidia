@@ -7,24 +7,83 @@ use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
 pub(super) fn stair_map() -> Arc<StaticMap> {
     use formats::items_xml::FloorChange;
     let items = ItemsOtb {
-        major_version: 3, minor_version: 57, build_number: 0,
+        major_version: 3,
+        minor_version: 57,
+        build_number: 0,
         items: vec![
-            ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
-            ItemType { group: 5, flags: 0, server_id: 300, client_id: 1, always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::DOWN },
+            ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
+            ItemType {
+                group: 5,
+                flags: 0,
+                server_id: 300,
+                client_id: 1,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::DOWN,
+            },
         ],
     };
-    let g = |x, y, z| MapTile { x, y, z, flags: 0, house_id: None, items: vec![MapItem { id: 100, count: None, contents: vec![] }] };
-    let stair = |x, y, z| MapTile { x, y, z, flags: 0, house_id: None,
-        items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 300, count: None, contents: vec![] }] };
-    let map = OtbmMap {
-        width: 200, height: 200, major_items: 3, minor_items: 57,
-        description: String::new(), spawn_file: None, house_file: None,
-        tiles: vec![
-            g(100, 100, 7),          // spawn
-            stair(101, 100, 7),      // step east onto this -> floorchange down
-            g(101, 100, 8),          // landing one floor below
+    let g = |x, y, z| MapTile {
+        x,
+        y,
+        z,
+        flags: 0,
+        house_id: None,
+        items: vec![MapItem {
+            id: 100,
+            count: None,
+            contents: vec![],
+        }],
+    };
+    let stair = |x, y, z| MapTile {
+        x,
+        y,
+        z,
+        flags: 0,
+        house_id: None,
+        items: vec![
+            MapItem {
+                id: 100,
+                count: None,
+                contents: vec![],
+            },
+            MapItem {
+                id: 300,
+                count: None,
+                contents: vec![],
+            },
         ],
-        towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+    };
+    let map = OtbmMap {
+        width: 200,
+        height: 200,
+        major_items: 3,
+        minor_items: 57,
+        description: String::new(),
+        spawn_file: None,
+        house_file: None,
+        tiles: vec![
+            g(100, 100, 7),     // spawn
+            stair(101, 100, 7), // step east onto this -> floorchange down
+            g(101, 100, 8),     // landing one floor below
+        ],
+        towns: vec![Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 100,
+            y: 100,
+            z: 7,
+        }],
         waypoints: vec![],
     };
     Arc::new(StaticMap::from_formats(&map, &items))
@@ -32,36 +91,112 @@ pub(super) fn stair_map() -> Arc<StaticMap> {
 
 pub(super) fn walk_map() -> Arc<StaticMap> {
     let items = ItemsOtb {
-        major_version: 3, minor_version: 57, build_number: 0,
+        major_version: 3,
+        minor_version: 57,
+        build_number: 0,
         items: vec![
-            ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
-            ItemType { group: 5, flags: 0x0000_0001, server_id: 200, client_id: 1059, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
+            ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            },
+            ItemType {
+                group: 5,
+                flags: 0x0000_0001,
+                server_id: 200,
+                client_id: 1059,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            },
         ],
     };
-    let ground = |x, y| MapTile { x, y, z: 7, flags: 0, house_id: None,
-        items: vec![MapItem { id: 100, count: None, contents: vec![] }] };
+    let ground = |x, y| MapTile {
+        x,
+        y,
+        z: 7,
+        flags: 0,
+        house_id: None,
+        items: vec![MapItem {
+            id: 100,
+            count: None,
+            contents: vec![],
+        }],
+    };
     let map = OtbmMap {
-        width: 200, height: 200, major_items: 3, minor_items: 57,
-        description: String::new(), spawn_file: None, house_file: None,
+        width: 200,
+        height: 200,
+        major_items: 3,
+        minor_items: 57,
+        description: String::new(),
+        spawn_file: None,
+        house_file: None,
         tiles: vec![
-            ground(95, 117), ground(96, 117), ground(95, 116),
+            ground(95, 117),
+            ground(96, 117),
+            ground(95, 116),
             // wall to the west of spawn
-            MapTile { x: 94, y: 117, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] }, MapItem { id: 200, count: None, contents: vec![] }] },
+            MapTile {
+                x: 94,
+                y: 117,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 200,
+                        count: None,
+                        contents: vec![],
+                    },
+                ],
+            },
         ],
-        towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+        towns: vec![Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 95,
+            y: 117,
+            z: 7,
+        }],
         waypoints: vec![],
     };
     Arc::new(StaticMap::from_formats(&map, &items))
 }
 
 pub(super) fn knight() -> Outfit {
-    Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
+    Outfit {
+        look_type: 128,
+        head: 78,
+        body: 69,
+        legs: 58,
+        feet: 76,
+        addons: 0,
+        mount: 0,
+    }
 }
 
 /// A custom outfit distinct from the default knight outfit, for restore tests.
 pub(super) fn wizard_outfit() -> Outfit {
-    Outfit { look_type: 75, head: 20, body: 30, legs: 40, feet: 50, addons: 1, mount: 0 }
+    Outfit {
+        look_type: 75,
+        head: 20,
+        body: 30,
+        legs: 40,
+        feet: 50,
+        addons: 1,
+        mount: 0,
+    }
 }
 
 /// Build a default `InitialState` for use in tests that don't care about
@@ -80,81 +215,184 @@ pub(super) fn default_initial(outfit: Outfit) -> InitialState {
     }
 }
 
+/// Insert a monster at `pos` and return its id.
+#[allow(dead_code)]
+pub(super) fn add_monster(g: &mut Game, pos: Position) -> u32 {
+    let id = g.next_monster_id;
+    g.next_monster_id += 1;
+    g.monsters.insert(
+        id,
+        MonsterState {
+            name: "Rat".into(),
+            position: pos,
+            direction: Direction::South,
+            health: 50,
+            max_health: 50,
+            speed: 200,
+            look_type: 100,
+            attacking: None,
+            last_attack_ms: 0,
+            attack: 7,
+            loot: vec![],
+            spawn_id: None,
+            list_walk_dir: VecDeque::new(),
+            follow_target: None,
+            target_distance: 0,
+        },
+    );
+    id
+}
+
 /// Insert a player at `pos` and return (id, its push receiver).
 pub(super) fn add_player(g: &mut Game, pos: Position) -> (u32, mpsc::Receiver<Vec<u8>>) {
     let (tx, rx) = mpsc::channel(super::PUSH_CAPACITY);
     let id = g.next_id;
     g.next_id += 1;
-    g.players.insert(id, PlayerState {
-        name: "Tester".into(), position: pos, direction: Direction::South,
-        outfit: knight(), push_tx: tx, known: HashSet::new(),
-        health: 150, max_health: 150, fist_skill: 10,
-        attacking: None, last_attack_ms: 0,
-        sex: 1, // male (default)
-        gamemaster: false,
-        ghost: false,
-        prev_outfit: None,
-        noclip: false,
-        inventory: [None; 10],
-        open_containers: std::array::from_fn(|_| None),
-    });
+    g.players.insert(
+        id,
+        PlayerState {
+            name: "Tester".into(),
+            position: pos,
+            direction: Direction::South,
+            outfit: knight(),
+            push_tx: tx,
+            known: HashSet::new(),
+            health: 150,
+            max_health: 150,
+            fist_skill: 10,
+            attacking: None,
+            last_attack_ms: 0,
+            sex: 1, // male (default)
+            gamemaster: false,
+            ghost: false,
+            prev_outfit: None,
+            noclip: false,
+            speed: 220,
+            inventory: [None; 10],
+            open_containers: std::array::from_fn(|_| None),
+            follow_target: None,
+            go_to_position: None,
+            failed_repaths: None,
+            list_walk_dir: VecDeque::new(),
+            last_walk_ms: 0,
+            conditions: Vec::new(),
+        },
+    );
     (id, rx)
 }
 
 pub(super) fn combat_map(spawn_pz: bool) -> Arc<StaticMap> {
+    use formats::items_xml::{ItemsXml, parse_items_xml};
     let items = ItemsOtb {
-        major_version: 3, minor_version: 57, build_number: 0,
-        items: vec![
-            ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
-        ],
+        major_version: 3,
+        minor_version: 57,
+        build_number: 0,
+        items: vec![ItemType {
+            group: 1,
+            flags: 0,
+            server_id: 100,
+            client_id: 4526,
+            always_on_top: false,
+            top_order: 0,
+            has_height: false,
+            floor_change: formats::items_xml::FloorChange::NONE,
+        }],
     };
     let ground = |x: u16, y: u16, pz: bool| MapTile {
-        x, y, z: 7,
+        x,
+        y,
+        z: 7,
         flags: if pz { 1 } else { 0 }, // 1 = OTBM_TILEFLAG_PROTECTIONZONE
         house_id: None,
-        items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+        items: vec![MapItem {
+            id: 100,
+            count: None,
+            contents: vec![],
+        }],
     };
     let map = OtbmMap {
-        width: 200, height: 200, major_items: 3, minor_items: 57,
-        description: String::new(), spawn_file: None, house_file: None,
+        width: 200,
+        height: 200,
+        major_items: 3,
+        minor_items: 57,
+        description: String::new(),
+        spawn_file: None,
+        house_file: None,
         tiles: vec![
             ground(95, 117, spawn_pz), // spawn / temple
             ground(96, 117, false),    // adjacent east
             ground(97, 117, false),    // two tiles east
         ],
-        towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+        towns: vec![Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 95,
+            y: 117,
+            z: 7,
+        }],
         waypoints: vec![],
     };
-    Arc::new(StaticMap::from_formats(&map, &items))
+    let xml: ItemsXml =
+        parse_items_xml(r#"<items><item id="100" article="a" name="ground"/></items>"#).unwrap();
+    let mut sm = StaticMap::from_formats(&map, &items);
+    sm.load_item_metadata(&items, &xml);
+    Arc::new(sm)
 }
 
 pub(super) fn wide_combat_map_with_pz() -> Arc<StaticMap> {
+    use formats::items_xml::{ItemsXml, parse_items_xml};
     let items = ItemsOtb {
-        major_version: 3, minor_version: 57, build_number: 0,
-        items: vec![
-            ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
-                always_on_top: false, top_order: 0, has_height: false,
-                floor_change: formats::items_xml::FloorChange::NONE },
-        ],
+        major_version: 3,
+        minor_version: 57,
+        build_number: 0,
+        items: vec![ItemType {
+            group: 1,
+            flags: 0,
+            server_id: 100,
+            client_id: 4526,
+            always_on_top: false,
+            top_order: 0,
+            has_height: false,
+            floor_change: formats::items_xml::FloorChange::NONE,
+        }],
     };
     let ground = |x: u16, y: u16, pz: bool| MapTile {
-        x, y, z: 7,
+        x,
+        y,
+        z: 7,
         flags: if pz { 1 } else { 0 },
         house_id: None,
-        items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+        items: vec![MapItem {
+            id: 100,
+            count: None,
+            contents: vec![],
+        }],
     };
-    let mut tiles: Vec<MapTile> = (90u16..=116u16)
-        .map(|x| ground(x, 117, x == 90))
-        .collect();
+    let mut tiles: Vec<MapTile> = (90u16..=116u16).map(|x| ground(x, 117, x == 90)).collect();
     tiles.push(ground(115, 116, false));
     let map = OtbmMap {
-        width: 200, height: 200, major_items: 3, minor_items: 57,
-        description: String::new(), spawn_file: None, house_file: None,
+        width: 200,
+        height: 200,
+        major_items: 3,
+        minor_items: 57,
+        description: String::new(),
+        spawn_file: None,
+        house_file: None,
         tiles,
-        towns: vec![Town { id: 1, name: "Thais".into(), x: 95, y: 117, z: 7 }],
+        towns: vec![Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 95,
+            y: 117,
+            z: 7,
+        }],
         waypoints: vec![],
     };
-    Arc::new(StaticMap::from_formats(&map, &items))
+    let xml: ItemsXml =
+        parse_items_xml(r#"<items><item id="100" article="a" name="ground"/></items>"#).unwrap();
+    let mut sm = StaticMap::from_formats(&map, &items);
+    sm.load_item_metadata(&items, &xml);
+    Arc::new(sm)
 }
 
 /// FLAG_PICKUPABLE (bit 5) from items.otb.
@@ -182,18 +420,43 @@ pub(super) fn look_map() -> Arc<StaticMap> {
     use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
 
     let otb = ItemsOtb {
-        major_version: 3, minor_version: 57, build_number: 0,
+        major_version: 3,
+        minor_version: 57,
+        build_number: 0,
         items: vec![
             // ground (group 1, no flags)
-            OtbItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
             // stone: pickupable (bit 5), not stackable
-            OtbItemType { group: 5, flags: FLAG_PICKUPABLE_OTB, server_id: 200, client_id: 1987,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 5,
+                flags: FLAG_PICKUPABLE_OTB,
+                server_id: 200,
+                client_id: 1987,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
             // gold coin: pickupable + stackable (bits 5+7)
-            OtbItemType { group: 5, flags: FLAG_PICKUPABLE_OTB | FLAG_STACKABLE_OTB, server_id: 300,
-                client_id: 2148, always_on_top: false, top_order: 0, has_height: false,
-                floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 5,
+                flags: FLAG_PICKUPABLE_OTB | FLAG_STACKABLE_OTB,
+                server_id: 300,
+                client_id: 2148,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
         ],
     };
 
@@ -209,28 +472,75 @@ pub(super) fn look_map() -> Arc<StaticMap> {
     let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
 
     let g = |x: u16, y: u16| MapTile {
-        x, y, z: 7, flags: 0, house_id: None,
-        items: vec![MapItem { id: 100, count: None, contents: vec![] }],
+        x,
+        y,
+        z: 7,
+        flags: 0,
+        house_id: None,
+        items: vec![MapItem {
+            id: 100,
+            count: None,
+            contents: vec![],
+        }],
     };
     let map = OtbmMap {
-        width: 200, height: 200, major_items: 3, minor_items: 57,
-        description: String::new(), spawn_file: None, house_file: None,
+        width: 200,
+        height: 200,
+        major_items: 3,
+        minor_items: 57,
+        description: String::new(),
+        spawn_file: None,
+        house_file: None,
         tiles: vec![
-            g(100, 100),  // spawn — ground only
-            MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None,
+            g(100, 100), // spawn — ground only
+            MapTile {
+                x: 101,
+                y: 100,
+                z: 7,
+                flags: 0,
+                house_id: None,
                 items: vec![
-                    MapItem { id: 100, count: None, contents: vec![] },
-                    MapItem { id: 200, count: None, contents: vec![] }, // stone at stackpos 1
-                ] },
-            MapTile { x: 102, y: 100, z: 7, flags: 0, house_id: None,
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 200,
+                        count: None,
+                        contents: vec![],
+                    }, // stone at stackpos 1
+                ],
+            },
+            MapTile {
+                x: 102,
+                y: 100,
+                z: 7,
+                flags: 0,
+                house_id: None,
                 items: vec![
-                    MapItem { id: 100, count: None, contents: vec![] },
-                    MapItem { id: 300, count: Some(50), contents: vec![] }, // 50 gold coins
-                ] },
-            g(103, 100),  // ground only
-            g(99, 100),   // one tile west of spawn (for out-of-viewport test)
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 300,
+                        count: Some(50),
+                        contents: vec![],
+                    }, // 50 gold coins
+                ],
+            },
+            g(103, 100), // ground only
+            g(99, 100),  // one tile west of spawn (for out-of-viewport test)
         ],
-        towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+        towns: vec![Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 100,
+            y: 100,
+            z: 7,
+        }],
         waypoints: vec![],
     };
     let mut sm = StaticMap::from_formats(&map, &otb);
@@ -272,26 +582,75 @@ pub(super) fn move_map() -> Arc<StaticMap> {
     use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
 
     let otb = ItemsOtb {
-        major_version: 3, minor_version: 57, build_number: 0,
+        major_version: 3,
+        minor_version: 57,
+        build_number: 0,
         items: vec![
-            OtbItemType { group: 1, flags: 0, server_id: 100, client_id: 4526,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
             // stone: moveable, not stackable, not pickupable
-            OtbItemType { group: 5, flags: FLAG_MOVEABLE_OTB, server_id: 200, client_id: 1987,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 5,
+                flags: FLAG_MOVEABLE_OTB,
+                server_id: 200,
+                client_id: 1987,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
             // gold coin: moveable + stackable + pickupable
-            OtbItemType { group: 5, flags: FLAG_MOVEABLE_OTB | FLAG_STACKABLE_OTB | FLAG_PICKUPABLE_OTB,
-                server_id: 300, client_id: 2148,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 5,
+                flags: FLAG_MOVEABLE_OTB | FLAG_STACKABLE_OTB | FLAG_PICKUPABLE_OTB,
+                server_id: 300,
+                client_id: 2148,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
             // decoration: NOT moveable (no FLAG_MOVEABLE)
-            OtbItemType { group: 5, flags: 0, server_id: 400, client_id: 999,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 5,
+                flags: 0,
+                server_id: 400,
+                client_id: 999,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
             // helmet: moveable + pickupable, slotType head (equippable in slot 1)
-            OtbItemType { group: 5, flags: FLAG_MOVEABLE_OTB | FLAG_PICKUPABLE_OTB, server_id: 500, client_id: 5741,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 5,
+                flags: FLAG_MOVEABLE_OTB | FLAG_PICKUPABLE_OTB,
+                server_id: 500,
+                client_id: 5741,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
             // backpack: container (group 2), moveable + pickupable. Not on any tile.
-            OtbItemType { group: 2, flags: FLAG_MOVEABLE_OTB | FLAG_PICKUPABLE_OTB, server_id: 600, client_id: 1988,
-                always_on_top: false, top_order: 0, has_height: false, floor_change: FloorChange::NONE },
+            OtbItemType {
+                group: 2,
+                flags: FLAG_MOVEABLE_OTB | FLAG_PICKUPABLE_OTB,
+                server_id: 600,
+                client_id: 1988,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
         ],
     };
 
@@ -304,39 +663,170 @@ pub(super) fn move_map() -> Arc<StaticMap> {
     </items>"#;
     let xml: ItemsXml = parse_items_xml(xml_str).unwrap();
 
-    let g = |x: u16| MapTile { x, y: 100, z: 7, flags: 0, house_id: None,
-        items: vec![MapItem { id: 100, count: None, contents: vec![] }] };
+    let g = |x: u16| MapTile {
+        x,
+        y: 100,
+        z: 7,
+        flags: 0,
+        house_id: None,
+        items: vec![MapItem {
+            id: 100,
+            count: None,
+            contents: vec![],
+        }],
+    };
     let map = OtbmMap {
-        width: 200, height: 200, major_items: 3, minor_items: 57,
-        description: String::new(), spawn_file: None, house_file: None,
+        width: 200,
+        height: 200,
+        major_items: 3,
+        minor_items: 57,
+        description: String::new(),
+        spawn_file: None,
+        house_file: None,
         tiles: vec![
             g(100), // spawn
-            MapTile { x: 101, y: 100, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] },
-                            MapItem { id: 200, count: None, contents: vec![] }] }, // stone
-            MapTile { x: 102, y: 100, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] },
-                            MapItem { id: 300, count: Some(10), contents: vec![] }] }, // 10 coins
-            MapTile { x: 103, y: 100, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] },
-                            MapItem { id: 400, count: None, contents: vec![] }] }, // deco (non-moveable)
+            MapTile {
+                x: 101,
+                y: 100,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 200,
+                        count: None,
+                        contents: vec![],
+                    },
+                ],
+            }, // stone
+            MapTile {
+                x: 102,
+                y: 100,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 300,
+                        count: Some(10),
+                        contents: vec![],
+                    },
+                ],
+            }, // 10 coins
+            MapTile {
+                x: 103,
+                y: 100,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 400,
+                        count: None,
+                        contents: vec![],
+                    },
+                ],
+            }, // deco (non-moveable)
             // (104,100) deliberately absent — no tile → invalid dest
             g(105), // valid empty-item dest
-            MapTile { x: 106, y: 100, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] },
-                            MapItem { id: 500, count: None, contents: vec![] }] }, // helmet
+            MapTile {
+                x: 106,
+                y: 100,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 500,
+                        count: None,
+                        contents: vec![],
+                    },
+                ],
+            }, // helmet
             // Isolated vertical strip (y=110..113) for ground->ground container tests.
-            MapTile { x: 100, y: 110, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] },
-                            MapItem { id: 600, count: None, contents: vec![] }] }, // backpack on ground
-            MapTile { x: 100, y: 111, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
-            MapTile { x: 100, y: 112, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
-            MapTile { x: 100, y: 113, z: 7, flags: 0, house_id: None,
-                items: vec![MapItem { id: 100, count: None, contents: vec![] }] },
+            MapTile {
+                x: 100,
+                y: 110,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 600,
+                        count: None,
+                        contents: vec![],
+                    },
+                ],
+            }, // backpack on ground
+            MapTile {
+                x: 100,
+                y: 111,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![MapItem {
+                    id: 100,
+                    count: None,
+                    contents: vec![],
+                }],
+            },
+            MapTile {
+                x: 100,
+                y: 112,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![MapItem {
+                    id: 100,
+                    count: None,
+                    contents: vec![],
+                }],
+            },
+            MapTile {
+                x: 100,
+                y: 113,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![MapItem {
+                    id: 100,
+                    count: None,
+                    contents: vec![],
+                }],
+            },
         ],
-        towns: vec![Town { id: 1, name: "Thais".into(), x: 100, y: 100, z: 7 }],
+        towns: vec![Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 100,
+            y: 100,
+            z: 7,
+        }],
         waypoints: vec![],
     };
     let mut sm = StaticMap::from_formats(&map, &otb);
@@ -347,7 +837,9 @@ pub(super) fn move_map() -> Arc<StaticMap> {
 /// Helper: drain ALL pending packets from `rx` and return them.
 pub(super) fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    while let Ok(p) = rx.try_recv() { out.push(p); }
+    while let Ok(p) = rx.try_recv() {
+        out.push(p);
+    }
     out
 }
 
@@ -357,7 +849,9 @@ pub(super) fn has_op(packets: &[Vec<u8>], op: u8) -> bool {
 }
 
 /// Wire position for inventory slot `slot` (TFS: x=0xFFFF, y=slot, z=0).
-pub(super) fn inv_pos(slot: u8) -> Position { Position::new(0xFFFF, u16::from(slot), 0) }
+pub(super) fn inv_pos(slot: u8) -> Position {
+    Position::new(0xFFFF, u16::from(slot), 0)
+}
 
 pub(super) fn outfit_window_looktypes(pkt: &[u8]) -> Vec<u16> {
     // [0xC8][AddOutfit current = 9][u8 count][per outfit: u16 lt, u16 namelen, name, u8 addons]...
@@ -387,7 +881,8 @@ pub(super) fn drain_find_icons(rx: &mut mpsc::Receiver<Vec<u8>>) -> Option<Vec<u
 }
 
 pub(super) fn count_sid_in_overlays(g: &Game, sid: u16) -> usize {
-    g.dynamic.values()
+    g.dynamic
+        .values()
         .map(|st| st.server_ids.iter().filter(|&&s| s == sid).count())
         .sum()
 }

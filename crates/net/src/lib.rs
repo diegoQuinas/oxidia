@@ -51,11 +51,13 @@ pub enum NetError {
 ///
 /// In M0 a connection handler simply logs connect/disconnect and drains bytes.
 pub async fn serve(proto: Protocol, addr: SocketAddr) -> Result<(), NetError> {
-    let listener = TcpListener::bind(addr).await.map_err(|source| NetError::Bind {
-        proto: proto.label(),
-        addr,
-        source,
-    })?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|source| NetError::Bind {
+            proto: proto.label(),
+            addr,
+            source,
+        })?;
 
     info!(protocol = proto.label(), %addr, "listening");
 
@@ -89,11 +91,13 @@ where
     H: Fn(TcpStream, SocketAddr) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = TcpListener::bind(addr).await.map_err(|source| NetError::Bind {
-        proto: proto.label(),
-        addr,
-        source,
-    })?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|source| NetError::Bind {
+            proto: proto.label(),
+            addr,
+            source,
+        })?;
 
     info!(protocol = proto.label(), %addr, "listening");
 

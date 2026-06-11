@@ -1,0 +1,54 @@
+# openspec/config.yaml — Oxidia (Rust Tibia 10.98 server)
+schema: spec-driven
+
+context: |
+  Tech stack: Rust (edition 2024, MSRV 1.85, toolchain 1.96), Cargo workspace (6 crates),
+    Tokio async runtime, SQLx + SQLite persistence, mlua (Lua 5.4) scripting.
+  Architecture: Actor model — single tokio actor owns all world state, mpsc channels
+    for commands, no Arc<Mutex>. Protocol: TFS 10.98, OTClient Redemption (mehah/otclient).
+  Testing: cargo test (403 tests, 49 files), clippy -D warnings, rustfmt.
+    #![forbid(unsafe_code)] in every crate.
+  Safety: Memory-safe by construction — no unsafe, lock-free via actor model.
+
+rules:
+  proposal:
+    - Include TDD-first scope unless spike exception is justified
+    - Reference the milestone (M#) this change targets
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Reference TFS 1.4.2 line numbers for protocol/behavior claims
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+    - Verify wire format byte-faithfulness in design
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    - Follow existing code patterns (world actor commands, protocol encoders/decoders)
+    tdd: true
+    test_command: cargo test
+  verify:
+    test_command: cargo test
+    build_command: cargo build
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
+    - Verify existing tests still pass before archiving
+
+testing:
+  strict_tdd: true
+  runner:
+    command: cargo test
+    framework: Rust built-in (cargo test)
+  layers:
+    unit: true
+    integration: true
+    e2e: false
+  quality:
+    linter: cargo clippy --all-targets -- -D warnings
+    type_checker: rustc (inherent)
+    formatter: cargo fmt
+  coverage:
+    available: false

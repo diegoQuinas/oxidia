@@ -46,12 +46,9 @@ pub fn encrypt(data: &mut [u8], keys: &RoundKeys) {
     while i < keys.len() {
         for block in data.chunks_exact_mut(8) {
             let (mut left, mut right) = read_block(block);
-            left = left.wrapping_add(
-                (((right << 4) ^ (right >> 5)).wrapping_add(right)) ^ keys[i],
-            );
-            right = right.wrapping_add(
-                (((left << 4) ^ (left >> 5)).wrapping_add(left)) ^ keys[i + 1],
-            );
+            left = left.wrapping_add((((right << 4) ^ (right >> 5)).wrapping_add(right)) ^ keys[i]);
+            right =
+                right.wrapping_add((((left << 4) ^ (left >> 5)).wrapping_add(left)) ^ keys[i + 1]);
             write_block(block, left, right);
         }
         i += 2;
@@ -63,12 +60,9 @@ pub fn decrypt(data: &mut [u8], keys: &RoundKeys) {
     for i in (1..keys.len()).rev().step_by(2) {
         for block in data.chunks_exact_mut(8) {
             let (mut left, mut right) = read_block(block);
-            right = right.wrapping_sub(
-                (((left << 4) ^ (left >> 5)).wrapping_add(left)) ^ keys[i],
-            );
-            left = left.wrapping_sub(
-                (((right << 4) ^ (right >> 5)).wrapping_add(right)) ^ keys[i - 1],
-            );
+            right = right.wrapping_sub((((left << 4) ^ (left >> 5)).wrapping_add(left)) ^ keys[i]);
+            left = left
+                .wrapping_sub((((right << 4) ^ (right >> 5)).wrapping_add(right)) ^ keys[i - 1]);
             write_block(block, left, right);
         }
     }
@@ -133,7 +127,8 @@ mod tests {
         let mut sum: u32 = 0;
         for _ in 0..32 {
             v0 = v0.wrapping_add(
-                (((v1 << 4) ^ (v1 >> 5)).wrapping_add(v1)) ^ sum.wrapping_add(key[(sum & 3) as usize]),
+                (((v1 << 4) ^ (v1 >> 5)).wrapping_add(v1))
+                    ^ sum.wrapping_add(key[(sum & 3) as usize]),
             );
             sum = sum.wrapping_add(DELTA);
             v1 = v1.wrapping_add(
@@ -161,8 +156,14 @@ mod tests {
 
         encrypt(&mut block, &expand_key(&key));
 
-        assert_eq!(u32::from_le_bytes(block[0..4].try_into().unwrap()), expected[0]);
-        assert_eq!(u32::from_le_bytes(block[4..8].try_into().unwrap()), expected[1]);
+        assert_eq!(
+            u32::from_le_bytes(block[0..4].try_into().unwrap()),
+            expected[0]
+        );
+        assert_eq!(
+            u32::from_le_bytes(block[4..8].try_into().unwrap()),
+            expected[1]
+        );
     }
 
     #[test]

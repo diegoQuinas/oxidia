@@ -1,7 +1,10 @@
 //! Combat behavior (targeting, damage, death, ticks) for the game actor.
 
+use std::collections::VecDeque;
+
 use super::*;
 use crate::combat;
+use rand::Rng;
 
 impl Game {
     /// Handle `0xA1` — set or clear the attacker's melee target.
@@ -10,7 +13,7 @@ impl Game {
     /// - `target_id == id` (self-attack) is ignored.
     /// - Attacker on a PZ tile → push `0xB4` and do NOT set target
     ///   (`combat.cpp:294-297`, TFS `playerSetAttackedCreature`).
-    /// - Unknown target is silently ignored.
+    /// - Unknown target (player or monster) is silently ignored.
     pub(super) fn do_set_target(&mut self, id: u32, target_id: u32) {
         if target_id == 0 {
             if let Some(p) = self.players.get_mut(&id) {
@@ -28,12 +31,14 @@ impl Game {
         };
         // PZ check on the attacker's tile.
         if self.map.is_protection_zone(attacker_pos) {
-            self.push_status_message(id,
-                b"You may not attack a person while you are in a protection zone.");
+            self.push_status_message(
+                id,
+                b"You may not attack while you are in a protection zone.",
+            );
             return;
         }
-        // Target must exist.
-        if !self.players.contains_key(&target_id) {
+        // Target must exist (player or monster).
+        if !self.creature_exists(target_id) {
             return;
         }
         if let Some(p) = self.players.get_mut(&id) {
@@ -56,7 +61,7 @@ impl Game {
                 None => return,
             };
             let before = v.health;
-            v.health = v.health.saturating_sub(dmg.max(0) as u16);
+            v.health = v.health.saturating_sub(dmg.max(0) as u32);
             (before, v.health, v.max_health)
         };
         let victim_pos = match self.players.get(&victim_id) {
@@ -65,10 +70,11 @@ impl Game {
         };
         // Push 0x8C health-bar to every spectator of the victim's tile,
         // INCLUDING the victim itself (it is also a spectator of its own tile).
-        let pct = combat_packets::health_percent(i32::from(new_health), i32::from(max_health));
+        let pct = combat_packets::health_percent(new_health as i32, max_health as i32);
         let health_bar = combat_packets::creature_health(victim_id, pct);
         // Collect spectators first (can_see of the victim's tile), then push.
-        let spectators: Vec<u32> = self.players
+        let spectators: Vec<u32> = self
+            .players
             .iter()
             .filter(|&(&sid, sp)| Self::can_see(sp.position, victim_pos) || sid == victim_id)
             .map(|(&sid, _)| sid)
@@ -78,10 +84,13 @@ impl Game {
         }
         // Push 0xA0 self-stats to the victim only.
         let stats = {
-            let p = match self.players.get(&victim_id) { Some(p) => p, None => return };
+            let p = match self.players.get(&victim_id) {
+                Some(p) => p,
+                None => return,
+            };
             enter_world::stats(&enter_world::Stats {
-                health: p.health,
-                max_health: p.max_health,
+                health: p.health as u16,
+                max_health: p.max_health as u16,
                 free_capacity: 40_000,
                 total_capacity: 40_000,
                 experience: 0,
@@ -92,7 +101,7 @@ impl Game {
                 magic_level: 0,
                 soul: 100,
                 stamina_minutes: 2520,
-                base_speed: 220,
+                base_speed: p.speed,
             })
         };
         self.push(victim_id, stats);
@@ -101,7 +110,11 @@ impl Game {
         // wire value is the enum value (CONST_ME_DRAWBLOOD = 1). See
         // enter_world::EFFECT_DRAWBLOOD.
         let effect = enter_world::magic_effect(
-            victim_pos.x, victim_pos.y, victim_pos.z, enter_world::EFFECT_DRAWBLOOD);
+            victim_pos.x,
+            victim_pos.y,
+            victim_pos.z,
+            enter_world::EFFECT_DRAWBLOOD,
+        );
         for sid in &spectators {
             self.push(*sid, effect.clone());
         }
@@ -110,26 +123,46 @@ impl Game {
         // an overkill shows the real hit. A 0 value renders nothing client-side,
         // so skip the packet entirely. The mode byte is routed per recipient:
         // the attacker sees "dealt", the victim "received", bystanders "others".
-        let applied = u32::from(health_before.saturating_sub(new_health));
+        let applied = health_before.saturating_sub(new_health);
         if applied > 0 {
-            let victim_name = self.players.get(&victim_id)
-                .map(|p| p.name.clone()).unwrap_or_default();
-            let attacker_name = self.players.get(&attacker_id)
-                .map(|p| p.name.clone()).unwrap_or_default();
+            let victim_name = self
+                .creature_name(victim_id)
+                .unwrap_or_default()
+                .to_string();
+            let attacker_name = self
+                .creature_name(attacker_id)
+                .unwrap_or_default()
+                .to_string();
             for sid in &spectators {
                 let (mode, text) = if *sid == attacker_id {
-                    (combat_packets::MSG_DAMAGE_DEALT,
-                     format!("You deal {applied} damage to {victim_name}."))
+                    (
+                        combat_packets::MSG_DAMAGE_DEALT,
+                        format!("You deal {applied} damage to {victim_name}."),
+                    )
                 } else if *sid == victim_id {
-                    (combat_packets::MSG_DAMAGE_RECEIVED,
-                     format!("You lose {applied} hitpoints due to an attack by {attacker_name}."))
+                    (
+                        combat_packets::MSG_DAMAGE_RECEIVED,
+                        format!(
+                            "You lose {applied} hitpoints due to an attack by {attacker_name}."
+                        ),
+                    )
                 } else {
-                    (combat_packets::MSG_DAMAGE_OTHERS,
-                     format!("{victim_name} loses {applied} hitpoints due to an attack by {attacker_name}."))
+                    (
+                        combat_packets::MSG_DAMAGE_OTHERS,
+                        format!(
+                            "{victim_name} loses {applied} hitpoints due to an attack by {attacker_name}."
+                        ),
+                    )
                 };
                 let pkt = combat_packets::damage_text(
-                    mode, victim_pos.x, victim_pos.y, victim_pos.z,
-                    applied, combat_packets::TEXTCOLOR_RED, text.as_bytes());
+                    mode,
+                    victim_pos.x,
+                    victim_pos.y,
+                    victim_pos.z,
+                    applied,
+                    combat_packets::TEXTCOLOR_RED,
+                    text.as_bytes(),
+                );
                 self.push(*sid, pkt);
             }
         }
@@ -154,12 +187,21 @@ impl Game {
             let _ = p.push_tx.try_send(combat_packets::death_window(0));
         }
 
-        // Clear all fights targeting the victim, and the victim's own fight.
-        let all_ids: Vec<u32> = self.players.keys().copied().collect();
-        for pid in all_ids {
+        // Clear all player fights targeting the victim, and the victim's own fight.
+        let all_players: Vec<u32> = self.players.keys().copied().collect();
+        for pid in all_players {
             if let Some(p) = self.players.get_mut(&pid) {
                 if p.attacking == Some(victim_id) || pid == victim_id {
                     p.attacking = None;
+                }
+            }
+        }
+        // Clear all monster fights targeting the victim.
+        let all_monsters: Vec<u32> = self.monsters.keys().copied().collect();
+        for mid in all_monsters {
+            if let Some(m) = self.monsters.get_mut(&mid) {
+                if m.attacking == Some(victim_id) {
+                    m.attacking = None;
                 }
             }
         }
@@ -176,7 +218,9 @@ impl Game {
         // from each spectator's known-set so a relog re-introduces it (full form).
         for spec in self.spectators(death_pos, victim_id) {
             self.push(spec, walk::remove_creature_by_id(victim_id));
-            if let Some(s) = self.players.get_mut(&spec) { s.known.remove(&victim_id); }
+            if let Some(s) = self.players.get_mut(&spec) {
+                s.known.remove(&victim_id);
+            }
         }
 
         // Remove the victim from the world (death == logout). Persist the player
@@ -187,7 +231,9 @@ impl Game {
         // client shows the death window and returns to character select. Mirrors
         // TFS onDeath -> sendReLoginWindow + removeCreature (player.cpp:2070, 2197);
         // the death-respawn position is the town temple.
-        let Some(p) = self.players.remove(&victim_id) else { return };
+        let Some(p) = self.players.remove(&victim_id) else {
+            return;
+        };
         if let Some(tx) = &self.save_tx {
             let _ = tx.send(SaveRecord {
                 name: p.name.clone(),
@@ -197,79 +243,402 @@ impl Game {
                 health: p.max_health,
                 max_health: p.max_health,
                 sex: p.sex,
-                inventory: p.inventory.iter().enumerate()
-                    .filter_map(|(i, slot)| slot.map(|it| ((i + 1) as u8, it.server_id, it.count.unwrap_or(1))))
+                inventory: p
+                    .inventory
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, slot)| {
+                        slot.map(|it| ((i + 1) as u8, it.server_id, it.count.unwrap_or(1)))
+                    })
                     .collect(),
                 container_items: Self::export_container_items(&p.inventory, &p.open_containers),
             });
         }
+    }
 
+    /// Apply `dmg` hit points of damage to `victim_id` (a monster), dealt by
+    /// `attacker_id`. Reduces HP, pushes health-bar (`0x8C`) to all player
+    /// spectators, emits the physical-hit blood effect plus floating damage
+    /// number, and fires `do_monster_death` on 0 HP.
+    fn apply_monster_damage(&mut self, attacker_id: u32, victim_id: u32, dmg: i32, now_ms: u64) {
+        let (health_before, new_health) = {
+            let m = match self.monsters.get_mut(&victim_id) {
+                Some(m) => m,
+                None => return,
+            };
+            let before = m.health;
+            m.health = m.health.saturating_sub(dmg.max(0) as u32);
+            (before, m.health)
+        };
+        let victim_pos = match self.monsters.get(&victim_id) {
+            Some(m) => m.position,
+            None => return,
+        };
+        // Push health-bar to every player who can see the monster's tile.
+        let max_hp = self
+            .monsters
+            .get(&victim_id)
+            .map(|m| m.max_health)
+            .unwrap_or(1);
+        let pct = combat_packets::health_percent(new_health as i32, max_hp as i32);
+        let health_bar = combat_packets::creature_health(victim_id, pct);
+        let player_spectators: Vec<u32> = self
+            .players
+            .iter()
+            .filter(|&(_, sp)| Self::can_see(sp.position, victim_pos))
+            .map(|(&sid, _)| sid)
+            .collect();
+        for sid in &player_spectators {
+            self.push(*sid, health_bar.clone());
+        }
+
+        // Physical-hit blood effect to all player spectators.
+        let effect = enter_world::magic_effect(
+            victim_pos.x,
+            victim_pos.y,
+            victim_pos.z,
+            enter_world::EFFECT_DRAWBLOOD,
+        );
+        for sid in &player_spectators {
+            self.push(*sid, effect.clone());
+        }
+
+        // Floating damage number.
+        let applied = health_before.saturating_sub(new_health);
+        if applied > 0 {
+            let monster_name = self
+                .creature_name(victim_id)
+                .unwrap_or_default()
+                .to_string();
+            let attacker_name = self
+                .creature_name(attacker_id)
+                .unwrap_or_default()
+                .to_string();
+            for sid in &player_spectators {
+                let (mode, text) = if *sid == attacker_id {
+                    (
+                        combat_packets::MSG_DAMAGE_DEALT,
+                        format!("You deal {applied} damage to {monster_name}."),
+                    )
+                } else {
+                    (
+                        combat_packets::MSG_DAMAGE_OTHERS,
+                        format!(
+                            "{monster_name} loses {applied} hitpoints due to an attack by {attacker_name}."
+                        ),
+                    )
+                };
+                let pkt = combat_packets::damage_text(
+                    mode,
+                    victim_pos.x,
+                    victim_pos.y,
+                    victim_pos.z,
+                    applied,
+                    combat_packets::TEXTCOLOR_RED,
+                    text.as_bytes(),
+                );
+                self.push(*sid, pkt);
+            }
+        }
+
+        // Retaliation: if the monster survived, start attacking back.
+        if new_health > 0 {
+            if let Some(m) = self.monsters.get_mut(&victim_id) {
+                if m.attacking.is_none() {
+                    m.attacking = Some(attacker_id);
+                    m.last_attack_ms = 0;
+                }
+            }
+        }
+
+        // Death?
+        if new_health == 0 {
+            self.do_monster_death(victim_id, now_ms);
+        }
+    }
+
+    /// Handle the death of a monster: notify all player spectators (remove +
+    /// known-set cleanup), clear all fights targeting this monster, drop it
+    /// from the monster registry, and spawn loot on the death tile. If the
+    /// monster had a spawn entry, schedule a respawn.
+    fn do_monster_death(&mut self, victim_id: u32, now_ms: u64) {
+        let (spawn_id, death_pos, loot) = match self.monsters.get(&victim_id) {
+            Some(m) => (m.spawn_id, m.position, m.loot.clone()),
+            None => return,
+        };
+
+        // Clear all player fights targeting the monster.
+        let all_players: Vec<u32> = self.players.keys().copied().collect();
+        for pid in all_players {
+            if let Some(p) = self.players.get_mut(&pid) {
+                if p.attacking == Some(victim_id) {
+                    p.attacking = None;
+                }
+            }
+        }
+        // Clear all monster fights targeting the monster.
+        let all_monsters: Vec<u32> = self.monsters.keys().copied().collect();
+        for mid in all_monsters {
+            if let Some(m) = self.monsters.get_mut(&mid) {
+                if m.attacking == Some(victim_id) {
+                    m.attacking = None;
+                }
+            }
+        }
+
+        // Remove from the death tile for all player spectators.
+        for spec in self.spectators(death_pos, u32::MAX) {
+            self.push(spec, walk::remove_creature_by_id(victim_id));
+            if let Some(s) = self.players.get_mut(&spec) {
+                s.known.remove(&victim_id);
+            }
+        }
+
+        // Drop the monster.
+        self.monsters.remove(&victim_id);
+
+        // Schedule a respawn if this monster belonged to a spawn point.
+        if let Some(sid) = spawn_id {
+            if let Some(spawn) = self.spawns.get_mut(&sid) {
+                spawn.respawn_at_ms = Some(now_ms + spawn.respawn_interval_ms);
+            }
+        }
+
+        // Spawn loot on the death tile.
+        self.spawn_loot(death_pos, &loot);
+    }
+
+    /// Roll the loot table and spawn items on the ground at `pos`.
+    fn spawn_loot(&mut self, pos: Position, loot: &[MonsterDrop]) {
+        if !self.materialize(pos) {
+            return;
+        }
+        let mut stack_len = self
+            .dynamic
+            .get(&(pos.x, pos.y, pos.z))
+            .map(|st| st.items.len())
+            .unwrap_or(0);
+
+        for drop in loot {
+            if stack_len >= 10 {
+                break;
+            } // tile cap
+            if !self.rng.gen_bool(drop.chance) {
+                continue;
+            }
+
+            let Some(meta) = self.map.item_meta(drop.item_id) else {
+                continue;
+            };
+            let subtype = if meta.stackable {
+                Some(drop.count)
+            } else {
+                None
+            };
+            let wi = WireItem {
+                client_id: meta.client_id,
+                subtype,
+                animated: meta.animated,
+            };
+
+            let dest_creatures = self.creatures_on(pos).len();
+            {
+                let st = self.dynamic.get_mut(&(pos.x, pos.y, pos.z)).unwrap();
+                let front = st.pre_creature_len;
+                st.items.insert(front, wi);
+                st.server_ids.insert(front, drop.item_id);
+                st.counts.insert(front, subtype);
+            }
+            let front = self
+                .dynamic
+                .get(&(pos.x, pos.y, pos.z))
+                .map(|st| st.pre_creature_len)
+                .unwrap_or(0);
+            let sp = (front + dest_creatures).min(9) as u8;
+            self.broadcast_dest(pos, sp, wi, false);
+            stack_len += 1;
+        }
     }
 
     /// Global combat tick. Iterates all players with an active target and, for
     /// each whose attack interval has elapsed, rolls one swing. Out-of-range or
     /// missing targets clear the fight without damage.
     pub(super) fn on_combat_tick(&mut self, now_ms: u64) {
-        // Collect (attacker_id, target_id) pairs to process; avoid double-borrow.
-        let fights: Vec<(u32, u32)> = self.players
+        // --- Player attackers (existing) ---
+        let player_fights: Vec<(u32, u32)> = self
+            .players
             .iter()
             .filter_map(|(&id, p)| p.attacking.map(|tid| (id, tid)))
             .collect();
+        for (attacker_id, target_id) in player_fights {
+            self.process_player_attack(attacker_id, target_id, now_ms);
+        }
 
-        for (attacker_id, target_id) in fights {
-            // Target gone? Clear the fight.
-            let target_pos = match self.players.get(&target_id) {
-                Some(p) => p.position,
-                None => {
-                    if let Some(p) = self.players.get_mut(&attacker_id) { p.attacking = None; }
-                    continue;
-                }
-            };
-            let (attacker_pos, last_attack, fist_skill) = match self.players.get(&attacker_id) {
-                Some(p) => (p.position, p.last_attack_ms, p.fist_skill),
+        // --- Monster attackers (M12.3) ---
+        let monster_fights: Vec<(u32, u32)> = self
+            .monsters
+            .iter()
+            .filter_map(|(&id, m)| m.attacking.map(|tid| (id, tid)))
+            .collect();
+        for (attacker_id, target_id) in monster_fights {
+            self.process_monster_attack(attacker_id, target_id, now_ms);
+        }
+
+        // --- Respawn overdue spawn points (M12.5) ---
+        self.process_respawns(now_ms);
+    }
+
+    /// Check all spawn points for overdue respawns and create the monster.
+    fn process_respawns(&mut self, now_ms: u64) {
+        let due: Vec<u32> = self
+            .spawns
+            .iter()
+            .filter(|(_, s)| s.respawn_at_ms.is_some_and(|t| t <= now_ms))
+            .map(|(&id, _)| id)
+            .collect();
+        for sid in due {
+            let spawn = match self.spawns.get(&sid) {
+                Some(s) => s.clone(),
                 None => continue,
             };
-            // W3 fix: TFS clears the fight the moment EITHER party is in a PZ
-            // (`canTargetCreature` combat.cpp:221-229; `onAttackedCreatureChangeZone`
-            // player.cpp:1153). A victim who fled into the temple must stop taking
-            // hits on the very next tick — clearing `attacking` (not just skipping
-            // the swing) so the attacker also gets their combat state cleared.
-            if self.map.is_protection_zone(attacker_pos)
-                || self.map.is_protection_zone(target_pos)
-            {
-                if let Some(p) = self.players.get_mut(&attacker_id) { p.attacking = None; }
-                continue;
+            // Clear the respawn timer.
+            self.spawns.get_mut(&sid).unwrap().respawn_at_ms = None;
+
+            let mid = self.next_monster_id;
+            self.next_monster_id += 1;
+            let monster = MonsterState {
+                name: spawn.name,
+                position: spawn.position,
+                direction: Direction::South,
+                health: spawn.health,
+                max_health: spawn.max_health,
+                speed: spawn.speed,
+                look_type: spawn.look_type,
+                attacking: None,
+                last_attack_ms: 0,
+                attack: spawn.attack,
+                loot: spawn.loot,
+                spawn_id: Some(sid),
+                list_walk_dir: VecDeque::new(),
+                follow_target: None,
+                target_distance: spawn.target_distance,
+            };
+            self.monsters.insert(mid, monster);
+            // Broadcast the resawned monster.
+            for spec in self.spectators(spawn.position, u32::MAX) {
+                if let Some(bytes) = self.introduce(spec, mid) {
+                    let stackpos = self.creature_stackpos_on(spawn.position, mid);
+                    self.push(
+                        spec,
+                        tile_creature::add_tile_creature(
+                            (spawn.position.x, spawn.position.y, spawn.position.z),
+                            stackpos,
+                            &bytes,
+                        ),
+                    );
+                }
             }
-            // Interval check.
-            if now_ms.saturating_sub(last_attack) < MELEE_ATTACK_INTERVAL_MS {
-                continue;
+        }
+    }
+
+    /// Process a player's melee attack against `target_id`.
+    fn process_player_attack(&mut self, attacker_id: u32, target_id: u32, now_ms: u64) {
+        let target_pos = match self.creature_position(target_id) {
+            Some(pos) => pos,
+            None => {
+                if let Some(p) = self.players.get_mut(&attacker_id) {
+                    p.attacking = None;
+                }
+                return;
             }
-            // Same-floor Chebyshev ≤ 1 (TFS `useFist` range check).
-            if attacker_pos.z != target_pos.z {
-                continue; // cross-floor melee impossible
-            }
-            let dx = (i32::from(attacker_pos.x) - i32::from(target_pos.x)).abs();
-            let dy = (i32::from(attacker_pos.y) - i32::from(target_pos.y)).abs();
-            if dx > 1 || dy > 1 {
-                continue; // out of melee range, no swing this tick
-            }
-            // Roll damage.
-            let dmg = combat::fist_damage(&mut self.rng, 1, fist_skill);
-            // Update last_attack_ms before applying damage (apply_damage may call
-            // do_death which removes the attacker's fight — the timestamp update
-            // must not be lost in that chain).
+        };
+        let (attacker_pos, last_attack, fist_skill) = match self.players.get(&attacker_id) {
+            Some(p) => (p.position, p.last_attack_ms, p.fist_skill),
+            None => return,
+        };
+        let target_is_player = self.players.contains_key(&target_id);
+        if self.map.is_protection_zone(attacker_pos)
+            || (target_is_player && self.map.is_protection_zone(target_pos))
+        {
             if let Some(p) = self.players.get_mut(&attacker_id) {
-                p.last_attack_ms = now_ms;
+                p.attacking = None;
             }
+            return;
+        }
+        if now_ms.saturating_sub(last_attack) < MELEE_ATTACK_INTERVAL_MS {
+            return;
+        }
+        if attacker_pos.z != target_pos.z {
+            return;
+        }
+        let dx = (i32::from(attacker_pos.x) - i32::from(target_pos.x)).abs();
+        let dy = (i32::from(attacker_pos.y) - i32::from(target_pos.y)).abs();
+        if dx > 1 || dy > 1 {
+            return;
+        }
+        let dmg = combat::fist_damage(&mut self.rng, 1, fist_skill);
+        if let Some(p) = self.players.get_mut(&attacker_id) {
+            p.last_attack_ms = now_ms;
+        }
+        if target_is_player {
             self.apply_damage(attacker_id, target_id, dmg);
+        } else {
+            self.apply_monster_damage(attacker_id, target_id, dmg, now_ms);
+        }
+    }
+
+    /// Process a monster's melee attack against `target_id` (player or monster).
+    fn process_monster_attack(&mut self, attacker_id: u32, target_id: u32, now_ms: u64) {
+        let target_pos = match self.creature_position(target_id) {
+            Some(pos) => pos,
+            None => {
+                if let Some(m) = self.monsters.get_mut(&attacker_id) {
+                    m.attacking = None;
+                }
+                return;
+            }
+        };
+        let target_is_player = self.players.contains_key(&target_id);
+        let (attacker_pos, last_attack, attack) = match self.monsters.get(&attacker_id) {
+            Some(m) => (m.position, m.last_attack_ms, m.attack),
+            None => return,
+        };
+        // PZ check: attacker in PZ always clears; target PZ only matters for players.
+        if self.map.is_protection_zone(attacker_pos)
+            || (target_is_player && self.map.is_protection_zone(target_pos))
+        {
+            if let Some(m) = self.monsters.get_mut(&attacker_id) {
+                m.attacking = None;
+            }
+            return;
+        }
+        if now_ms.saturating_sub(last_attack) < MELEE_ATTACK_INTERVAL_MS {
+            return;
+        }
+        if attacker_pos.z != target_pos.z {
+            return;
+        }
+        let dx = (i32::from(attacker_pos.x) - i32::from(target_pos.x)).abs();
+        let dy = (i32::from(attacker_pos.y) - i32::from(target_pos.y)).abs();
+        if dx > 1 || dy > 1 {
+            return;
+        }
+        let dmg: i32 = self.rng.gen_range(0..=attack).into();
+        if let Some(m) = self.monsters.get_mut(&attacker_id) {
+            m.last_attack_ms = now_ms;
+        }
+        if target_is_player {
+            self.apply_damage(attacker_id, target_id, dmg);
+        } else {
+            self.apply_monster_damage(attacker_id, target_id, dmg, now_ms);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_support::*;
+    use super::*;
 
     // -------------------------------------------------------------------------
     // M7 combat tests
@@ -281,7 +650,11 @@ mod tests {
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
-        assert_eq!(g.players[&a].attacking, Some(b), "set_target should store target id");
+        assert_eq!(
+            g.players[&a].attacking,
+            Some(b),
+            "set_target should store target id"
+        );
         g.do_set_target(a, 0);
         assert_eq!(g.players[&a].attacking, None, "target 0 clears the fight");
     }
@@ -292,7 +665,10 @@ mod tests {
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         g.do_set_target(a, a);
         assert_eq!(g.players[&a].attacking, None, "self-target must be ignored");
-        assert!(ra.try_recv().is_err(), "self-target must not push any packet");
+        assert!(
+            ra.try_recv().is_err(),
+            "self-target must not push any packet"
+        );
     }
 
     #[test]
@@ -303,9 +679,15 @@ mod tests {
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7)); // PZ tile
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
-        assert_eq!(g.players[&a].attacking, None, "PZ attacker must not get a target");
+        assert_eq!(
+            g.players[&a].attacking, None,
+            "PZ attacker must not get a target"
+        );
         let pkt = ra.try_recv().expect("PZ rejection must push a 0xB4 packet");
-        assert_eq!(pkt[0], 0xB4, "PZ rejection packet must be a text message (0xB4)");
+        assert_eq!(
+            pkt[0], 0xB4,
+            "PZ rejection packet must be a text message (0xB4)"
+        );
     }
 
     #[test]
@@ -327,9 +709,14 @@ mod tests {
         // we can only assert B received a 0x8C packet (spectator of own tile).
         let _ = b_hp_before;
         let _ = b_hp_after;
-        let pkt = rb.try_recv().expect("victim must receive at least a 0x8C health-bar");
-        assert_eq!(pkt[0], protocol::combat_packets::OP_CREATURE_HEALTH,
-            "first packet must be 0x8C (health-bar)");
+        let pkt = rb
+            .try_recv()
+            .expect("victim must receive at least a 0x8C health-bar");
+        assert_eq!(
+            pkt[0],
+            protocol::combat_packets::OP_CREATURE_HEALTH,
+            "first packet must be 0x8C (health-bar)"
+        );
     }
 
     #[test]
@@ -343,8 +730,14 @@ mod tests {
         // Drain the 0x8C (spectator of own tile, health-bar first)
         let _ = rb.try_recv().expect("0x8C expected");
         // Then the 0xA0 self-stats
-        let stats_pkt = rb.try_recv().expect("victim must also receive its own 0xA0 stats");
-        assert_eq!(stats_pkt[0], protocol::enter_world::OP_STATS, "0xA0 self-stats expected");
+        let stats_pkt = rb
+            .try_recv()
+            .expect("victim must also receive its own 0xA0 stats");
+        assert_eq!(
+            stats_pkt[0],
+            protocol::enter_world::OP_STATS,
+            "0xA0 self-stats expected"
+        );
     }
 
     #[test]
@@ -357,7 +750,9 @@ mod tests {
         let (_spec, mut rx_spec) = add_player(&mut g, Position::new(95, 116, 7));
         g.do_set_target(a, b);
         g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
-        let pkt = rx_spec.try_recv().expect("spectator must receive 0x8C health bar");
+        let pkt = rx_spec
+            .try_recv()
+            .expect("spectator must receive 0x8C health bar");
         assert_eq!(pkt[0], protocol::combat_packets::OP_CREATURE_HEALTH);
     }
 
@@ -369,7 +764,10 @@ mod tests {
         let (b, mut rb) = add_player(&mut g, Position::new(97, 117, 7)); // 2 tiles east
         g.do_set_target(a, b);
         g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
-        assert!(rb.try_recv().is_err(), "out-of-range target should receive no packets");
+        assert!(
+            rb.try_recv().is_err(),
+            "out-of-range target should receive no packets"
+        );
     }
 
     #[test]
@@ -381,7 +779,10 @@ mod tests {
         g.do_set_target(a, b);
         // Send a tick at t=1000ms (< 2000ms interval) → no swing.
         g.on_combat_tick(1000);
-        assert!(rb.try_recv().is_err(), "tick before interval elapses must not produce damage");
+        assert!(
+            rb.try_recv().is_err(),
+            "tick before interval elapses must not produce damage"
+        );
     }
 
     #[test]
@@ -407,14 +808,25 @@ mod tests {
                     saw_death_window = true;
                 }
             }
-            if !g.players.contains_key(&b) { break; }
+            if !g.players.contains_key(&b) {
+                break;
+            }
         }
 
-        assert!(saw_death_window, "dying player must receive the 0x28 death window");
-        assert!(!g.players.contains_key(&b), "victim must be removed from the world on death");
+        assert!(
+            saw_death_window,
+            "dying player must receive the 0x28 death window"
+        );
+        assert!(
+            !g.players.contains_key(&b),
+            "victim must be removed from the world on death"
+        );
         let rec = save_rx.try_recv().expect("death must emit a SaveRecord");
         assert_eq!(rec.position, temple, "death saves the player at the temple");
-        assert_eq!(rec.health, rec.max_health, "death saves the player at full HP");
+        assert_eq!(
+            rec.health, rec.max_health,
+            "death saves the player at full HP"
+        );
     }
 
     #[test]
@@ -433,10 +845,21 @@ mod tests {
             g.push(b, vec![0u8]);
         }
         g.do_death(b);
-        let rec = save_rx.try_recv().expect("death must emit a SaveRecord even with a full buffer");
-        assert_eq!(rec.position, temple, "death saves at the temple even with a full client buffer");
-        assert_eq!(rec.health, rec.max_health, "death saves full HP even with a full client buffer");
-        assert!(!g.players.contains_key(&b), "victim must be removed from the world");
+        let rec = save_rx
+            .try_recv()
+            .expect("death must emit a SaveRecord even with a full buffer");
+        assert_eq!(
+            rec.position, temple,
+            "death saves at the temple even with a full client buffer"
+        );
+        assert_eq!(
+            rec.health, rec.max_health,
+            "death saves full HP even with a full client buffer"
+        );
+        assert!(
+            !g.players.contains_key(&b),
+            "victim must be removed from the world"
+        );
     }
 
     #[test]
@@ -452,10 +875,18 @@ mod tests {
         for tick in 1..=200u64 {
             g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
             while rb.try_recv().is_ok() {} // drain packets
-            if !g.players.contains_key(&b) { break; }
+            if !g.players.contains_key(&b) {
+                break;
+            }
         }
-        assert!(!g.players.contains_key(&b), "victim must be removed from the world on death");
-        assert_eq!(g.players[&a].attacking, None, "attacker's fight must clear on target death");
+        assert!(
+            !g.players.contains_key(&b),
+            "victim must be removed from the world on death"
+        );
+        assert_eq!(
+            g.players[&a].attacking, None,
+            "attacker's fight must clear on target death"
+        );
     }
 
     #[test]
@@ -487,8 +918,16 @@ mod tests {
             }
         }
         let pkt = remove_pkt.expect("spectator must receive a 0x6C remove on the victim's death");
-        assert_eq!(&pkt[1..3], &[0xFF, 0xFF], "death remove must be id-form (co-occupancy safe)");
-        assert_eq!(&pkt[3..7], &b.to_le_bytes(), "id-form remove carries the victim id");
+        assert_eq!(
+            &pkt[1..3],
+            &[0xFF, 0xFF],
+            "death remove must be id-form (co-occupancy safe)"
+        );
+        assert_eq!(
+            &pkt[3..7],
+            &b.to_le_bytes(),
+            "id-form remove carries the victim id"
+        );
     }
 
     #[test]
@@ -502,7 +941,10 @@ mod tests {
         assert_eq!(g.players[&a].attacking, Some(b));
         g.logout(b); // B disconnects
         g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
-        assert_eq!(g.players[&a].attacking, None, "attacker must clear when target logs out");
+        assert_eq!(
+            g.players[&a].attacking, None,
+            "attacker must clear when target logs out"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -541,5 +983,645 @@ mod tests {
             rb.try_recv().is_err(),
             "target in PZ must receive no damage (no 0x8C) on tick"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // M12.2 monster combat tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn set_target_on_monster_sets_attacking() {
+        let mut g = Game::new(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.do_set_target(a, m);
+        assert_eq!(g.players[&a].attacking, Some(m));
+    }
+
+    #[test]
+    fn set_target_on_unknown_creature_is_ignored() {
+        let mut g = Game::new(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        // 0x4000_0001 doesn't exist as a player or monster.
+        g.do_set_target(a, 0x4000_0001);
+        assert_eq!(g.players[&a].attacking, None);
+    }
+
+    #[test]
+    fn set_target_on_monster_from_pz_rejects() {
+        let mut g = Game::new(wide_combat_map_with_pz());
+        let (a, _ra) = add_player(&mut g, Position::new(90, 117, 7)); // PZ tile
+        let m = add_monster(&mut g, Position::new(95, 117, 7));
+        g.do_set_target(a, m);
+        assert_eq!(
+            g.players[&a].attacking, None,
+            "attacker in PZ must not be allowed to set target on any creature"
+        );
+    }
+
+    #[test]
+    fn combat_tick_deals_damage_to_monster() {
+        let mut g = Game::new(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.do_set_target(a, m);
+        let hp_before = g.monsters[&m].health;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        let hp_after = g.monsters[&m].health;
+        assert!(
+            hp_after <= hp_before,
+            "monster HP must not increase after combat tick"
+        );
+        // Attacker must receive a 0x8C health-bar.
+        let pkt = ra
+            .try_recv()
+            .expect("attacker must receive a 0x8C for monster health-bar");
+        assert_eq!(pkt[0], protocol::combat_packets::OP_CREATURE_HEALTH);
+    }
+
+    #[test]
+    fn combat_tick_kills_monster() {
+        // Monster with 50 HP: player with fist_skill 10 lands at most ~7 dmg per
+        // swing; kill needs many ticks if damage rolls low (min 0). Loop and drain
+        // packets until the monster dies.
+        let mut g = Game::new(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().health = 1;
+        g.do_set_target(a, m);
+        for tick in 1..=5u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            if !g.monsters.contains_key(&m) {
+                break;
+            }
+        }
+        // Monster removed.
+        assert!(
+            !g.monsters.contains_key(&m),
+            "monster must be removed on death"
+        );
+        // Attacker's fight cleared.
+        assert_eq!(
+            g.players[&a].attacking, None,
+            "attacker's fight must clear on monster death"
+        );
+        // Spectator (the attacker, who can see the death tile) must have received
+        // a 0x6C id-form remove packet.
+        let mut saw_remove = false;
+        while let Ok(pkt) = ra.try_recv() {
+            if pkt.first() == Some(&0x6C) && pkt.len() >= 7 && pkt[3..7] == m.to_le_bytes() {
+                saw_remove = true;
+            }
+        }
+        assert!(
+            saw_remove,
+            "attacker must receive 0x6C remove for the monster on death"
+        );
+    }
+
+    #[test]
+    fn combat_tick_monster_spectator_receives_health_bar() {
+        let mut g = Game::new(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (_spec, mut rx_spec) = add_player(&mut g, Position::new(95, 116, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.do_set_target(a, m);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        let pkt = rx_spec
+            .try_recv()
+            .expect("spectator must receive 0x8C for monster health bar");
+        assert_eq!(pkt[0], protocol::combat_packets::OP_CREATURE_HEALTH);
+    }
+
+    #[test]
+    fn combat_tick_monster_no_damage_when_out_of_melee_range() {
+        let mut g = Game::new(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(97, 117, 7)); // 2 tiles east
+        g.do_set_target(a, m);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert!(
+            ra.try_recv().is_err(),
+            "out-of-range monster should produce no packets"
+        );
+    }
+
+    #[test]
+    fn combat_tick_monster_respects_interval() {
+        let mut g = Game::new(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.do_set_target(a, m);
+        g.on_combat_tick(1000); // < 2000ms interval
+        assert!(
+            ra.try_recv().is_err(),
+            "tick before interval must not produce damage packets"
+        );
+    }
+
+    #[test]
+    fn combat_tick_monster_does_not_clear_in_pz() {
+        // Monsters are never PZ-checked: combat in PZ against a monster is ok
+        // (attacker not in PZ, monster on PZ tile — must NOT clear the fight).
+        let mut g = Game::new(wide_combat_map_with_pz());
+        let (a, _ra) = add_player(&mut g, Position::new(91, 117, 7)); // normal ground
+        let m = add_monster(&mut g, Position::new(90, 117, 7)); // PZ tile
+        g.do_set_target(a, m);
+        assert_eq!(
+            g.players[&a].attacking,
+            Some(m),
+            "targeting a monster on a PZ tile must be allowed"
+        );
+        let old_hp = g.monsters[&m].health;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(
+            g.players[&a].attacking,
+            Some(m),
+            "monster in PZ must NOT clear the attacker's fight"
+        );
+        let new_hp = g.monsters[&m].health;
+        assert!(
+            new_hp <= old_hp,
+            "monster on PZ tile must still take damage (monsters ignore PZ)"
+        );
+    }
+
+    #[test]
+    fn combat_tick_clears_monster_target_when_monster_dies_elsewhere() {
+        // If the monster is removed outside of combat (e.g. manually), the next
+        // tick must clear the attacker's fight without panicking.
+        let mut g = Game::new(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.do_set_target(a, m);
+        assert_eq!(g.players[&a].attacking, Some(m));
+        g.monsters.remove(&m);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(
+            g.players[&a].attacking, None,
+            "attacker must clear when monster is removed externally"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // M12.3 monster → player combat tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn monster_retaliates_when_attacked() {
+        // Player damages a monster → the monster starts attacking back.
+        let mut g = Game::new(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        assert_eq!(
+            g.monsters[&m].attacking, None,
+            "monster starts with no target"
+        );
+        g.do_set_target(a, m);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(
+            g.monsters[&m].attacking,
+            Some(a),
+            "monster must retaliate after being hit"
+        );
+    }
+
+    #[test]
+    fn monster_combat_tick_attacks_player() {
+        // Monster with a target (player) must deal damage on combat tick.
+        let mut g = Game::new(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.monsters.get_mut(&m).unwrap().attack = 20; // guaranteed non-zero
+        let hp_before = g.players[&a].health;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        let hp_after = g.players[&a].health;
+        assert!(
+            hp_after <= hp_before,
+            "player HP must not increase after monster attack tick"
+        );
+        // Player must receive a 0x8C health-bar.
+        let pkt = ra
+            .try_recv()
+            .expect("player must receive 0x8C for own health bar");
+        assert_eq!(pkt[0], protocol::combat_packets::OP_CREATURE_HEALTH);
+    }
+
+    #[test]
+    fn monster_combat_tick_kills_player() {
+        // Monster kills player: player must be removed, death window sent, saved.
+        let mut g = Game::new(combat_map(false));
+        let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
+        g.save_tx = Some(save_tx);
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.players.get_mut(&a).unwrap().health = 1;
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.monsters.get_mut(&m).unwrap().attack = 20; // guaranteed kill
+
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+
+        assert!(
+            !g.players.contains_key(&a),
+            "player must be removed on death"
+        );
+        let mut saw_death = false;
+        while let Ok(pkt) = ra.try_recv() {
+            if pkt[0] == protocol::combat_packets::OP_DEATH_WINDOW {
+                saw_death = true;
+            }
+        }
+        assert!(
+            saw_death,
+            "player must receive 0x28 death window after monster kill"
+        );
+        assert_eq!(
+            g.monsters[&m].attacking, None,
+            "monster's fight must clear when its target dies"
+        );
+        let rec = save_rx
+            .try_recv()
+            .expect("player death must emit a SaveRecord");
+        assert_eq!(
+            rec.health, rec.max_health,
+            "SaveRecord must have full HP (temple respawn)"
+        );
+    }
+
+    #[test]
+    fn monster_combat_tick_out_of_range() {
+        let mut g = Game::new(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(97, 117, 7)); // 2 tiles east
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert!(
+            ra.try_recv().is_err(),
+            "out-of-range monster attack must produce no packets"
+        );
+    }
+
+    #[test]
+    fn monster_combat_tick_respects_interval() {
+        let mut g = Game::new(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.on_combat_tick(1000); // < 2000ms interval
+        assert!(
+            ra.try_recv().is_err(),
+            "monster attack before interval must not hit"
+        );
+    }
+
+    #[test]
+    fn monster_attack_clears_when_target_logs_out() {
+        let mut g = Game::new(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.logout(a); // player disconnects
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(
+            g.monsters[&m].attacking, None,
+            "monster must clear its target when the player logs out"
+        );
+    }
+
+    #[test]
+    fn monster_attack_clears_when_attacker_in_pz() {
+        // Monster on a PZ tile → fight clears (monsters can't attack from PZ).
+        let mut g = Game::new(wide_combat_map_with_pz());
+        let (a, mut ra) = add_player(&mut g, Position::new(91, 117, 7)); // normal ground
+        let m = add_monster(&mut g, Position::new(90, 117, 7)); // PZ tile
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(
+            g.monsters[&m].attacking, None,
+            "monster in PZ must clear its fight"
+        );
+        assert!(
+            ra.try_recv().is_err(),
+            "player must receive no damage from monster in PZ"
+        );
+    }
+
+    // ===================================================================
+    // Task 3.7: stats push uses live p.speed (combat path)
+    // ===================================================================
+
+    #[test]
+    fn combat_stats_push_uses_live_player_speed() {
+        // After changing a player's speed, a combat tick that deals damage
+        // must push 0xA0 with base_speed = p.speed.
+        let mut g = Game::new(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
+        // Set B's speed to a non-default value (even so /2 is lossless)
+        g.players.get_mut(&b).unwrap().speed = 800;
+        g.do_set_target(a, b);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        // Drain packets until we find 0xA0
+        let mut found_speed = None;
+        while let Ok(pkt) = rb.try_recv() {
+            if pkt.first() == Some(&0xA0) && pkt.len() >= 46 {
+                // base_speed is at offset 44, stored as value/2
+                let spd = u16::from_le_bytes([pkt[44], pkt[45]]);
+                found_speed = Some(spd * 2); // undo wire halving
+                break;
+            }
+        }
+        assert_eq!(
+            found_speed,
+            Some(800),
+            "0xA0 must carry base_speed = 800 (p.speed)"
+        );
+    }
+
+    #[test]
+    fn monster_attack_clears_when_target_in_pz() {
+        // Player on a PZ tile → monster fight clears.
+        let mut g = Game::new(wide_combat_map_with_pz());
+        let (a, mut ra) = add_player(&mut g, Position::new(90, 117, 7)); // PZ tile
+        let m = add_monster(&mut g, Position::new(91, 117, 7)); // normal ground
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(
+            g.monsters[&m].attacking, None,
+            "monster fight must clear when target is in PZ"
+        );
+        assert!(
+            ra.try_recv().is_err(),
+            "player in PZ must receive no damage from monster"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // M12.4 monster → monster combat tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn monster_attacks_monster() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
+        let m1 = add_monster(&mut g, Position::new(100, 117, 7));
+        let m2 = add_monster(&mut g, Position::new(101, 117, 7));
+        g.monsters.get_mut(&m1).unwrap().attacking = Some(m2);
+        g.monsters.get_mut(&m1).unwrap().attack = 20;
+        let hp_before = g.monsters[&m2].health;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        let hp_after = g.monsters[&m2].health;
+        assert!(
+            hp_after <= hp_before,
+            "monster HP must not increase after monster-on-monster hit"
+        );
+        assert_eq!(
+            g.monsters[&m1].attacking,
+            Some(m2),
+            "monster attacker must keep its target after hitting another monster"
+        );
+    }
+
+    #[test]
+    fn monster_kills_monster() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
+        let m1 = add_monster(&mut g, Position::new(100, 117, 7));
+        let m2 = add_monster(&mut g, Position::new(101, 117, 7));
+        g.monsters.get_mut(&m1).unwrap().attacking = Some(m2);
+        g.monsters.get_mut(&m1).unwrap().attack = 20;
+        g.monsters.get_mut(&m2).unwrap().health = 1;
+        for tick in 1..=5u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            if !g.monsters.contains_key(&m2) {
+                break;
+            }
+        }
+        assert!(
+            !g.monsters.contains_key(&m2),
+            "victim monster must be removed on death"
+        );
+        assert_eq!(
+            g.monsters[&m1].attacking, None,
+            "monster attacker's fight must clear when its monster target dies"
+        );
+    }
+
+    #[test]
+    fn monster_vs_monster_retaliation() {
+        // Monster A hits monster B → B starts attacking A.
+        let mut g = Game::new(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
+        let m1 = add_monster(&mut g, Position::new(100, 117, 7));
+        let m2 = add_monster(&mut g, Position::new(101, 117, 7));
+        g.monsters.get_mut(&m1).unwrap().attacking = Some(m2);
+        g.monsters.get_mut(&m1).unwrap().attack = 20;
+        assert_eq!(g.monsters[&m2].attacking, None, "m2 starts with no target");
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(
+            g.monsters[&m2].attacking,
+            Some(m1),
+            "m2 must retaliate after being hit by m1"
+        );
+    }
+
+    #[test]
+    fn monster_vs_monster_out_of_range() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m1 = add_monster(&mut g, Position::new(100, 117, 7));
+        let m2 = add_monster(&mut g, Position::new(102, 117, 7)); // 2 tiles east
+        g.monsters.get_mut(&m1).unwrap().attacking = Some(m2);
+        let hp_before = g.monsters[&m2].health;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(
+            g.monsters[&m2].health, hp_before,
+            "out-of-range monster must not take damage"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // M12.6 monster loot tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn monster_drops_nothing_with_empty_loot() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, mut ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        // loot is empty by default
+        g.do_monster_death(m, 0);
+        assert!(!g.monsters.contains_key(&m), "monster must be removed");
+        while let Ok(pkt) = ra.try_recv() {
+            assert_ne!(
+                pkt[0], 0x6A,
+                "empty loot must not emit 0x6A add-item packets"
+            );
+        }
+    }
+
+    #[test]
+    fn monster_drops_item_on_death() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, mut ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().loot = vec![MonsterDrop {
+            item_id: 100,
+            chance: 1.0,
+            count: 1,
+        }];
+        g.do_monster_death(m, 0);
+        assert!(!g.monsters.contains_key(&m), "monster must be removed");
+
+        // First packet must be 0x6C (creature remove), then 0x6A (item add).
+        let pkt_6c = ra.try_recv().expect("must receive 0x6C remove");
+        assert_eq!(
+            pkt_6c[0], 0x6C,
+            "first death packet must be creature remove"
+        );
+
+        let pkt_6a = ra.try_recv().expect("must receive 0x6A item add");
+        assert_eq!(pkt_6a[0], 0x6A, "second death packet must be item add");
+    }
+
+    #[test]
+    fn monster_drop_uses_chance() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, mut ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        // Two drops: one guaranteed (1.0), one impossible (0.0).
+        g.monsters.get_mut(&m).unwrap().loot = vec![
+            MonsterDrop {
+                item_id: 100,
+                chance: 1.0,
+                count: 1,
+            },
+            MonsterDrop {
+                item_id: 100,
+                chance: 0.0,
+                count: 1,
+            },
+        ];
+        g.do_monster_death(m, 0);
+        assert!(!g.monsters.contains_key(&m), "monster must be removed");
+
+        let mut count = 0u32;
+        while let Ok(pkt) = ra.try_recv() {
+            if pkt[0] == 0x6A {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 1,
+            "only the 1.0-chance drop must produce a 0x6A packet"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // M12.5 monster spawner tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn monster_respawns_after_death() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let sid = 1;
+        g.spawns.insert(
+            sid,
+            MonsterSpawn {
+                position: Position::new(96, 117, 7),
+                respawn_interval_ms: 100,
+                respawn_at_ms: None,
+                name: "Rat".into(),
+                look_type: 100,
+                health: 50,
+                max_health: 50,
+                speed: 200,
+                attack: 7,
+                loot: vec![],
+                target_distance: 0,
+            },
+        );
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().spawn_id = Some(sid);
+
+        // Kill the monster — should schedule a respawn in 100ms.
+        g.do_monster_death(m, 0);
+        assert!(!g.monsters.contains_key(&m), "monster removed on death");
+        assert_eq!(
+            g.spawns[&sid].respawn_at_ms,
+            Some(100),
+            "spawn timer set at now_ms + interval"
+        );
+        // Drain death packets (0x6C remove, 0x6A loot).
+        while ra.try_recv().is_ok() {}
+
+        // Tick before the interval — no respawn yet.
+        g.on_combat_tick(50);
+        assert_eq!(g.monsters.len(), 0, "no respawn before interval elapses");
+
+        // Tick after the interval — respawn should trigger.
+        g.on_combat_tick(100);
+        assert_eq!(g.monsters.len(), 1, "monster respawned after interval");
+
+        // The spawned monster must broadcast an 0x6A add-creature.
+        let pkt = ra.try_recv().expect("respawn broadcasts 0x6A add-creature");
+        assert_eq!(pkt[0], 0x6A, "respawn packet is 0x6A add-tile-creature");
+    }
+
+    #[test]
+    fn monster_dies_without_respawn_when_no_spawn_id() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        // spawn_id is None by default — no spawn entry registered.
+
+        g.do_monster_death(m, 0);
+        assert!(!g.monsters.contains_key(&m), "monster removed");
+
+        // Process any pending respawns — nothing should happen.
+        g.process_respawns(9999);
+        assert_eq!(
+            g.monsters.len(),
+            0,
+            "monster without spawn_id does not respawn"
+        );
+    }
+
+    #[test]
+    fn monster_respawn_respects_interval() {
+        let mut g = Game::new(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let sid = 1;
+        g.spawns.insert(
+            sid,
+            MonsterSpawn {
+                position: Position::new(96, 117, 7),
+                respawn_interval_ms: 200,
+                respawn_at_ms: None,
+                name: "Rat".into(),
+                look_type: 100,
+                health: 50,
+                max_health: 50,
+                speed: 200,
+                attack: 7,
+                loot: vec![],
+                target_distance: 0,
+            },
+        );
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().spawn_id = Some(sid);
+
+        g.do_monster_death(m, 0);
+        assert_eq!(g.spawns[&sid].respawn_at_ms, Some(200));
+
+        // Tick just before the interval — no respawn.
+        g.process_respawns(199);
+        assert_eq!(g.monsters.len(), 0, "not yet due at 199 < 200");
+
+        // Tick at the exact boundary — respawn.
+        g.process_respawns(200);
+        assert_eq!(g.monsters.len(), 1, "respawn at exact boundary");
     }
 }

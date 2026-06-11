@@ -12,6 +12,7 @@ pub mod combat;
 pub mod game;
 pub mod map;
 pub mod outfit_catalog;
+pub mod pathfinding;
 
 /// A position in the game world. `z` is the floor (7 = ground level).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

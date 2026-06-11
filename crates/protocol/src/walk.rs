@@ -33,8 +33,9 @@ pub fn parse_auto_walk(body: &[u8]) -> Option<Vec<AutoWalkStep>> {
     if num_dirs == 0 || body.len() < 1 + num_dirs {
         return None;
     }
-    let steps: Vec<AutoWalkStep> = body[1..=num_dirs].iter().filter_map(|&b| {
-        match b {
+    let steps: Vec<AutoWalkStep> = body[1..=num_dirs]
+        .iter()
+        .filter_map(|&b| match b {
             1 => Some(AutoWalkStep::East),
             2 => Some(AutoWalkStep::NorthEast),
             3 => Some(AutoWalkStep::North),
@@ -44,9 +45,44 @@ pub fn parse_auto_walk(body: &[u8]) -> Option<Vec<AutoWalkStep>> {
             7 => Some(AutoWalkStep::South),
             8 => Some(AutoWalkStep::SouthEast),
             _ => None,
-        }
-    }).collect();
+        })
+        .collect();
     if steps.is_empty() { None } else { Some(steps) }
+}
+
+/// Direction deltas for AutoWalkStep, mapping to the same (dx, dy) as Direction.
+fn auto_walk_delta(step: &AutoWalkStep) -> (i32, i32) {
+    match step {
+        AutoWalkStep::East => (1, 0),
+        AutoWalkStep::NorthEast => (1, -1),
+        AutoWalkStep::North => (0, -1),
+        AutoWalkStep::NorthWest => (-1, -1),
+        AutoWalkStep::West => (-1, 0),
+        AutoWalkStep::SouthWest => (-1, 1),
+        AutoWalkStep::South => (0, 1),
+        AutoWalkStep::SouthEast => (1, 1),
+    }
+}
+
+/// Apply 0x64 direction steps to a starting position and return the final
+/// coordinates `(x, y, z)`. The floor `z` remains unchanged — only x/y are
+/// adjusted by the step deltas. Returns `None` if any step would overflow u16.
+pub fn auto_walk_destination(
+    start: (u16, u16, u8),
+    steps: &[AutoWalkStep],
+) -> Option<(u16, u16, u8)> {
+    let (mut x, mut y, z) = start;
+    for step in steps {
+        let (dx, dy) = auto_walk_delta(step);
+        let nx = i32::from(x) + dx;
+        let ny = i32::from(y) + dy;
+        if !(0..=i32::from(u16::MAX)).contains(&nx) || !(0..=i32::from(u16::MAX)).contains(&ny) {
+            return None;
+        }
+        x = nx as u16;
+        y = ny as u16;
+    }
+    Some((x, y, z))
 }
 
 const SLICE_NORTH: u8 = 0x65;
@@ -139,27 +175,63 @@ fn move_up_block<S: TileSource>(
         let mut skip = -1;
         for i in (0..=5i32).rev() {
             map_description::floor_description(
-                &mut w, ox - VIEW_X, oy - VIEW_Y, i, 8 - i,
-                SLICE_W, SLICE_H, &mut skip, src, creatures,
+                &mut w,
+                ox - VIEW_X,
+                oy - VIEW_Y,
+                i,
+                8 - i,
+                SLICE_W,
+                SLICE_H,
+                &mut skip,
+                src,
+                creatures,
             );
         }
-        if skip >= 0 { w.write_u8(skip as u8); w.write_u8(0xFF); }
+        if skip >= 0 {
+            w.write_u8(skip as u8);
+            w.write_u8(0xFF);
+        }
     } else if nz > 7 {
         // still underground, one floor up: reveal floor oz-3
         let mut skip = -1;
         map_description::floor_description(
-            &mut w, ox - VIEW_X, oy - VIEW_Y, oz - 3, 3,
-            SLICE_W, SLICE_H, &mut skip, src, creatures,
+            &mut w,
+            ox - VIEW_X,
+            oy - VIEW_Y,
+            oz - 3,
+            3,
+            SLICE_W,
+            SLICE_H,
+            &mut skip,
+            src,
+            creatures,
         );
-        if skip >= 0 { w.write_u8(skip as u8); w.write_u8(0xFF); }
+        if skip >= 0 {
+            w.write_u8(skip as u8);
+            w.write_u8(0xFF);
+        }
     }
 
     // west then north correction slices (anchored per TFS 3159-3164).
     w.write_bytes(&map_description::encode_slice(
-        SLICE_WEST, ox - VIEW_X, oy - (VIEW_Y - 1), nz, 1, SLICE_H, src, creatures,
+        SLICE_WEST,
+        ox - VIEW_X,
+        oy - (VIEW_Y - 1),
+        nz,
+        1,
+        SLICE_H,
+        src,
+        creatures,
     ));
     w.write_bytes(&map_description::encode_slice(
-        SLICE_NORTH, ox - VIEW_X, oy - VIEW_Y, nz, SLICE_W, 1, src, creatures,
+        SLICE_NORTH,
+        ox - VIEW_X,
+        oy - VIEW_Y,
+        nz,
+        SLICE_W,
+        1,
+        src,
+        creatures,
     ));
     w.into_bytes()
 }
@@ -183,27 +255,63 @@ fn move_down_block<S: TileSource>(
         let mut skip = -1;
         for i in 0..3i32 {
             map_description::floor_description(
-                &mut w, ox - VIEW_X, oy - VIEW_Y, nz + i, -i - 1,
-                SLICE_W, SLICE_H, &mut skip, src, creatures,
+                &mut w,
+                ox - VIEW_X,
+                oy - VIEW_Y,
+                nz + i,
+                -i - 1,
+                SLICE_W,
+                SLICE_H,
+                &mut skip,
+                src,
+                creatures,
             );
         }
-        if skip >= 0 { w.write_u8(skip as u8); w.write_u8(0xFF); }
+        if skip >= 0 {
+            w.write_u8(skip as u8);
+            w.write_u8(0xFF);
+        }
     } else if nz > oz && nz > 8 && nz < 14 {
         // deeper underground: reveal floor nz+2
         let mut skip = -1;
         map_description::floor_description(
-            &mut w, ox - VIEW_X, oy - VIEW_Y, nz + 2, -3,
-            SLICE_W, SLICE_H, &mut skip, src, creatures,
+            &mut w,
+            ox - VIEW_X,
+            oy - VIEW_Y,
+            nz + 2,
+            -3,
+            SLICE_W,
+            SLICE_H,
+            &mut skip,
+            src,
+            creatures,
         );
-        if skip >= 0 { w.write_u8(skip as u8); w.write_u8(0xFF); }
+        if skip >= 0 {
+            w.write_u8(skip as u8);
+            w.write_u8(0xFF);
+        }
     }
 
     // east then south correction slices (anchored per TFS 3201-3206).
     w.write_bytes(&map_description::encode_slice(
-        SLICE_EAST, ox + (VIEW_X + 1), oy - (VIEW_Y + 1), nz, 1, SLICE_H, src, creatures,
+        SLICE_EAST,
+        ox + (VIEW_X + 1),
+        oy - (VIEW_Y + 1),
+        nz,
+        1,
+        SLICE_H,
+        src,
+        creatures,
     ));
     w.write_bytes(&map_description::encode_slice(
-        SLICE_SOUTH, ox - VIEW_X, oy + (VIEW_Y + 1), nz, SLICE_W, 1, src, creatures,
+        SLICE_SOUTH,
+        ox - VIEW_X,
+        oy + (VIEW_Y + 1),
+        nz,
+        SLICE_W,
+        1,
+        src,
+        creatures,
     ));
     w.into_bytes()
 }
@@ -241,7 +349,11 @@ pub fn walk_update<S: TileSource>(
     if nz != oz && ((nx - ox).abs() > 1 || (ny - oy).abs() > 1) {
         let mut out = remove_creature_by_id(id);
         out.extend(map_description::encode(
-            map_description::Center { x: new.0, y: new.1, z: new.2 },
+            map_description::Center {
+                x: new.0,
+                y: new.1,
+                z: new.2,
+            },
             src,
             creatures,
         ));
@@ -265,20 +377,48 @@ pub fn walk_update<S: TileSource>(
     // Directional slices for the x/y component (TFS 2616-2630), at floor nz.
     if oy > ny {
         out.extend(map_description::encode_slice(
-            SLICE_NORTH, ox - VIEW_X, ny - VIEW_Y, nz, SLICE_W, 1, src, creatures,
+            SLICE_NORTH,
+            ox - VIEW_X,
+            ny - VIEW_Y,
+            nz,
+            SLICE_W,
+            1,
+            src,
+            creatures,
         ));
     } else if oy < ny {
         out.extend(map_description::encode_slice(
-            SLICE_SOUTH, ox - VIEW_X, ny + (VIEW_Y + 1), nz, SLICE_W, 1, src, creatures,
+            SLICE_SOUTH,
+            ox - VIEW_X,
+            ny + (VIEW_Y + 1),
+            nz,
+            SLICE_W,
+            1,
+            src,
+            creatures,
         ));
     }
     if ox < nx {
         out.extend(map_description::encode_slice(
-            SLICE_EAST, nx + (VIEW_X + 1), ny - VIEW_Y, nz, 1, SLICE_H, src, creatures,
+            SLICE_EAST,
+            nx + (VIEW_X + 1),
+            ny - VIEW_Y,
+            nz,
+            1,
+            SLICE_H,
+            src,
+            creatures,
         ));
     } else if ox > nx {
         out.extend(map_description::encode_slice(
-            SLICE_WEST, nx - VIEW_X, ny - VIEW_Y, nz, 1, SLICE_H, src, creatures,
+            SLICE_WEST,
+            nx - VIEW_X,
+            ny - VIEW_Y,
+            nz,
+            1,
+            SLICE_H,
+            src,
+            creatures,
         ));
     }
 
@@ -286,7 +426,11 @@ pub fn walk_update<S: TileSource>(
     // directional stripes were emitted. Correlate with the world-side "move ok"
     // log to see if the wire slices match the intended step.
     if tracing::enabled!(tracing::Level::DEBUG) {
-        let (band_lo, band_hi) = if nz > 7 { (nz - 2, (nz + 2).min(15)) } else { (0, 7) };
+        let (band_lo, band_hi) = if nz > 7 {
+            (nz - 2, (nz + 2).min(15))
+        } else {
+            (0, 7)
+        };
         tracing::debug!(
             id, old = ?old, new = ?new,
             floor_change = nz != oz, underground = nz > 7,
@@ -312,6 +456,80 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::map_description::{TileSlices, WireItem};
+
+    // -------------------------------------------------------------------------
+    // auto_walk_destination tests (TDD: RED first)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn auto_walk_destination_returns_correct_target_for_known_steps() {
+        // GIVEN start at (100, 100, 7) and steps [East, East, South, South]
+        let steps = vec![
+            AutoWalkStep::East,
+            AutoWalkStep::East,
+            AutoWalkStep::South,
+            AutoWalkStep::South,
+        ];
+        // WHEN computing destination
+        let dest = auto_walk_destination((100, 100, 7), &steps);
+        // THEN position should be (102, 102, 7)
+        assert_eq!(dest, Some((102, 102, 7)));
+    }
+
+    #[test]
+    fn auto_walk_destination_overflow_returns_none() {
+        // GIVEN start at (0, 0, 7) and a step West (dx=-1)
+        // WHEN computing destination
+        let dest = auto_walk_destination((0, 0, 7), &[AutoWalkStep::West]);
+        // THEN overflow yields None
+        assert_eq!(dest, None);
+    }
+
+    #[test]
+    fn auto_walk_destination_overflow_south_returns_none() {
+        // GIVEN start at (100, u16::MAX, 7) and a step South (dy=+1)
+        let dest = auto_walk_destination((100, u16::MAX, 7), &[AutoWalkStep::South]);
+        // THEN overflow yields None
+        assert_eq!(dest, None);
+    }
+
+    #[test]
+    fn auto_walk_destination_single_step_works() {
+        // GIVEN a single North step
+        let dest = auto_walk_destination((100, 100, 7), &[AutoWalkStep::North]);
+        // THEN y decreases by one
+        assert_eq!(dest, Some((100, 99, 7)));
+    }
+
+    #[test]
+    fn auto_walk_destination_northwest_moves_both_axes() {
+        // GIVEN a single NorthWest step
+        let dest = auto_walk_destination((100, 100, 7), &[AutoWalkStep::NorthWest]);
+        // THEN both x and y change
+        assert_eq!(dest, Some((99, 99, 7)));
+    }
+
+    #[test]
+    fn auto_walk_destination_empty_steps_returns_start() {
+        // GIVEN zero steps
+        let dest = auto_walk_destination((100, 100, 7), &[]);
+        // THEN position unchanged
+        assert_eq!(dest, Some((100, 100, 7)));
+    }
+
+    #[test]
+    fn auto_walk_destination_diagonal_chain() {
+        // GIVEN steps [NorthEast, SouthEast, SouthWest, NorthWest] — a full loop
+        let steps = vec![
+            AutoWalkStep::NorthEast,
+            AutoWalkStep::SouthEast,
+            AutoWalkStep::SouthWest,
+            AutoWalkStep::NorthWest,
+        ];
+        let dest = auto_walk_destination((50, 50, 7), &steps);
+        // THEN the loop should return to start
+        assert_eq!(dest, Some((50, 50, 7)));
+    }
 
     struct MapStub(HashMap<(i32, i32, i32), WireItem>);
     impl TileSource for MapStub {
@@ -357,6 +575,12 @@ mod tests {
     }
 
     #[test]
+    fn creature_turn_ghost_walkthrough_byte() {
+        let p = creature_turn(0x1000_0000, 2, 1);
+        assert_eq!(p[14], 1, "walkthrough byte must be 1 for ghost");
+    }
+
+    #[test]
     fn east_step_emits_move_then_east_slice() {
         let stub = MapStub(HashMap::new());
         let out = walk_update(0x1000_0000, (100, 100, 7), (101, 100, 7), &stub, &[]);
@@ -381,7 +605,10 @@ mod tests {
         // 7->8 boundary uses the id-form remove (0x6C, 0xFFFF, id), not 0x6D.
         assert_eq!(out[0], OP_REMOVE_TILE_THING);
         assert_eq!(u16::from_le_bytes([out[1], out[2]]), 0xFFFF);
-        assert_eq!(u32::from_le_bytes([out[3], out[4], out[5], out[6]]), 0x1000_0000);
+        assert_eq!(
+            u32::from_le_bytes([out[3], out[4], out[5], out[6]]),
+            0x1000_0000
+        );
         // floor-change-down opcode present.
         assert!(out.contains(&OP_FLOOR_CHANGE_DOWN));
         // the down correction slices (east 0x66 + south 0x67) are appended.
@@ -398,14 +625,34 @@ mod tests {
         let mut m = HashMap::new();
         m.insert((100, 102, 8), WireItem::plain(4526)); // landing tile must exist
         let stub = MapStub(m);
-        let mover = PlacedCreature { x: 100, y: 102, z: 8, bytes: vec![0x62, 0x00, 0x01, 0x00, 0x00, 0x10] };
-        let out = walk_update(0x1000_0000, (100, 100, 7), (100, 102, 8), &stub, std::slice::from_ref(&mover));
+        let mover = PlacedCreature {
+            x: 100,
+            y: 102,
+            z: 8,
+            bytes: vec![0x62, 0x00, 0x01, 0x00, 0x00, 0x10],
+        };
+        let out = walk_update(
+            0x1000_0000,
+            (100, 100, 7),
+            (100, 102, 8),
+            &stub,
+            std::slice::from_ref(&mover),
+        );
         assert_eq!(out[0], OP_REMOVE_TILE_THING); // id-form remove header
         assert_eq!(u16::from_le_bytes([out[1], out[2]]), 0xFFFF);
-        assert_eq!(u32::from_le_bytes([out[3], out[4], out[5], out[6]]), 0x1000_0000);
+        assert_eq!(
+            u32::from_le_bytes([out[3], out[4], out[5], out[6]]),
+            0x1000_0000
+        );
         assert_eq!(out[7], map_description::OPCODE_MAP_DESCRIPTION); // full 0x64 map, not 0xBF
-        assert!(!out.contains(&OP_FLOOR_CHANGE_DOWN), "teleport replaces the incremental floor block");
-        assert!(out.windows(mover.bytes.len()).any(|w| w == mover.bytes), "mover re-added in teleport map");
+        assert!(
+            !out.contains(&OP_FLOOR_CHANGE_DOWN),
+            "teleport replaces the incremental floor block"
+        );
+        assert!(
+            out.windows(mover.bytes.len()).any(|w| w == mover.bytes),
+            "mover re-added in teleport map"
+        );
     }
 
     #[test]

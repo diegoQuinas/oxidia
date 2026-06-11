@@ -1,19 +1,23 @@
 //! Chat packets for protocol 10.98: inbound `0x96` "say" (parse) and outbound
 //! `0xAA` "creature say" (build). Byte-faithful ports of
 //! `reference/tfs/src/protocolgame.cpp` `parseSay` (922-951) and
-//! `sendCreatureSay` (2199-2225). M6 supports the three local speak types
-//! (say/whisper/yell); private and channel types are rejected by `parse_say`.
+//! `sendCreatureSay` (2199-2225). M6 supports the three local player speak
+//! types (say/whisper/yell) for inbound; MonsterSay and MonsterYell are
+//! outbound-only (food messages, monster speech, etc.).
 
 use crate::message::{MessageReader, MessageWriter};
 
 pub const OP_CREATURE_SAY: u8 = 0xAA;
 
-/// The local speak types M6 supports. Wire values match TFS `SpeakClasses`.
+/// Speak types matching TFS `SpeakClasses`. Say/Whisper/Yell are for player
+/// inbound speech; MonsterSay/MonsterYell are outbound-only (food, monsters).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeakType {
     Say = 1,
     Whisper = 2,
     Yell = 3,
+    MonsterSay = 36,
+    MonsterYell = 37,
 }
 
 impl SpeakType {
@@ -89,14 +93,20 @@ mod tests {
 
     #[test]
     fn parse_say_accepts_whisper_and_yell() {
-        assert_eq!(parse_say(&say_body(2, b"hi")).unwrap().0, SpeakType::Whisper);
+        assert_eq!(
+            parse_say(&say_body(2, b"hi")).unwrap().0,
+            SpeakType::Whisper
+        );
         assert_eq!(parse_say(&say_body(3, b"hi")).unwrap().0, SpeakType::Yell);
     }
 
     #[test]
     fn parse_say_rejects_unsupported_types() {
-        for b in [0u8, 5, 7, 36] {
-            assert!(parse_say(&say_body(b, b"hi")).is_none(), "type {b} must be rejected");
+        for b in [0u8, 5, 7, 14, 15, 36, 37, 255] {
+            assert!(
+                parse_say(&say_body(b, b"hi")).is_none(),
+                "type {b} must be rejected"
+            );
         }
     }
 
@@ -114,17 +124,31 @@ mod tests {
     fn creature_say_layout() {
         let p = creature_say(0x0A0B_0C0D, b"Bob", 1, SpeakType::Say, (100, 200, 7), b"hi");
         let mut i = 0;
-        assert_eq!(p[i], OP_CREATURE_SAY); i += 1;
-        assert_eq!(u32::from_le_bytes([p[i], p[i+1], p[i+2], p[i+3]]), 0x0A0B_0C0D); i += 4;
-        assert_eq!(u16::from_le_bytes([p[i], p[i+1]]), 3); i += 2; // name len
-        assert_eq!(&p[i..i+3], b"Bob"); i += 3;
-        assert_eq!(u16::from_le_bytes([p[i], p[i+1]]), 1); i += 2; // level
-        assert_eq!(p[i], 1); i += 1; // type SAY
-        assert_eq!(u16::from_le_bytes([p[i], p[i+1]]), 100); i += 2; // x
-        assert_eq!(u16::from_le_bytes([p[i], p[i+1]]), 200); i += 2; // y
-        assert_eq!(p[i], 7); i += 1; // z
-        assert_eq!(u16::from_le_bytes([p[i], p[i+1]]), 2); i += 2; // msg len
-        assert_eq!(&p[i..i+2], b"hi"); i += 2;
+        assert_eq!(p[i], OP_CREATURE_SAY);
+        i += 1;
+        assert_eq!(
+            u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]),
+            0x0A0B_0C0D
+        );
+        i += 4;
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 3);
+        i += 2; // name len
+        assert_eq!(&p[i..i + 3], b"Bob");
+        i += 3;
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 1);
+        i += 2; // level
+        assert_eq!(p[i], 1);
+        i += 1; // type SAY
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 100);
+        i += 2; // x
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 200);
+        i += 2; // y
+        assert_eq!(p[i], 7);
+        i += 1; // z
+        assert_eq!(u16::from_le_bytes([p[i], p[i + 1]]), 2);
+        i += 2; // msg len
+        assert_eq!(&p[i..i + 2], b"hi");
+        i += 2;
         assert_eq!(i, p.len(), "no trailing bytes");
     }
 }

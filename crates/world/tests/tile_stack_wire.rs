@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use formats::otb::{ItemType, ItemsOtb};
 use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
-use protocol::map_description::{encode, Center};
+use protocol::map_description::{Center, encode};
 use protocol::walk;
 use world::map::StaticMap;
 
@@ -26,23 +26,77 @@ fn decorated_map() -> (OtbmMap, ItemsOtb) {
         minor_version: 57,
         build_number: 0,
         items: vec![
-            ItemType { group: 1, flags: 0, server_id: 100, client_id: 4526, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
-            ItemType { group: 5, flags: 1 << 13, server_id: 200, client_id: 1059, always_on_top: true, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
-            ItemType { group: 5, flags: 0, server_id: 300, client_id: 2000, always_on_top: false, top_order: 0, has_height: false, floor_change: formats::items_xml::FloorChange::NONE },
+            ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            },
+            ItemType {
+                group: 5,
+                flags: 1 << 13,
+                server_id: 200,
+                client_id: 1059,
+                always_on_top: true,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            },
+            ItemType {
+                group: 5,
+                flags: 0,
+                server_id: 300,
+                client_id: 2000,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            },
         ],
     };
     let map = OtbmMap {
-        width: 2000, height: 2000, major_items: 3, minor_items: 57,
-        description: String::new(), spawn_file: None, house_file: None,
+        width: 2000,
+        height: 2000,
+        major_items: 3,
+        minor_items: 57,
+        description: String::new(),
+        spawn_file: None,
+        house_file: None,
         tiles: vec![MapTile {
-            x: 1000, y: 1000, z: 7, flags: 0, house_id: None,
+            x: 1000,
+            y: 1000,
+            z: 7,
+            flags: 0,
+            house_id: None,
             items: vec![
-                MapItem { id: 100, count: None, contents: vec![] },
-                MapItem { id: 200, count: None, contents: vec![] },
-                MapItem { id: 300, count: None, contents: vec![] },
+                MapItem {
+                    id: 100,
+                    count: None,
+                    contents: vec![],
+                },
+                MapItem {
+                    id: 200,
+                    count: None,
+                    contents: vec![],
+                },
+                MapItem {
+                    id: 300,
+                    count: None,
+                    contents: vec![],
+                },
             ],
         }],
-        towns: vec![Town { id: 1, name: "Thais".into(), x: 1000, y: 1000, z: 7 }],
+        towns: vec![Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 1000,
+            y: 1000,
+            z: 7,
+        }],
         waypoints: vec![],
     };
     (map, items)
@@ -101,7 +155,11 @@ fn decode(bytes: &[u8], center: Center) -> HashMap<(i32, i32, i32), Vec<u16>> {
 fn static_map_stack_round_trips_through_encoder() {
     let (map, items) = decorated_map();
     let sm = StaticMap::from_formats(&map, &items);
-    let center = Center { x: 1000, y: 1000, z: 7 };
+    let center = Center {
+        x: 1000,
+        y: 1000,
+        z: 7,
+    };
     let bytes = encode(center, &sm, &[]);
     let found = decode(&bytes, center);
     assert_eq!(found.get(&(1000, 1000, 7)), Some(&vec![4526, 1059, 2000]));

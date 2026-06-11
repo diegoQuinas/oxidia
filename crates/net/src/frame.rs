@@ -82,8 +82,14 @@ mod tests {
         write_frame(&mut client, b"first").await.unwrap();
         write_frame(&mut client, b"second").await.unwrap();
 
-        assert_eq!(read_frame(&mut server).await.unwrap().as_deref(), Some(&b"first"[..]));
-        assert_eq!(read_frame(&mut server).await.unwrap().as_deref(), Some(&b"second"[..]));
+        assert_eq!(
+            read_frame(&mut server).await.unwrap().as_deref(),
+            Some(&b"first"[..])
+        );
+        assert_eq!(
+            read_frame(&mut server).await.unwrap().as_deref(),
+            Some(&b"second"[..])
+        );
     }
 
     #[tokio::test]

@@ -20,9 +20,9 @@
 //!     ...      zero padding
 //! ```
 
-use crate::message::{MessageReader, MessageWriter};
-use crate::rsa::{encrypt_open_tibia_public, RSA_BLOCK_SIZE, RsaError, RsaPrivateKey};
 use crate::ProtocolError;
+use crate::message::{MessageReader, MessageWriter};
+use crate::rsa::{RSA_BLOCK_SIZE, RsaError, RsaPrivateKey, encrypt_open_tibia_public};
 
 /// First byte of a login packet.
 pub const LOGIN_OPCODE: u8 = 0x01;
@@ -89,7 +89,10 @@ pub fn build_request(
 
     let mut block = [0u8; RSA_BLOCK_SIZE];
     let bytes = inner.into_bytes();
-    assert!(bytes.len() <= RSA_BLOCK_SIZE, "credentials overflow RSA block");
+    assert!(
+        bytes.len() <= RSA_BLOCK_SIZE,
+        "credentials overflow RSA block"
+    );
     block[..bytes.len()].copy_from_slice(&bytes);
     encrypt_open_tibia_public(&mut block).expect("128-byte block");
 

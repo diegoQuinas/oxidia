@@ -47,8 +47,7 @@ pub fn max_weapon_damage(
     // INTEGER division — mirrors C++ `(uint32_t level) / 5`.
     let int_part = (level / 5) as f64;
     // FLOAT division — mirrors C++ `(attackSkill / 4.)` and `(attackValue / 3.)`.
-    let skill_term =
-        ((attack_skill as f64 / 4.0) + 1.0) * (attack_value as f64 / 3.0);
+    let skill_term = ((attack_skill as f64 / 4.0) + 1.0) * (attack_value as f64 / 3.0);
     (int_part + (skill_term * 1.03) / attack_factor).round() as i32
 }
 
@@ -68,11 +67,7 @@ pub fn melee_damage(
     attack_factor: f64,
 ) -> i32 {
     let max = max_weapon_damage(level, attack_skill, attack_value, attack_factor).max(0);
-    if max == 0 {
-        0
-    } else {
-        rng.gen_range(0..=max)
-    }
+    if max == 0 { 0 } else { rng.gen_range(0..=max) }
 }
 
 /// Fist (unarmed) swing: `attack_value = 7`, `attack_factor = 1.0`.
@@ -139,9 +134,9 @@ mod tests {
         // Correct (integer level/5):
         assert_eq!(max_weapon_damage(4, 10, 7, 1.0), 8);
         // Proof by contrast: 4.0/5.0 = 0.8, which would give 9 — we must NOT do that.
-        let would_be_wrong =
-            (4.0_f64 / 5.0 + ((10.0_f64 / 4.0 + 1.0) * (7.0_f64 / 3.0)) * 1.03 / 1.0)
-                .round() as i32;
+        let would_be_wrong = (4.0_f64 / 5.0
+            + ((10.0_f64 / 4.0 + 1.0) * (7.0_f64 / 3.0)) * 1.03 / 1.0)
+            .round() as i32;
         assert_eq!(would_be_wrong, 9);
         assert_ne!(max_weapon_damage(4, 10, 7, 1.0), would_be_wrong);
     }
@@ -183,10 +178,7 @@ mod tests {
         let max = max_weapon_damage(1, 10, 7, 1.0); // == 8
         for _ in 0..10_000 {
             let d = fist_damage(&mut rng, 1, 10);
-            assert!(
-                (0..=max).contains(&d),
-                "damage {d} is out of 0..={max}"
-            );
+            assert!((0..=max).contains(&d), "damage {d} is out of 0..={max}");
         }
     }
 

@@ -17,7 +17,7 @@
 //!
 //! All three reuse [`crate::creature::add_outfit`] (the 9-byte `AddOutfit`).
 
-use crate::creature::{add_outfit, Outfit};
+use crate::creature::{Outfit, add_outfit};
 use crate::message::MessageWriter;
 
 // ---------------------------------------------------------------------------
@@ -127,7 +127,15 @@ mod tests {
     use super::*;
 
     fn knight() -> Outfit {
-        Outfit { look_type: 128, head: 78, body: 69, legs: 58, feet: 76, addons: 0, mount: 0 }
+        Outfit {
+            look_type: 128,
+            head: 78,
+            body: 69,
+            legs: 58,
+            feet: 76,
+            addons: 0,
+            mount: 0,
+        }
     }
 
     #[test]
@@ -139,8 +147,13 @@ mod tests {
     fn creature_outfit_opcode_id_then_outfit() {
         let bytes = creature_outfit(0x1000_0000, &knight());
         let mut p = 0;
-        assert_eq!(bytes[p], OP_CREATURE_OUTFIT); p += 1;
-        assert_eq!(u32::from_le_bytes([bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]]), 0x1000_0000); p += 4;
+        assert_eq!(bytes[p], OP_CREATURE_OUTFIT);
+        p += 1;
+        assert_eq!(
+            u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]),
+            0x1000_0000
+        );
+        p += 4;
         assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 128); // outfit looktype
         // 1 opcode + 4 id + 9 outfit = 14 bytes
         assert_eq!(bytes.len(), 14);
@@ -149,32 +162,58 @@ mod tests {
     #[test]
     fn outfit_window_full_layout() {
         let outfits = [
-            AvailableOutfit { look_type: 128, name: b"Citizen", addons: 0 },
-            AvailableOutfit { look_type: 129, name: b"Hunter", addons: 3 },
+            AvailableOutfit {
+                look_type: 128,
+                name: b"Citizen",
+                addons: 0,
+            },
+            AvailableOutfit {
+                look_type: 129,
+                name: b"Hunter",
+                addons: 3,
+            },
         ];
-        let mounts = [AvailableMount { client_id: 387, name: b"Widow Queen" }];
+        let mounts = [AvailableMount {
+            client_id: 387,
+            name: b"Widow Queen",
+        }];
         let bytes = outfit_window(&knight(), &outfits, &mounts);
 
         let mut p = 0;
-        assert_eq!(bytes[p], OP_OUTFIT_WINDOW); p += 1;
-        assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 128); p += 9; // current outfit (9 bytes)
+        assert_eq!(bytes[p], OP_OUTFIT_WINDOW);
+        p += 1;
+        assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 128);
+        p += 9; // current outfit (9 bytes)
 
-        assert_eq!(bytes[p], 2); p += 1; // outfit count
+        assert_eq!(bytes[p], 2);
+        p += 1; // outfit count
         // outfit 0
-        assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 128); p += 2;
-        let n0 = u16::from_le_bytes([bytes[p], bytes[p + 1]]) as usize; p += 2;
-        assert_eq!(&bytes[p..p + n0], b"Citizen"); p += n0;
-        assert_eq!(bytes[p], 0); p += 1; // addons
+        assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 128);
+        p += 2;
+        let n0 = u16::from_le_bytes([bytes[p], bytes[p + 1]]) as usize;
+        p += 2;
+        assert_eq!(&bytes[p..p + n0], b"Citizen");
+        p += n0;
+        assert_eq!(bytes[p], 0);
+        p += 1; // addons
         // outfit 1
-        assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 129); p += 2;
-        let n1 = u16::from_le_bytes([bytes[p], bytes[p + 1]]) as usize; p += 2;
-        assert_eq!(&bytes[p..p + n1], b"Hunter"); p += n1;
-        assert_eq!(bytes[p], 3); p += 1; // addons
+        assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 129);
+        p += 2;
+        let n1 = u16::from_le_bytes([bytes[p], bytes[p + 1]]) as usize;
+        p += 2;
+        assert_eq!(&bytes[p..p + n1], b"Hunter");
+        p += n1;
+        assert_eq!(bytes[p], 3);
+        p += 1; // addons
 
-        assert_eq!(bytes[p], 1); p += 1; // mount count
-        assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 387); p += 2;
-        let m0 = u16::from_le_bytes([bytes[p], bytes[p + 1]]) as usize; p += 2;
-        assert_eq!(&bytes[p..p + m0], b"Widow Queen"); p += m0;
+        assert_eq!(bytes[p], 1);
+        p += 1; // mount count
+        assert_eq!(u16::from_le_bytes([bytes[p], bytes[p + 1]]), 387);
+        p += 2;
+        let m0 = u16::from_le_bytes([bytes[p], bytes[p + 1]]) as usize;
+        p += 2;
+        assert_eq!(&bytes[p..p + m0], b"Widow Queen");
+        p += m0;
 
         assert_eq!(p, bytes.len(), "no trailing bytes");
     }
@@ -190,8 +229,13 @@ mod tests {
 
     #[test]
     fn outfit_window_clamps_catalog_to_255() {
-        let many: Vec<AvailableOutfit> =
-            (0..300).map(|i| AvailableOutfit { look_type: i, name: b"x", addons: 0 }).collect();
+        let many: Vec<AvailableOutfit> = (0..300)
+            .map(|i| AvailableOutfit {
+                look_type: i,
+                name: b"x",
+                addons: 0,
+            })
+            .collect();
         let bytes = outfit_window(&knight(), &many, &[]);
         // count byte sits right after opcode (1) + current outfit (9) = index 10
         assert_eq!(bytes[10], 255, "count byte must clamp to 255, not wrap");

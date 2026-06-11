@@ -25,5 +25,5 @@ debug.log
 # git worktrees created for isolated milestone work
 .claude/worktrees/
 
-# Local map files (never committed — binary)
-/world/
+# Map + spawns + NPC + server data (game content, never committed)
+/data/

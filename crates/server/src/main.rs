@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
     // world has stair/floor-change data on its tiles.
     let items_xml_bytes = std::fs::read_to_string("reference/tfs/data/items/items.xml")
         .context("reading items.xml")?;
-    let items_xml = formats::items_xml::parse_items_xml(&items_xml_bytes)
-        .context("parsing items.xml")?;
+    let items_xml =
+        formats::items_xml::parse_items_xml(&items_xml_bytes).context("parsing items.xml")?;
     formats::items_xml::merge_items_xml(&mut items, &items_xml);
     // A missing or unparseable map is fatal: the server must not start without a
     // world (mirrors TFS `startupErrorMessage` on `loadMainMap` failure). The
@@ -89,11 +89,10 @@ async fn main() -> Result<()> {
     );
     static_map.load_item_metadata(&items, &items_xml);
     let static_map = std::sync::Arc::new(static_map);
-    let actions_xml = std::fs::read_to_string("config/lua/actions.xml")
-        .unwrap_or_else(|e| {
-            warn!(%e, "config/lua/actions.xml not found — script hooks disabled");
-            String::new()
-        });
+    let actions_xml = std::fs::read_to_string("config/lua/actions.xml").unwrap_or_else(|e| {
+        warn!(%e, "config/lua/actions.xml not found — script hooks disabled");
+        String::new()
+    });
     let lua_scripts_dir = std::path::Path::new("config/lua/scripts");
     let lua_scripts_dir = if lua_scripts_dir.is_dir() {
         Some(lua_scripts_dir.to_path_buf())
@@ -101,7 +100,14 @@ async fn main() -> Result<()> {
         warn!("config/lua/scripts/ not found — Lua runtime disabled");
         None
     };
-    let game_cfg = world::game::GameConfig { lua_scripts_dir, actions_xml };
+    let monsters_xml = std::fs::read_to_string("config/monsters.xml").unwrap_or_default();
+    let spawns_xml = std::fs::read_to_string("data/world/map1-spawn.xml").unwrap_or_default();
+    let game_cfg = world::game::GameConfig {
+        lua_scripts_dir,
+        actions_xml,
+        monsters_xml,
+        spawns_xml,
+    };
     let (world_handle, mut save_rx) = world::game::spawn(static_map, game_cfg);
     info!(spawn = ?world_handle.map.spawn(), "world loaded");
 
@@ -154,7 +160,11 @@ async fn main() -> Result<()> {
         login_addr,
         login_handler,
     ));
-    let game = tokio::spawn(net::serve_with(net::Protocol::Game, game_addr, game_handler));
+    let game = tokio::spawn(net::serve_with(
+        net::Protocol::Game,
+        game_addr,
+        game_handler,
+    ));
 
     // Run until a listener exits (bind error) or a shutdown signal arrives. On
     // Ctrl+C / SIGTERM we persist every online player BEFORE exiting — otherwise

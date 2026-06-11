@@ -28,7 +28,13 @@ pub fn parse_throw(body: &[u8]) -> Option<Throw> {
     let ty = r.read_u16().ok()?;
     let tz = r.read_u8().ok()?;
     let count = r.read_u8().ok()?;
-    Some(Throw { from: (fx, fy, fz), sprite, from_stackpos, to: (tx, ty, tz), count })
+    Some(Throw {
+        from: (fx, fy, fz),
+        sprite,
+        from_stackpos,
+        to: (tx, ty, tz),
+        count,
+    })
 }
 
 #[cfg(test)]
@@ -43,13 +49,13 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&1000u16.to_le_bytes()); // fx
         body.extend_from_slice(&2000u16.to_le_bytes()); // fy
-        body.push(7u8);                                  // fz
+        body.push(7u8); // fz
         body.extend_from_slice(&4526u16.to_le_bytes()); // sprite
-        body.push(2u8);                                  // from_stackpos
+        body.push(2u8); // from_stackpos
         body.extend_from_slice(&1001u16.to_le_bytes()); // tx
         body.extend_from_slice(&2000u16.to_le_bytes()); // ty
-        body.push(7u8);                                  // tz
-        body.push(5u8);                                  // count
+        body.push(7u8); // tz
+        body.push(5u8); // count
         assert_eq!(body.len(), 14, "body must be exactly 14 bytes");
         let t = parse_throw(&body).expect("valid 14-byte body must parse");
         assert_eq!(t.from, (1000, 2000, 7));

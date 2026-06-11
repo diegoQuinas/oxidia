@@ -71,7 +71,11 @@ mod tests {
     /// A stackable item must append the count byte after MARK_UNMARKED.
     #[test]
     fn add_tile_item_stackable_appends_count_byte() {
-        let item = WireItem { client_id: 100, subtype: Some(5), animated: false };
+        let item = WireItem {
+            client_id: 100,
+            subtype: Some(5),
+            animated: false,
+        };
         let pkt = add_tile_item((1, 2, 7), 3, &item);
         // [0x6A, x_lo, x_hi, y_lo, y_hi, z, stackpos, cid_lo, cid_hi, 0xFF, count]
         assert_eq!(pkt[0], OP_ADD_TILE_THING);
