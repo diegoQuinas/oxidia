@@ -11,7 +11,7 @@ use protocol::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use world::game::{InitialState, SaveRecord, WorldHandle};
-use world::map::StaticMap;
+use world::map::WorldMeta;
 use world::{Direction, Position};
 
 pub const CLIENT_VERSION_MIN: u16 = 1097;
@@ -116,7 +116,7 @@ pub fn build_enter_world_burst(
     player: &EnterWorldPlayer<'_>,
     center: Center,
     map_description: &[u8],
-    map: &StaticMap,
+    meta: &WorldMeta,
 ) -> Vec<u8> {
     let snapshot_id = player.id;
     let health = player.health;
@@ -159,16 +159,16 @@ pub fn build_enter_world_burst(
     for slot in 1..=enter_world::INVENTORY_SLOTS {
         match equipped.get(&slot) {
             Some(&(server_id, count)) => {
-                if let Some(meta) = map.item_meta(server_id) {
-                    let subtype = if meta.stackable {
+                if let Some(m) = meta.item_meta(server_id) {
+                    let subtype = if m.stackable {
                         Some(count.max(1))
                     } else {
                         None
                     };
                     let wi = protocol::map_description::WireItem {
-                        client_id: meta.client_id,
+                        client_id: m.client_id,
                         subtype,
-                        animated: meta.animated,
+                        animated: m.animated,
                     };
                     burst.extend(enter_world::set_inventory_slot(slot, &wi));
                 } else {
@@ -183,11 +183,9 @@ pub fn build_enter_world_burst(
     burst.extend(enter_world::world_light(215, 215));
     burst.extend(enter_world::creature_light(snapshot_id, 0, 0));
     burst.extend(enter_world::basic_data());
-    let icon_mask = if map.is_protection_zone(Position::new(center.x, center.y, center.z)) {
-        enter_world::ICON_PIGEON
-    } else {
-        0
-    };
+    // The PZ icon is set by the world actor on login — the network layer no
+    // longer has access to spatial tile data (moved to ChunkManager).
+    let icon_mask = 0u16;
     burst.extend(enter_world::icons(icon_mask));
     burst
 }
@@ -288,7 +286,7 @@ where
         &player_info,
         center,
         &ack.map_description,
-        world.map.as_ref(),
+        world.meta.as_ref(),
     );
     send_encrypted(&mut stream, &keys, &burst).await?;
     tracing::info!(character = %name, id = snapshot.id, ?center, "player entered game");
@@ -664,10 +662,9 @@ mod tests {
             }],
             waypoints: vec![],
         };
-        let (handle, _save_rx) = world::game::spawn(
-            Arc::new(StaticMap::from_formats(&map, &items)),
-            Default::default(),
-        );
+        let sm = StaticMap::from_formats(&map, &items);
+        let (chunks, meta) = sm.into_chunks_and_meta();
+        let (handle, _save_rx) = world::game::spawn(chunks, Arc::new(meta), Default::default());
         handle
     }
 
@@ -990,7 +987,7 @@ mod tests {
     }
 
     /// A one-tile StaticMap at (100,100,7) with the PZ flag set (flags: 1).
-    fn pz_test_map() -> Arc<StaticMap> {
+    fn pz_test_map() -> StaticMap {
         let items = ItemsOtb {
             major_version: 3,
             minor_version: 57,
@@ -1035,12 +1032,16 @@ mod tests {
             }],
             waypoints: vec![],
         };
-        Arc::new(StaticMap::from_formats(&map, &items))
+        StaticMap::from_formats(&map, &items)
     }
 
     #[test]
-    fn burst_includes_pz_icon_when_spawn_in_protection_zone() {
+    fn burst_does_not_include_pz_icon_from_network_layer() {
+        // With the chunked-map architecture, the network layer no longer has
+        // access to spatial tile data. PZ icons are pushed by the world actor.
         let map = pz_test_map();
+        let (_chunks, meta) = map.into_chunks_and_meta();
+        let meta = Arc::new(meta);
         let center = Center {
             x: 100,
             y: 100,
@@ -1052,14 +1053,14 @@ mod tests {
             max_health: 150,
             inventory: &[],
         };
-        let burst = build_enter_world_burst(&player, center, &[], map.as_ref());
-        // (map_description is empty here; this test only asserts the PZ icon.)
-        // The icons packet [0xA2, lo, hi] for ICON_PIGEON (0x4000) must be present.
+        let burst = build_enter_world_burst(&player, center, &[], meta.as_ref());
+        // The icons packet [0xA2, 0x00, 0x00] for no icon must be present.
+        // No PZ icon since spatial data isn't in WorldMeta.
         assert!(
             burst
                 .windows(3)
-                .any(|w| w == [enter_world::OP_ICONS, 0x00, 0x40]),
-            "burst must carry ICON_PIGEON when spawning in a PZ"
+                .any(|w| w == [enter_world::OP_ICONS, 0x00, 0x00]),
+            "burst must carry an icons packet (no PZ icon from network layer)"
         );
     }
 }

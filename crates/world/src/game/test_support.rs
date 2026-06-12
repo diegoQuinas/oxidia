@@ -1,8 +1,116 @@
 //! Shared test fixtures for the game module's per-file test suites.
 
 use super::*;
+use crate::map::StaticMap;
 use formats::otb::{ItemType, ItemsOtb};
 use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
+
+/// Spawn a world actor from a `StaticMap` fixture — convenience for actor-level
+/// tests that need a running world handle.
+#[allow(dead_code)]
+pub(super) fn spawn_from_static_map(
+    map: Arc<StaticMap>,
+    config: GameConfig,
+) -> (WorldHandle, mpsc::UnboundedReceiver<SaveRecord>) {
+    let map_ref = Arc::try_unwrap(map).unwrap_or_else(|arc| (*arc).clone());
+    let (chunks, meta) = map_ref.into_chunks_and_meta();
+    super::spawn(chunks, Arc::new(meta), config)
+}
+
+/// Map with a FloorChange::DOWN tile that has a walkable bypass route via the
+/// north side. A* prunes the south return (North neighbor is pruned when
+/// approaching from East, so a south bypass can't reach the target). North
+/// bypass works because SouthEast (1,1) is allowed when incoming from East.
+///
+/// Layout (z=7):
+///   (100,99) (101,99)      ← bypass route
+///   (100,100)[hole](102,100) ← start, blocked, target
+pub(super) fn hole_bypass_map() -> Arc<StaticMap> {
+    use formats::items_xml::FloorChange;
+    let items = ItemsOtb {
+        major_version: 3,
+        minor_version: 57,
+        build_number: 0,
+        items: vec![
+            ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 1,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
+            ItemType {
+                group: 5,
+                flags: 0,
+                server_id: 300,
+                client_id: 2,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::DOWN,
+            },
+        ],
+    };
+    let ground = |x: u16, y: u16| MapTile {
+        x,
+        y,
+        z: 7,
+        flags: 0,
+        house_id: None,
+        items: vec![MapItem {
+            id: 100,
+            count: None,
+            contents: vec![],
+        }],
+    };
+    let hole = |x: u16, y: u16| MapTile {
+        x,
+        y,
+        z: 7,
+        flags: 0,
+        house_id: None,
+        items: vec![
+            MapItem {
+                id: 100,
+                count: None,
+                contents: vec![],
+            },
+            MapItem {
+                id: 300,
+                count: None,
+                contents: vec![],
+            },
+        ],
+    };
+    let map = OtbmMap {
+        width: 200,
+        height: 200,
+        major_items: 3,
+        minor_items: 57,
+        description: String::new(),
+        spawn_file: None,
+        house_file: None,
+        tiles: vec![
+            ground(100, 100),  // start
+            hole(101, 100),    // FloorChange::DOWN — blocked in A*
+            ground(102, 100),  // target
+            ground(100, 99),   // bypass route: north
+            ground(101, 99),   // bypass route: north-east
+        ],
+        towns: vec![Town {
+            id: 1,
+            name: "Test".into(),
+            x: 100,
+            y: 100,
+            z: 7,
+        }],
+        waypoints: vec![],
+    };
+    Arc::new(StaticMap::from_formats(&map, &items))
+}
 
 pub(super) fn stair_map() -> Arc<StaticMap> {
     use formats::items_xml::FloorChange;
@@ -238,6 +346,7 @@ pub(super) fn add_monster(g: &mut Game, pos: Position) -> u32 {
             list_walk_dir: VecDeque::new(),
             follow_target: None,
             target_distance: 0,
+            race: Some(RaceType::Blood),
         },
     );
     id
@@ -259,8 +368,9 @@ pub(super) fn add_player(g: &mut Game, pos: Position) -> (u32, mpsc::Receiver<Ve
             known: HashSet::new(),
             health: 150,
             max_health: 150,
-            fist_skill: 10,
-            attacking: None,
+                fist_skill: 10,
+                race: RaceType::Blood,
+                attacking: None,
             last_attack_ms: 0,
             sex: 1, // male (default)
             gamemaster: false,
@@ -651,6 +761,17 @@ pub(super) fn move_map() -> Arc<StaticMap> {
                 has_height: false,
                 floor_change: FloorChange::NONE,
             },
+            // hole (433): non-moveable decoration, used by teleport dispatch tests.
+            OtbItemType {
+                group: 5,
+                flags: 0,
+                server_id: 433,
+                client_id: 999,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            },
         ],
     };
 
@@ -658,6 +779,7 @@ pub(super) fn move_map() -> Arc<StaticMap> {
       <item id="200" name="stone" article="a" plural="stones"><attribute key="weight" value="110"/></item>
       <item id="300" name="gold coin" article="a" plural="gold coins"><attribute key="weight" value="10"/><attribute key="showcount" value="1"/></item>
       <item id="400" name="decoration" article="a" plural="decorations"/>
+      <item id="433" name="hole" article="a" plural="holes"><attribute key="floorchange" value="down"/></item>
       <item id="500" name="helmet" article="a"><attribute key="slotType" value="head"/></item>
       <item id="600" name="backpack" article="a"><attribute key="containersize" value="20"/></item>
     </items>"#;
@@ -763,6 +885,25 @@ pub(super) fn move_map() -> Arc<StaticMap> {
                     },
                 ],
             }, // helmet
+            MapTile {
+                x: 107,
+                y: 100,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 433,
+                        count: None,
+                        contents: vec![],
+                    },
+                ],
+            }, // hole
             // Isolated vertical strip (y=110..113) for ground->ground container tests.
             MapTile {
                 x: 100,

@@ -7,6 +7,8 @@
 
 use crate::message::MessageWriter;
 
+use serde::{Deserialize, Serialize};
+
 pub const OPCODE_MAP_DESCRIPTION: u8 = 0x64;
 pub const MARK_UNMARKED: u8 = 0xFF;
 
@@ -20,7 +22,7 @@ const ANCHOR_DY: i32 = 6; // (VIEWPORT_HEIGHT / 2) - 1
 /// protocol carries optional per-item bytes that OTClient `getItem` reads back:
 /// a `subtype` byte for stackable (count) or splash/fluid items, then a phase
 /// byte for animated items. Omitting these desynchronizes the client's parser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireItem {
     pub client_id: u16,
     /// Stackable count or splash/fluid type. `None` for plain items.
@@ -685,5 +687,22 @@ mod tests {
             find_subsequence(&bytes, &[0x73, 0x0B, 0xFF, 0xFE]).is_some(),
             "animated phase byte present"
         );
+    }
+
+    #[test]
+    fn wire_item_serde_round_trip() {
+        let item = WireItem {
+            client_id: 0x0ABC,
+            subtype: Some(5),
+            animated: true,
+        };
+        let bytes = bincode::serialize(&item).expect("serialize");
+        let back: WireItem = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(item, back);
+        // also test plain item
+        let plain = WireItem::plain(4526);
+        let bytes = bincode::serialize(&plain).expect("serialize");
+        let back: WireItem = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(plain, back);
     }
 }

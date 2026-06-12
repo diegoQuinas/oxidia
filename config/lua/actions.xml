@@ -2,5 +2,6 @@
     <action itemid="1386" script="teleport.onUse"/>
     <action itemid="1391" script="teleport.onUse"/>
     <action itemid="384"  script="teleport.onUse"/>
+    <action itemid="433"  script="teleport.onUse"/>
     <action fromid="2666" toid="2696" script="food.onUse"/>
 </actions>

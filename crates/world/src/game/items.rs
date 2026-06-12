@@ -30,7 +30,7 @@ impl Game {
             .dynamic
             .get(&(pos.x, pos.y, pos.z))
             .map(|st| st.pre_creature_len)
-            .unwrap_or_else(|| self.map.tile_pre_creature_len(pos));
+            .unwrap_or_else(|| self.chunks.tile_pre_creature_len(pos));
         let creatures = self.creatures_on(pos).len();
         let sp = if idx < pre { idx } else { idx + creatures };
         sp.min(9) as u8
@@ -165,7 +165,7 @@ impl Game {
             return;
         }
 
-        if !self.map.can_throw_object_to(from, to) {
+        if !self.chunks.can_throw_object_to(from, to) {
             self.push_cannot_move(id, "You cannot throw there.");
             return;
         }
@@ -175,7 +175,7 @@ impl Game {
             .dynamic
             .get(&(from.x, from.y, from.z))
             .map(|st| st.pre_creature_len)
-            .unwrap_or_else(|| self.map.tile_pre_creature_len(from));
+            .unwrap_or_else(|| self.chunks.tile_pre_creature_len(from));
         let sp = from_stackpos as usize;
         let src_idx = if sp < pre {
             sp
@@ -190,7 +190,7 @@ impl Game {
         let Some(src_sid) = self.merged_server_id(from, src_idx) else {
             return;
         };
-        let Some(meta) = self.map.item_meta(src_sid) else {
+        let Some(meta) = self.meta.item_meta(src_sid) else {
             return;
         };
         let stackable = meta.stackable;
@@ -202,13 +202,14 @@ impl Game {
         let animated = meta.animated;
         let is_container = meta.is_container;
 
-        if self.map.tile_pre_creature_len(to) == 0 && self.map.tile_stack_clone(to).is_none() {
+        if self.chunks.tile_pre_creature_len(to) == 0 && self.chunks.tile_stack_clone(to).is_none()
+        {
             self.push_cannot_move(id, "You cannot put that there.");
             return;
         }
         // Reject block-solid destinations (walls): TFS refuses to place items on a
         // tile whose stack holds an unpassable item.
-        if self.map.is_blocked(to) {
+        if self.chunks.is_blocked(to) {
             self.push_cannot_move(id, "You cannot put that there.");
             return;
         }
@@ -316,7 +317,7 @@ impl Game {
                     .dynamic
                     .get(&(from.x, from.y, from.z))
                     .map(|st| st.pre_creature_len)
-                    .unwrap_or_else(|| self.map.tile_pre_creature_len(from));
+                    .unwrap_or_else(|| self.chunks.tile_pre_creature_len(from));
                 let sp = from_stackpos as usize;
                 let src_idx = if sp < pre {
                     sp
@@ -329,7 +330,7 @@ impl Game {
                 let Some(src_sid) = self.merged_server_id(from, src_idx) else {
                     return;
                 };
-                let Some(meta) = self.map.item_meta(src_sid) else {
+                let Some(meta) = self.meta.item_meta(src_sid) else {
                     return;
                 };
                 if !meta.moveable {
@@ -390,23 +391,23 @@ impl Game {
                 // the player's own tile when fromCylinder is the inventory) the only
                 // distance constraint is throw range + line of sight to the dest —
                 // NOT adjacency. You can toss an unequipped item across the screen.
-                if player_pos.z != to.z || !self.map.can_throw_object_to(player_pos, to) {
+                if player_pos.z != to.z || !self.chunks.can_throw_object_to(player_pos, to) {
                     self.push_cannot_move(id, "You cannot throw there.");
                     return;
                 }
-                if self.map.tile_pre_creature_len(to) == 0
-                    && self.map.tile_stack_clone(to).is_none()
+                if self.chunks.tile_pre_creature_len(to) == 0
+                    && self.chunks.tile_stack_clone(to).is_none()
                 {
                     self.push_cannot_move(id, "You cannot put that there.");
                     return;
                 }
                 // Reject block-solid destinations (walls), mirroring do_move_thing.
-                if self.map.is_blocked(to) {
+                if self.chunks.is_blocked(to) {
                     self.push_cannot_move(id, "You cannot put that there.");
                     return;
                 }
                 let meta_stackable = self
-                    .map
+                    .meta
                     .item_meta(it.server_id)
                     .map(|m| m.stackable)
                     .unwrap_or(false);
@@ -461,7 +462,7 @@ impl Game {
                     return;
                 };
                 if let Some(eq) = self
-                    .map
+                    .meta
                     .item_meta(moving.server_id)
                     .and_then(|m| m.equip_slot)
                 {
@@ -476,7 +477,7 @@ impl Game {
                 let displaced = p.inventory[(dst - 1) as usize];
                 if let Some(d) = displaced {
                     let ok = self
-                        .map
+                        .meta
                         .item_meta(d.server_id)
                         .and_then(|m| m.equip_slot)
                         .map(|eq| eq.admits(src))
@@ -573,7 +574,7 @@ mod tests {
         // chain of tiles — including a hop where the destination is the player's
         // OWN tile (creature present), which is the on-tile case the existing
         // tests deliberately avoid. After every hop exactly ONE stone must exist.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         // Player stands on (102,100,7) the whole time; it can reach 101/102/103.
         let (player, mut rx) = add_player(&mut g, Position::new(102, 100, 7));
         drain(&mut rx);
@@ -640,7 +641,7 @@ mod tests {
     #[test]
     fn do_move_thing_from_eq_to_is_noop() {
         // from == to must be an early return with no overlay change and no packet.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         // Player at (100,100,7) (spawn), source at (101,100,7) — adjacent.
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         let pos = Position::new(101, 100, 7);
@@ -656,7 +657,7 @@ mod tests {
         // Player at (102,100,7), source deco at (103,100,7) — adjacent (dx=1).
         // stackpos for the item: pre_creature_len for (103,100,7) = 1 (ground),
         // no creatures on that tile → item is at stackpos 1.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(102, 100, 7));
         drain(&mut rx);
 
@@ -692,7 +693,7 @@ mod tests {
     #[test]
     fn do_move_thing_out_of_reach_is_rejected() {
         // Player at (100,100,7), source at (103,100,7) — dx=3 > 1 → too far.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         drain(&mut rx);
 
@@ -721,7 +722,7 @@ mod tests {
         // so creature stackpos does not interfere with the item's stackpos.
         // pre_creature_len for (101,100,7) = 1 (ground), no creatures on that tile
         // → stone is at item index 1 → wire stackpos 1.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         drain(&mut rx);
 
@@ -779,7 +780,7 @@ mod tests {
         // Player at (101,100,7) — adjacent to source (dx=1), not ON it.
         // pre_creature_len for (102,100,7) = 1 (ground), no creatures on it
         // → coins at item index 1 → wire stackpos 1.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(101, 100, 7));
         drain(&mut rx);
 
@@ -826,7 +827,7 @@ mod tests {
     fn do_move_thing_stackable_clamps_to_available() {
         // Attempt to move 20 of 10 coins — must clamp to 10 (no duplication).
         // Player at (101,100,7), coins at (102,100,7).
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(101, 100, 7));
         drain(&mut rx);
 
@@ -865,7 +866,7 @@ mod tests {
     fn do_move_thing_spectator_receives_tile_update() {
         // A spectator near both tiles must receive the add-tile-item packet.
         // Player at (100,100,7), stone at (101,100,7), spectator also at (100,100,7).
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx_player) = add_player(&mut g, Position::new(100, 100, 7));
         let (_spec, mut rx_spec) = add_player(&mut g, Position::new(100, 100, 7));
         drain(&mut rx_player);
@@ -896,7 +897,7 @@ mod tests {
         // Expected after move: sids = [ground(100), stone(200), coins(300)]
         //   i.e. stone at index 1 = pre_creature_len, coins shift to index 2.
         // Expected broadcast: 0x6A at stackpos 1 (pre_creature_len=1, no creatures).
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         drain(&mut rx);
 
@@ -945,7 +946,7 @@ mod tests {
 
     #[test]
     fn equip_ground_item_into_matching_slot() {
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         // Player adjacent to the helmet tile (106,100,7); stand on (105,100,7).
         let (player, mut rx) = add_player(&mut g, Position::new(105, 100, 7));
         drain(&mut rx);
@@ -972,7 +973,7 @@ mod tests {
 
     #[test]
     fn equip_into_wrong_slot_is_rejected() {
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(105, 100, 7));
         drain(&mut rx);
         // Try to put the helmet (head item) into the feet slot (8) → rejected.
@@ -1000,7 +1001,7 @@ mod tests {
 
     #[test]
     fn unequip_returns_item_to_the_ground() {
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(105, 100, 7));
         drain(&mut rx);
         // Equip first.

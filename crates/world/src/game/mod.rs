@@ -17,19 +17,20 @@ use rand::{SeedableRng, rngs::StdRng};
 use protocol::chat::SpeakType;
 use protocol::combat_packets;
 use protocol::creature::{self, CreatureView, Outfit};
-use protocol::map_description::{PlacedCreature, TileSource, WireItem};
+use protocol::map_description::{PlacedCreature, WireItem};
 use protocol::outfit as outfit_packets;
 use protocol::{enter_world, tile_creature, tile_item, walk};
 
-use crate::map::StaticMap;
+use crate::map::ChunkId;
+use crate::map::{ChunkManager, WorldMeta};
 use crate::pathfinding;
 use crate::{Direction, Position};
 
 use self::condition::ConditionRegeneration;
 use self::lua::LuaRuntime;
 pub(super) use self::monster::{
-    MonsterDrop, MonsterSpawn, MonsterState, MonsterType, name_hash_looktype, parse_monsters_xml,
-    parse_spawns_xml,
+    MonsterDrop, MonsterSpawn, MonsterState, MonsterType, name_hash_looktype,
+    parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml,
 };
 use self::xml_registry::XmlRegistry;
 
@@ -94,6 +95,41 @@ const MSG_CONSOLE_BLUE: u8 = 4;
 /// Ghost sprite looktype used when GM `/ghost` mode is active.
 /// Verify against client `.dat` if visual mismatch occurs.
 const GHOST_LOOKTYPE: u16 = 40;
+
+/// Creature race determining splash fluid type on combat hit/death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaceType {
+    Blood,
+    Venom,
+    Fire,
+    Energy,
+    Drown,
+    Physical,
+    Earth,
+    Holy,
+    Death,
+    Undead,
+    Diamond,
+}
+
+impl RaceType {
+    /// Fluid subtype byte for splash items, or `None` for races that produce no splash.
+    pub(crate) fn fluid_subtype(self) -> Option<u8> {
+        match self {
+            Self::Blood => Some(5),   // FLUID_BLOOD (OTClient: 5 = red)
+            Self::Venom => Some(6),   // FLUID_SLIME (OTClient: 6 = green)
+            _ => None,                // no splash
+        }
+    }
+}
+
+/// Client sprite id for the small (on-hit) splash item.
+/// items.otb: server_id=2019, client_id=2889, group=11 (SPLASH).
+const ITEM_SMALLSPLASH: u16 = 2889;
+
+/// Client sprite id for the full (on-death) splash item.
+/// items.otb: server_id=2016, client_id=2886, group=11 (SPLASH).
+const ITEM_FULLSPLASH: u16 = 2886;
 
 /// Client viewport extents from the player's tile, matching the 18x14 map
 /// description anchored at center-8 / center-6 (TFS `Map::maxClientViewportX/Y`).
@@ -258,6 +294,8 @@ struct PlayerState {
     sex: u8,
     /// Gamemaster flag from login; gates look-at debug (item id + position).
     gamemaster: bool,
+    /// Creature race — defaults to Blood for players (always produces blood splash).
+    race: RaceType,
     /// Ghost mode: GM invisible to non-GMs, bypasses collision.
     /// Runtime-only — reset on login/logout.
     ghost: bool,
@@ -296,7 +334,10 @@ struct PlayerState {
 }
 
 struct Game {
-    map: Arc<StaticMap>,
+    chunks: ChunkManager,
+    /// Shared world metadata (spawn, towns, item catalogue). Owned by the actor
+    /// and shared with WorldHandle via Arc.
+    meta: Arc<WorldMeta>,
     /// Copy-on-write overlay of runtime-modified tile stacks (M10.1). Empty until
     /// the first item move; reads fall back to `map` for untouched tiles.
     dynamic: std::collections::HashMap<(u16, u16, u8), crate::map::TileStack>,
@@ -342,12 +383,17 @@ pub struct GameConfig {
     pub monsters_xml: String,
     /// XML content of `world/map-spawn.xml` — monster spawn points.
     pub spawns_xml: String,
+    /// Directory containing individual monster XML files (e.g. `data/monster/`).
+    /// When set, these files are parsed and merged into `monster_types`,
+    /// providing race attributes and overrides for the flat config entries.
+    pub monsters_data_dir: Option<PathBuf>,
 }
 
 impl Game {
-    fn new(map: Arc<StaticMap>) -> Self {
+    fn new(chunks: ChunkManager, meta: Arc<WorldMeta>) -> Self {
         Game {
-            map,
+            chunks,
+            meta,
             dynamic: std::collections::HashMap::new(),
             players: HashMap::new(),
             monsters: HashMap::new(),
@@ -365,12 +411,29 @@ impl Game {
         }
     }
 
+    /// Create a `Game` from a `StaticMap` — convenience for tests. Not available
+    /// in production code (the production path builds ChunkManager directly).
+    #[cfg(test)]
+    pub(crate) fn from_static_map(map: crate::map::StaticMap) -> Self {
+        let (chunks, meta) = map.into_chunks_and_meta();
+        Game::new(chunks, Arc::new(meta))
+    }
+
+    /// Create a `Game` from an `Arc<StaticMap>` — convenience for tests using
+    /// shared fixtures that return `Arc<StaticMap>`.
+    #[cfg(test)]
+    pub(crate) fn from_static_map_arc(map: std::sync::Arc<crate::map::StaticMap>) -> Self {
+        let map = std::sync::Arc::try_unwrap(map).unwrap_or_else(|arc| (*arc).clone());
+        Self::from_static_map(map)
+    }
+
     /// Create a `Game` with a fixed RNG seed — deterministic in tests.
     #[cfg(test)]
     #[allow(dead_code)]
-    fn new_seeded(map: Arc<StaticMap>, seed: u64) -> Self {
+    fn new_seeded(chunks: ChunkManager, meta: Arc<WorldMeta>, seed: u64) -> Self {
         Game {
-            map,
+            chunks,
+            meta,
             dynamic: std::collections::HashMap::new(),
             players: HashMap::new(),
             monsters: HashMap::new(),
@@ -415,6 +478,7 @@ impl Game {
                     attack: t.attack,
                     loot: t.loot.clone(),
                     target_distance: t.target_distance,
+                    race: t.race,
                 };
                 self.spawns.insert(sid, spawn_entry);
 
@@ -437,6 +501,7 @@ impl Game {
                     list_walk_dir: VecDeque::new(),
                     follow_target: None,
                     target_distance: t.target_distance,
+                    race: t.race,
                 };
                 self.monsters.insert(mid, monster);
             } else {
@@ -465,6 +530,7 @@ impl Game {
                     list_walk_dir: VecDeque::new(),
                     follow_target: None,
                     target_distance: 0,
+                    race: Some(RaceType::Blood),
                 };
                 self.monsters.insert(mid, monster);
             }
@@ -473,9 +539,9 @@ impl Game {
     }
 
     /// A merged read view (overlay + static) for the map encoder.
-    fn merged(&self) -> crate::map::MergedTiles<'_> {
+    fn merged(&self) -> crate::map::MergedTiles<'_, ChunkManager> {
         crate::map::MergedTiles {
-            base: self.map.as_ref(),
+            base: &self.chunks,
             dynamic: &self.dynamic,
         }
     }
@@ -487,7 +553,7 @@ impl Game {
         if self.dynamic.contains_key(&key) {
             return true;
         }
-        match self.map.tile_stack_clone(pos) {
+        match self.chunks.tile_stack_clone(pos) {
             Some(st) => {
                 self.dynamic.insert(key, st);
                 true
@@ -814,6 +880,16 @@ impl Game {
             Command::UpArrow { id, cid } => self.do_up_arrow(id, cid),
             Command::Gm { id, text } => self.do_gm_command(id, text),
             Command::ReloadLua => self.do_reload_lua(),
+            Command::SweepChunks => {
+                let mut required: HashSet<ChunkId> = HashSet::new();
+                for p in self.players.values() {
+                    required.extend(crate::map::chunks_around(p.position));
+                }
+                for m in self.monsters.values() {
+                    required.extend(crate::map::chunks_around(m.position));
+                }
+                self.chunks.sweep(&required);
+            }
             // Intercepted in the actor loop (it must break the loop + ack);
             // never reaches `handle`. Arm kept for match exhaustiveness.
             Command::Shutdown { .. } => {}
@@ -834,9 +910,9 @@ impl Game {
     /// arises on stair/height landings (FLAG_IGNOREBLOCKCREATURE); the newest
     /// arrival renders on top, matching TFS. Capped at 10 like the wire stack.
     fn creature_stackpos_on(&self, pos: Position, exclude: u32) -> u8 {
-        let base = self
-            .map
-            .creature_stackpos(i32::from(pos.x), i32::from(pos.y), i32::from(pos.z));
+        let base =
+            self.chunks
+                .creature_stackpos(i32::from(pos.x), i32::from(pos.y), i32::from(pos.z));
         let others = self
             .players
             .iter()
@@ -854,8 +930,8 @@ impl Game {
     /// square rings around it (so co-logins don't stack on one tile). Falls back
     /// to the spawn itself if nothing free is found within the search radius.
     fn free_spawn(&self) -> Position {
-        let origin = self.map.spawn();
-        if self.map.is_walkable(origin) && !self.tile_occupied(origin, u32::MAX) {
+        let origin = self.meta.spawn();
+        if self.chunks.is_walkable(origin) && !self.tile_occupied(origin, u32::MAX) {
             return origin;
         }
         for r in 1..=5i32 {
@@ -865,7 +941,7 @@ impl Game {
                         continue; // ring perimeter only
                     }
                     if let Some(p) = origin.offset(dx, dy) {
-                        if self.map.is_walkable(p) && !self.tile_occupied(p, u32::MAX) {
+                        if self.chunks.is_walkable(p) && !self.tile_occupied(p, u32::MAX) {
                             return p;
                         }
                     }
@@ -879,7 +955,7 @@ impl Game {
     /// the nearest walkable, unoccupied tile near `origin`, returning `origin` if
     /// free. Used by `login` so a returning player never lands on an occupied tile.
     fn free_spawn_near(&self, origin: Position, exclude: u32) -> Position {
-        if self.map.is_walkable(origin) && !self.tile_occupied(origin, exclude) {
+        if self.chunks.is_walkable(origin) && !self.tile_occupied(origin, exclude) {
             return origin;
         }
         for r in 1..=5i32 {
@@ -889,7 +965,7 @@ impl Game {
                         continue;
                     }
                     if let Some(p) = origin.offset(dx, dy) {
-                        if self.map.is_walkable(p) && !self.tile_occupied(p, exclude) {
+                        if self.chunks.is_walkable(p) && !self.tile_occupied(p, exclude) {
                             return p;
                         }
                     }
@@ -928,7 +1004,7 @@ impl Game {
         if let Some(st) = self.dynamic.get(&(pos.x, pos.y, pos.z)) {
             return st.server_ids.get(idx).copied();
         }
-        self.map.tile_item_server_id(pos, idx)
+        self.chunks.tile_item_server_id(pos, idx)
     }
 
     /// Stack count at overlay/static stack index `idx` on `pos` (overlay wins).
@@ -936,7 +1012,7 @@ impl Game {
         if let Some(st) = self.dynamic.get(&(pos.x, pos.y, pos.z)) {
             return st.counts.get(idx).copied().flatten();
         }
-        self.map.tile_item_count(pos, idx)
+        self.chunks.tile_item_count(pos, idx)
     }
 
     /// Items below a creature on `pos`, overlay-aware (overlay wins over static).
@@ -944,7 +1020,7 @@ impl Game {
         self.dynamic
             .get(&(pos.x, pos.y, pos.z))
             .map(|st| st.pre_creature_len)
-            .unwrap_or_else(|| self.map.tile_pre_creature_len(pos))
+            .unwrap_or_else(|| self.chunks.tile_pre_creature_len(pos))
     }
 
     // -----------------------------------------------------------------
@@ -1052,7 +1128,7 @@ impl Game {
             dx.max(dy) <= 1
         });
 
-        let path = self.map.get_path_matching(
+        let path = self.chunks.get_path_matching(
             player_pos,
             target_pos,
             &creature_positions,
@@ -1081,11 +1157,11 @@ impl Game {
     /// `list_walk_dir`.
     pub(super) fn do_go_to_position(&mut self, id: u32, target: Position) {
         let (pos, in_pz) = match self.players.get(&id) {
-            Some(p) => (p.position, self.map.is_protection_zone(p.position)),
+            Some(p) => (p.position, self.chunks.is_protection_zone(p.position)),
             None => return,
         };
         // Check PZ: cannot start auto-walk from or into PZ.
-        if in_pz || self.map.is_protection_zone(target) {
+        if in_pz || self.chunks.is_protection_zone(target) {
             self.push_cannot_move(id, "You cannot walk there.");
             return;
         }
@@ -1093,7 +1169,7 @@ impl Game {
             self.push_cannot_move(id, "You cannot walk to a different floor.");
             return;
         }
-        if !self.map.is_walkable(target) {
+        if !self.chunks.is_walkable(target) {
             self.push_cannot_move(id, "You cannot walk there.");
             return;
         }
@@ -1132,9 +1208,9 @@ impl Game {
         let tpos = target;
         let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |p| p == tpos);
 
-        let path = self
-            .map
-            .get_path_matching(pos, target, &creature_positions, &params, condition);
+        let path =
+            self.chunks
+                .get_path_matching(pos, target, &creature_positions, &params, condition);
 
         if !path.is_empty() {
             if let Some(p) = self.players.get_mut(&id) {
@@ -1246,7 +1322,7 @@ impl Game {
                     dx.max(dy) <= td
                 });
 
-                let path = self.map.get_path_matching(
+                let path = self.chunks.get_path_matching(
                     terp,
                     target_pos,
                     &creature_positions,
@@ -1320,7 +1396,7 @@ impl Game {
                 }
 
                 // Player in PZ — stop following.
-                if self.map.is_protection_zone(pos) {
+                if self.chunks.is_protection_zone(pos) {
                     if let Some(p) = self.players.get_mut(&id) {
                         p.follow_target = None;
                         p.list_walk_dir.clear();
@@ -1375,7 +1451,7 @@ impl Game {
                         dx.max(dy) <= 1
                     });
 
-                    let path = self.map.get_path_matching(
+                    let path = self.chunks.get_path_matching(
                         pos,
                         target_pos,
                         &creature_positions,
@@ -1417,7 +1493,7 @@ impl Game {
                 // -------------------------------------------------------------
 
                 // Player in PZ — stop auto-walk.
-                if self.map.is_protection_zone(pos) {
+                if self.chunks.is_protection_zone(pos) {
                     if let Some(p) = self.players.get_mut(&id) {
                         p.go_to_position = None;
                         p.list_walk_dir.clear();
@@ -1459,7 +1535,7 @@ impl Game {
                     let condition: pathfinding::FrozenPathingConditionCall =
                         Box::new(move |p| p == tpos);
 
-                    let path = self.map.get_path_matching(
+                    let path = self.chunks.get_path_matching(
                         pos,
                         target,
                         &creature_positions,
@@ -1516,7 +1592,7 @@ impl Game {
                     // Check if next step would enter PZ.
                     let next_pos = pos.offset(direction.delta().0, direction.delta().1);
                     if let Some(np) = next_pos {
-                        if self.map.is_protection_zone(np) {
+                        if self.chunks.is_protection_zone(np) {
                             if let Some(p) = self.players.get_mut(&id) {
                                 p.go_to_position = None;
                                 p.list_walk_dir.clear();
@@ -1712,13 +1788,15 @@ enum Command {
     /// Drop and re-initialise the Lua runtime so script changes on disk take
     /// effect without restarting the server.
     ReloadLua,
+    /// Periodic sweep: evict chunks that are no longer needed.
+    SweepChunks,
 }
 
 /// Cloneable handle to the running world.
 #[derive(Clone)]
 pub struct WorldHandle {
     tx: mpsc::Sender<Command>,
-    pub map: Arc<StaticMap>,
+    pub meta: Arc<WorldMeta>,
 }
 
 impl WorldHandle {
@@ -1922,13 +2000,14 @@ pub fn push_channel() -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
 /// awaiting `store.save_player`. Also spawns the single global combat-tick task
 /// that sends `Command::CombatTick` every `COMBAT_TICK_MS` milliseconds.
 pub fn spawn(
-    map: Arc<StaticMap>,
+    chunks: ChunkManager,
+    meta: Arc<WorldMeta>,
     config: GameConfig,
 ) -> (WorldHandle, mpsc::UnboundedReceiver<SaveRecord>) {
     let (tx, mut rx) = mpsc::channel::<Command>(64);
     let handle = WorldHandle {
         tx: tx.clone(),
-        map: Arc::clone(&map),
+        meta: Arc::clone(&meta),
     };
 
     // Save channel: unbounded so the actor never blocks on logout.
@@ -1993,9 +2072,32 @@ pub fn spawn(
         }
     });
 
+    // Sweep tick: fires every 5s, sending SweepChunks to evict stale chunks.
+    let sweep_tx = tx.clone();
     tokio::spawn(async move {
-        let mut game = Game::new(map);
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+        iv.tick().await; // consume the immediate first tick
+        loop {
+            iv.tick().await;
+            if sweep_tx.send(Command::SweepChunks).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut game = Game::new(chunks, meta);
         game.save_tx = Some(save_tx);
+        // Pin chunks containing spawn and town temple positions so they are never
+        // evicted by the sweep. These are always needed for player login.
+        {
+            let mut pin_ids: Vec<ChunkId> = Vec::new();
+            pin_ids.push(crate::map::chunk_id(game.meta.spawn()));
+            for town in &game.meta.towns {
+                pin_ids.push(crate::map::chunk_id(Position::new(town.x, town.y, town.z)));
+            }
+            game.chunks.pin(&pin_ids);
+        }
         game.lua = config.lua_scripts_dir.map(|d| LuaRuntime::new(&d));
         game.registry = match XmlRegistry::from_actions_xml(&config.actions_xml) {
             Ok(r) => r,
@@ -2004,13 +2106,35 @@ pub fn spawn(
                 XmlRegistry::default()
             }
         };
-        game.monster_types = match parse_monsters_xml(&config.monsters_xml) {
+        let mut monster_types = match parse_monsters_xml(&config.monsters_xml) {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!(%e, "failed to parse monsters.xml — using empty type registry");
                 HashMap::new()
             }
         };
+
+        // Merge monsters from data dir (individual XMLs with race attributes).
+        if let Some(data_dir) = &config.monsters_data_dir {
+            match parse_monsters_data_dir(data_dir) {
+                Ok(dir_types) => {
+                    // Individual files override/update flat config entries.
+                    monster_types.extend(dir_types);
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "failed to parse data/monster — continuing with flat config");
+                }
+            }
+        }
+
+        // Default race = Blood for any monster that still has None.
+        for mt in monster_types.values_mut() {
+            if mt.race.is_none() {
+                mt.race = Some(RaceType::Blood);
+            }
+        }
+
+        game.monster_types = monster_types;
         game.load_spawns(&config.spawns_xml, 0);
         while let Some(cmd) = rx.recv().await {
             if let Command::Shutdown { ack } = cmd {
@@ -2034,7 +2158,7 @@ mod tests {
 
     #[test]
     fn spectators_within_client_viewport() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(100, 100, 7));
         let (b, _rb) = add_player(&mut g, Position::new(108, 106, 7)); // edge: +8x +6y
         let (c, _rc) = add_player(&mut g, Position::new(109, 100, 7)); // 9 west of its own view: out
@@ -2099,7 +2223,7 @@ mod tests {
         // spectators(pos) must be exactly { P : can_see(P, pos) }. A player 9 tiles
         // WEST sees pos on its +9 east edge and so IS a spectator; a player 9 tiles
         // EAST cannot (that would need a +9 west view) and is NOT.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (west9, _rw) = add_player(&mut g, Position::new(91, 100, 7)); // pos.x - 9
         let (east9, _re) = add_player(&mut g, Position::new(109, 100, 7)); // pos.x + 9
         let specs = g.spectators(Position::new(100, 100, 7), u32::MAX);
@@ -2112,7 +2236,7 @@ mod tests {
 
     #[test]
     fn introduce_uses_full_then_short_form() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (viewer, _rv) = add_player(&mut g, Position::new(100, 100, 7));
         let (target, _rt) = add_player(&mut g, Position::new(101, 100, 7));
         let first = g.introduce(viewer, target).unwrap();
@@ -2148,14 +2272,14 @@ mod tests {
 
     #[test]
     fn monster_creature_name_rat() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let mid = add_monster(&mut g, Position::new(101, 100, 7));
         assert_eq!(g.creature_name(mid), Some("Rat"));
     }
 
     #[test]
     fn monster_creature_outfit_uses_look_type() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let mid = add_monster(&mut g, Position::new(101, 100, 7));
         let outfit = g.creature_outfit(mid).unwrap();
         assert_eq!(outfit.look_type, 100);
@@ -2165,7 +2289,7 @@ mod tests {
 
     #[test]
     fn monster_creature_type_byte_returns_monster() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let mid = add_monster(&mut g, Position::new(101, 100, 7));
         assert_eq!(
             g.creature_type_byte(mid),
@@ -2175,7 +2299,7 @@ mod tests {
 
     #[test]
     fn monster_creature_type_byte_player_returns_player() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, _) = add_player(&mut g, Position::new(100, 100, 7));
         assert_eq!(
             g.creature_type_byte(pid),
@@ -2185,7 +2309,7 @@ mod tests {
 
     #[test]
     fn monster_creature_exists_for_monster() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let mid = add_monster(&mut g, Position::new(101, 100, 7));
         assert!(g.creature_exists(mid));
         assert!(!g.creature_exists(0x9999_9999));
@@ -2193,7 +2317,7 @@ mod tests {
 
     #[test]
     fn monster_visible_from_returns_monster_in_range() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let mid = add_monster(&mut g, Position::new(101, 100, 7));
         let visible = g.monsters_visible_from(Position::new(100, 100, 7));
         assert!(visible.contains(&mid), "monster at +1x must be visible");
@@ -2201,7 +2325,7 @@ mod tests {
 
     #[test]
     fn monster_not_visible_from_out_of_range() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         add_monster(&mut g, Position::new(200, 200, 7));
         let visible = g.monsters_visible_from(Position::new(100, 100, 7));
         assert!(visible.is_empty(), "monster too far must not be visible");
@@ -2209,7 +2333,7 @@ mod tests {
 
     #[test]
     fn monster_creatures_on_includes_monster() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let pid = {
             let (id, _) = add_player(&mut g, Position::new(100, 100, 7));
             id
@@ -2228,7 +2352,7 @@ mod tests {
 
     #[test]
     fn monster_creature_stackpos_advances_for_monster() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, _) = add_player(&mut g, Position::new(101, 100, 7));
         let mid = add_monster(&mut g, Position::new(101, 100, 7));
         // Both on same tile; stackpos = base (1 for ground) + OTHER creatures count.
@@ -2242,7 +2366,7 @@ mod tests {
 
     #[test]
     fn monster_introduce_uses_full_form_first_time() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (viewer, _) = add_player(&mut g, Position::new(100, 100, 7));
         let mid = add_monster(&mut g, Position::new(101, 100, 7));
         let first = g.introduce(viewer, mid).unwrap();
@@ -2255,7 +2379,7 @@ mod tests {
 
     #[test]
     fn monster_introduce_uses_monster_creature_type() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (viewer, _) = add_player(&mut g, Position::new(100, 100, 7));
         let mid = add_monster(&mut g, Position::new(101, 100, 7));
         let bytes = g.introduce(viewer, mid).unwrap();
@@ -2271,14 +2395,14 @@ mod tests {
 
     #[test]
     fn go_to_position_defaults_to_none_on_login() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, _) = add_player(&mut g, Position::new(100, 100, 7));
         assert!(g.players.get(&pid).unwrap().go_to_position.is_none());
     }
 
     #[test]
     fn clear_auto_walk_clears_goto_position_and_queue() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, _) = add_player(&mut g, Position::new(100, 100, 7));
         let p = g.players.get_mut(&pid).unwrap();
         p.go_to_position = Some(Position::new(105, 100, 7));
@@ -2294,7 +2418,7 @@ mod tests {
 
     #[test]
     fn manual_move_clears_goto_position_and_queue() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         {
             let p = g.players.get_mut(&pid).unwrap();
@@ -2323,7 +2447,7 @@ mod tests {
 
     #[test]
     fn do_go_to_position_rejects_different_floor() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         // WHEN goto is called with a target on z=8 (player is on z=7)
         g.do_go_to_position(pid, Position::new(96, 117, 8));
@@ -2338,7 +2462,7 @@ mod tests {
 
     #[test]
     fn do_go_to_position_rejects_unwalkable_tile() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         // (94,117) has a block-solid item in walk_map
         g.do_go_to_position(pid, Position::new(94, 117, 7));
@@ -2352,7 +2476,7 @@ mod tests {
 
     #[test]
     fn do_go_to_position_rejects_out_of_viewport() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         // Far beyond viewport
         g.do_go_to_position(pid, Position::new(200, 200, 7));
@@ -2366,7 +2490,7 @@ mod tests {
 
     #[test]
     fn do_go_to_position_already_there_is_noop() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         // Target is exactly where player stands
         g.do_go_to_position(pid, Position::new(95, 117, 7));
@@ -2380,7 +2504,7 @@ mod tests {
 
     #[test]
     fn do_go_to_position_sets_target_and_fills_queue_for_walkable_dest() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         // Valid walkable destination within viewport, adjacent tile east
         g.do_go_to_position(pid, Position::new(96, 117, 7));
@@ -2396,13 +2520,96 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Task 1.3-1.4: Auto-walk avoids holes (SDD: pathfinding-avoid-holes)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn do_go_to_position_finds_path_around_hole() {
+        // GIVEN a player with a hole tile between start and destination
+        let mut g = Game::from_static_map_arc(hole_bypass_map());
+        let (pid, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+
+        // WHEN goto is called with a target past the hole
+        g.do_go_to_position(pid, Position::new(102, 100, 7));
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+
+        // THEN go_to_position is set (target is reachable via bypass)
+        assert_eq!(
+            p.go_to_position,
+            Some(Position::new(102, 100, 7))
+        );
+        // AND the walk queue is filled (A* found the detour)
+        assert!(
+            !p.list_walk_dir.is_empty(),
+            "A* must find a detour around the hole tile"
+        );
+        // AND the path does not step through the hole at (101,100)
+        let hole_x = 101i32;
+        let hole_y = 100i32;
+        let mut cur = Position::new(100, 100, 7);
+        for &dir in &p.list_walk_dir {
+            let (dx, dy) = dir.delta();
+            cur = Position::new(
+                (i32::from(cur.x) + dx) as u16,
+                (i32::from(cur.y) + dy) as u16,
+                cur.z,
+            );
+            assert!(
+                i32::from(cur.x) != hole_x || i32::from(cur.y) != hole_y,
+                "path must not route through the hole tile at (101, 100)"
+            );
+        }
+    }
+
+    #[test]
+    fn do_follow_target_finds_path_around_hole() {
+        // GIVEN a player and a follow target on opposite sides of a hole tile
+        let mut g = Game::from_static_map_arc(hole_bypass_map());
+        // Player at (100,100,7), follow target at (102,100,7)
+        // Hole between them at (101,100,7)
+        let (pid, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        let (fid, _rfx) = add_player(&mut g, Position::new(102, 100, 7));
+        while rx.try_recv().is_ok() {}
+
+        // WHEN do_follow_target is called
+        g.do_follow_target(pid, fid);
+        while rx.try_recv().is_ok() {}
+        let p = g.players.get(&pid).unwrap();
+
+        // THEN follow_target is set
+        assert_eq!(p.follow_target, Some(fid));
+        // AND the walk queue is filled (A* found a detour)
+        assert!(
+            !p.list_walk_dir.is_empty(),
+            "A* must find a detour around the hole tile for follow"
+        );
+        // AND the path does not step through the hole at (101,100)
+        let hole_x = 101i32;
+        let hole_y = 100i32;
+        let mut cur = Position::new(100, 100, 7);
+        for &dir in &p.list_walk_dir {
+            let (dx, dy) = dir.delta();
+            cur = Position::new(
+                (i32::from(cur.x) + dx) as u16,
+                (i32::from(cur.y) + dy) as u16,
+                cur.z,
+            );
+            assert!(
+                i32::from(cur.x) != hole_x || i32::from(cur.y) != hole_y,
+                "follow path must not route through the hole tile at (101, 100)"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // AI tick auto-walk tests (Task 3.3)
     // -------------------------------------------------------------------------
 
     #[test]
     fn do_go_to_position_fills_queue_for_distant_target() {
         // combat_map(false) has tiles at (95..97, 117, 7) all walkable.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.do_go_to_position(pid, Position::new(97, 117, 7));
         while rx.try_recv().is_ok() {}
@@ -2415,7 +2622,7 @@ mod tests {
 
     #[test]
     fn ai_tick_takes_one_step_toward_go_to_target() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         // Target at (97,117) — 2 tiles east, so arrival check won't trigger
         // until after at least one step.
@@ -2441,7 +2648,7 @@ mod tests {
 
     #[test]
     fn ai_tick_clears_goto_on_arrival() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         // Set goto to (97,117) — two tiles east. After tick 1: at (96,117).
         // Tick 2: step to (97,117). Tick 3: exact arrival.
@@ -2465,7 +2672,7 @@ mod tests {
     fn ai_tick_clears_goto_on_pz_entry() {
         // wide_combat_map_with_pz: (90,117) is PZ, (91..116,117) non-PZ.
         // Start at (91,117), step west into (90,117)PZ.
-        let mut g = Game::new(wide_combat_map_with_pz());
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
         let (pid, mut rx) = add_player(&mut g, Position::new(91, 117, 7));
         {
             let p = g.players.get_mut(&pid).unwrap();
@@ -2494,7 +2701,7 @@ mod tests {
     #[test]
     fn do_go_to_steps_derives_target_from_authoritative_position() {
         // GIVEN a player at (95,117,7) who moves manually to (96,117,7)
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.handle(Command::Move {
             id: pid,
@@ -2528,7 +2735,7 @@ mod tests {
 
     #[test]
     fn do_go_to_steps_same_target_skips_astar_on_second_call() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
 
         // First call with [East, East] steps: should compute A* and fill queue
@@ -2588,5 +2795,282 @@ mod tests {
             !Game::can_see(Position::new(100, 100, 7), Position::new(100, 100, 8)),
             "underground hidden from surface"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Chunked map loading tests (PR 3)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn chunks_around_produces_27_ids_for_center_position() {
+        let ids = crate::map::chunks_around(Position::new(1000, 1000, 7));
+        // 3×3 grid × 3 floors = 27 chunk ids
+        assert_eq!(
+            ids.len(),
+            27,
+            "chunks_around must return exactly 27 chunk ids"
+        );
+    }
+
+    #[test]
+    fn sweep_retains_required_chunks() {
+        let map = walk_map();
+        let (mut chunks, meta) = Arc::try_unwrap(map).unwrap().into_chunks_and_meta();
+        let spawn_chunk = crate::map::chunk_id(meta.spawn());
+        let far_pos = Position::new(2000, 2000, 7);
+
+        // Sweep with only spawn chunk required
+        let required: HashSet<ChunkId> = [spawn_chunk].into_iter().collect();
+        chunks.sweep(&required);
+
+        // Spawn chunk must still be present
+        assert!(
+            chunks.is_walkable(meta.spawn()),
+            "spawn chunk must survive sweep when required"
+        );
+        // Far chunk should be evicted (no tile there)
+        assert!(
+            !chunks.is_walkable(far_pos),
+            "far chunk must be evicted when not required"
+        );
+    }
+
+    #[test]
+    fn pin_prevents_eviction() {
+        let map = walk_map();
+        let (mut chunks, meta) = Arc::try_unwrap(map).unwrap().into_chunks_and_meta();
+        let spawn_chunk = crate::map::chunk_id(meta.spawn());
+
+        // Pin the spawn chunk, sweep with empty required set
+        chunks.pin(&[spawn_chunk]);
+        chunks.sweep(&HashSet::new());
+
+        // Pinned chunk must survive even with empty required set
+        assert!(
+            chunks.is_walkable(meta.spawn()),
+            "pinned chunk must survive sweep with empty required set"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_with_chunked_map_and_sweep_active() {
+        let map = walk_map();
+        let (chunks, meta) = Arc::try_unwrap(map).unwrap().into_chunks_and_meta();
+        let meta = Arc::new(meta);
+        let (world, _save_rx) = super::spawn(chunks, meta, GameConfig::default());
+
+        // Login a player — should succeed with chunked map
+        let (tx, _rx) = push_channel();
+        let ack = world
+            .login("Hero".into(), default_initial(knight()), tx)
+            .await
+            .unwrap();
+        assert!(ack.snapshot.id > 0, "player must receive a valid id");
+    }
+
+    #[test]
+    fn teleport_computes_destination_chunks() {
+        let mut g = Game::from_static_map_arc(walk_map());
+        let (player, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        drain(&mut rx);
+
+        // Teleport to a distant position
+        let dest = Position::new(1000, 1000, 7);
+        g.do_teleport(player, dest);
+
+        assert_eq!(
+            g.players.get(&player).unwrap().position,
+            dest,
+            "player must be teleported to the destination"
+        );
+    }
+
+    #[test]
+    fn do_teleport_same_position_is_noop() {
+        let mut g = Game::from_static_map_arc(walk_map());
+        let pos = Position::new(95, 117, 7);
+        let (player, mut rx) = add_player(&mut g, pos);
+        drain(&mut rx);
+
+        g.do_teleport(player, pos);
+
+        // Player still at same position
+        assert_eq!(g.players.get(&player).unwrap().position, pos);
+    }
+
+    #[test]
+    fn sweep_chunks_command_runs_without_crash() {
+        let mut g = Game::from_static_map_arc(walk_map());
+        // Add a player so there's something to compute required chunks for
+        let (player, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        drain(&mut rx);
+
+        // Execute the SweepChunks command
+        g.handle(Command::SweepChunks);
+
+        // Player should be unaffected
+        assert!(g.players.contains_key(&player));
+    }
+
+    #[test]
+    fn spawn_chunks_are_pinned_at_boot() {
+        let map = walk_map();
+        let (mut chunks, meta) = Arc::try_unwrap(map).unwrap().into_chunks_and_meta();
+        let spawn_chunk = crate::map::chunk_id(meta.spawn());
+
+        // Simulate what spawn() does: pin spawn/temple chunks
+        let mut pin_ids: Vec<ChunkId> = Vec::new();
+        pin_ids.push(spawn_chunk);
+        for town in &meta.towns {
+            pin_ids.push(crate::map::chunk_id(Position::new(town.x, town.y, town.z)));
+        }
+        chunks.pin(&pin_ids);
+
+        // Sweep with empty required
+        chunks.sweep(&HashSet::new());
+
+        // Pinned spawn must survive
+        assert!(
+            chunks.is_walkable(meta.spawn()),
+            "pinned spawn chunk must survive sweep"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Blood-item-on-hit: RaceType → fluid_subtype mapping tests (1.1 RED)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn race_type_blood_maps_to_fluid_5() {
+        assert_eq!(RaceType::Blood.fluid_subtype(), Some(5));
+    }
+
+    #[test]
+    fn race_type_venom_maps_to_fluid_6() {
+        assert_eq!(RaceType::Venom.fluid_subtype(), Some(6));
+    }
+
+    #[test]
+    fn race_type_undead_does_not_splash() {
+        assert_eq!(RaceType::Undead.fluid_subtype(), None);
+    }
+
+    #[test]
+    fn race_type_fire_does_not_splash() {
+        assert_eq!(RaceType::Fire.fluid_subtype(), None);
+    }
+
+    #[test]
+    fn race_type_energy_does_not_splash() {
+        assert_eq!(RaceType::Energy.fluid_subtype(), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Blood-item-on-hit: XML race attr parsing tests (2.1 RED)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_monsters_xml_race_attr_blood() {
+        let xml = r#"<monsters>
+            <monster name="Rat" looktype="100" health="50" max_health="50" speed="200" attack="7" race="blood"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let rat = map.get("rat").expect("Rat must be parsed");
+        assert_eq!(rat.race, Some(RaceType::Blood));
+    }
+
+    #[test]
+    fn parse_monsters_xml_race_attr_venom() {
+        let xml = r#"<monsters>
+            <monster name="Spider" looktype="38" health="30" max_health="30" speed="120" attack="15" race="venom"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let spider = map.get("spider").expect("Spider must be parsed");
+        assert_eq!(spider.race, Some(RaceType::Venom));
+    }
+
+    #[test]
+    fn parse_monsters_xml_race_attr_missing() {
+        let xml = r#"<monsters>
+            <monster name="Skeleton" looktype="33" health="50" max_health="50" speed="146" attack="7"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let skel = map.get("skeleton").expect("Skeleton must be parsed");
+        assert_eq!(skel.race, Some(RaceType::Blood));
+    }
+
+    #[test]
+    fn parse_monsters_xml_race_attr_undead() {
+        let xml = r#"<monsters>
+            <monster name="Ghost" looktype="52" health="80" max_health="80" speed="160" attack="10" race="undead"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let ghost = map.get("ghost").expect("Ghost must be parsed");
+        assert_eq!(ghost.race, Some(RaceType::Undead));
+    }
+
+    #[test]
+    fn parse_monsters_data_dir_parses_individual_xml() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("oxidia_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write index monster.xml
+        let mut idx = std::fs::File::create(dir.join("monsters.xml")).unwrap();
+        idx.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<monsters>
+    <monster name="Rat" file="Rats/rat.xml"/>
+    <monster name="Dragon" file="Dragons/dragon.xml"/>
+</monsters>"#).unwrap();
+
+        // Create subdirs
+        std::fs::create_dir_all(dir.join("Rats")).unwrap();
+        std::fs::create_dir_all(dir.join("Dragons")).unwrap();
+
+        // Write individual XMLs
+        let mut rat = std::fs::File::create(dir.join("Rats/rat.xml")).unwrap();
+        rat.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<monster name="Rat" nameDescription="a rat" race="blood" experience="5" speed="134" manacost="200">
+    <health now="20" max="20"/>
+    <look type="21" corpse="5964"/>
+    <attacks>
+        <attack name="melee" interval="2000" skill="15" attack="7"/>
+    </attacks>
+</monster>"#).unwrap();
+
+        let mut dragon = std::fs::File::create(dir.join("Dragons/dragon.xml")).unwrap();
+        dragon.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<monster name="Dragon" nameDescription="a dragon" race="fire" experience="1000" speed="180">
+    <health now="300" max="300"/>
+    <look type="92" corpse="5991"/>
+    <attacks>
+        <attack name="melee" interval="2000" min="-30" max="-50"/>
+    </attacks>
+</monster>"#).unwrap();
+
+        let map = parse_monsters_data_dir(&dir).unwrap();
+
+        // Rat: explicit race=blood
+        let rat = map.get("rat").expect("Rat must be parsed");
+        assert_eq!(rat.race, Some(RaceType::Blood));
+        assert_eq!(rat.health, 20);
+        assert_eq!(rat.max_health, 20);
+        assert_eq!(rat.look_type, 21);
+        assert_eq!(rat.speed, 134);
+        assert_eq!(rat.attack, 7);
+
+        // Dragon: explicit race=fire, attack from min/max format
+        let dragon = map.get("dragon").expect("Dragon must be parsed");
+        assert_eq!(dragon.race, Some(RaceType::Fire));
+        assert_eq!(dragon.health, 300);
+        assert_eq!(dragon.max_health, 300);
+        assert_eq!(dragon.look_type, 92);
+        assert_eq!(dragon.speed, 180);
+        assert_eq!(dragon.attack, 50); // max.abs() = 50
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

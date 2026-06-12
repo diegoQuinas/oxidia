@@ -9,4 +9,8 @@ license.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+serde.workspace = true
 num-bigint-dig.workspace = true
+
+[dev-dependencies]
+bincode.workspace = true

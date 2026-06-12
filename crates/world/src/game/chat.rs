@@ -86,7 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn say_broadcasts_to_spectator_and_speaker() {
-        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
+        let (world, _save_rx) = spawn_from_static_map(walk_map(), GameConfig::default());
         let (tx_a, mut rx_a) = push_channel();
         let ack_a = world
             .login("A".into(), default_initial(knight()), tx_a)
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn say_does_not_reach_beyond_viewport() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (_far, mut rx) = add_player(&mut g, Position::new(107, 117, 7)); // 12 east, outside ±8
         g.do_say(a, SpeakType::Say, "hi".into());
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn yell_uppercases_and_reaches_far_spectator() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (_far, mut rx) = add_player(&mut g, Position::new(107, 117, 7)); // 12 east: >±8, <±18
         g.do_say(a, SpeakType::Yell, "help".into());
@@ -138,16 +138,13 @@ mod tests {
 
     #[test]
     fn monster_yell_broadcasts_to_yell_range_without_uppercase() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (_mid, _rm) = add_player(&mut g, Position::new(107, 117, 7)); // 12 east: >±8, <±18
         let (_far, mut rx_far) = add_player(&mut g, Position::new(115, 117, 7)); // 20 east: >±18
         g.do_say(a, SpeakType::MonsterYell, "Glup".into());
         let pkt = rx_far.try_recv();
-        assert!(
-            pkt.is_err(),
-            "MonsterYell must NOT reach beyond ±18"
-        );
+        assert!(pkt.is_err(), "MonsterYell must NOT reach beyond ±18");
         // Mid (12 east, within ±18) must receive the packet with original casing.
         // rx_mid was dropped; the test compiles because we already verified the
         // range. The key assertion is that the packet is broadcast at all and
@@ -156,7 +153,7 @@ mod tests {
 
     #[test]
     fn monster_say_broadcasts_to_say_range() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (_mid, _rm) = add_player(&mut g, Position::new(107, 117, 7)); // 12 east: >±8, <±18
         let (_far, _rf) = add_player(&mut g, Position::new(115, 117, 7));
@@ -164,7 +161,9 @@ mod tests {
         // Test that it doesn't panic and range is correct.
         let (_a2, mut rx_in) = add_player(&mut g, Position::new(96, 117, 7)); // 1 east: in range
         g.do_say(a, SpeakType::MonsterSay, "hello".into());
-        let pkt = rx_in.try_recv().expect("MonsterSay must reach nearby players");
+        let pkt = rx_in
+            .try_recv()
+            .expect("MonsterSay must reach nearby players");
         assert_eq!(pkt[0], protocol::chat::OP_CREATURE_SAY);
         assert!(
             String::from_utf8_lossy(&pkt).contains("hello"),
@@ -174,7 +173,7 @@ mod tests {
 
     #[test]
     fn whisper_full_to_adjacent_pspsps_to_far_in_view() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (_adj, mut rx_adj) = add_player(&mut g, Position::new(96, 117, 7)); // Chebyshev 1
         let (_far, mut rx_far) = add_player(&mut g, Position::new(102, 117, 7)); // 7 east: in ±8, >1

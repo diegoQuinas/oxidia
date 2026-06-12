@@ -227,7 +227,7 @@ impl Game {
     fn gm_goto(&mut self, id: u32, args: &[&str]) {
         // Coordinate form: three numeric args.
         if let Some(pos) = parse_pos(args) {
-            if !self.map.has_ground(pos) {
+            if !self.chunks.has_ground(pos) {
                 self.push_status_message(id, b"There is no tile there.");
                 return;
             }
@@ -264,9 +264,9 @@ impl Game {
     /// own town — see docs/superpowers/backlog.md.
     fn gm_temple(&mut self, id: u32, args: &[&str]) {
         let temple = match args.first() {
-            None => self.map.spawn(),
+            None => self.meta.spawn(),
             Some(arg) => match arg.parse::<u32>() {
-                Ok(town_id) => match self.map.town_temple_by_id(town_id) {
+                Ok(town_id) => match self.meta.town_temple_by_id(town_id) {
                     Some(p) => p,
                     None => {
                         self.push_status_message(
@@ -276,7 +276,7 @@ impl Game {
                         return;
                     }
                 },
-                Err(_) => match self.map.town_temple_by_name(arg) {
+                Err(_) => match self.meta.town_temple_by_name(arg) {
                     Some(p) => p,
                     None => {
                         self.push_status_message(id, format!("No town named '{arg}'.").as_bytes());
@@ -322,7 +322,7 @@ impl Game {
                 _ => (args, 1),
             };
             let name = name_tokens.join(" ");
-            match self.map.find_item_id_by_name(&name) {
+            match self.meta.find_item_id_by_name(&name) {
                 Some(sid) => (sid, count),
                 None => {
                     self.push_status_message(id, format!("No item named '{name}'.").as_bytes());
@@ -350,7 +350,7 @@ impl Game {
             self.push_status_message(id, format!("Player '{name}' not found.").as_bytes());
             return;
         };
-        if !self.map.has_ground(pos) {
+        if !self.chunks.has_ground(pos) {
             self.push_status_message(id, b"There is no tile there.");
             return;
         }
@@ -509,6 +509,7 @@ impl Game {
             list_walk_dir: VecDeque::new(),
             follow_target: None,
             target_distance: template.map(|t| t.target_distance).unwrap_or(0),
+            race: template.and_then(|t| t.race),
         };
         self.monsters.insert(mid, monster);
         // Broadcast the new monster to every spectator (including the GM).
@@ -533,7 +534,7 @@ impl Game {
     /// insert at the front of the down-items (newest on top), broadcast at the
     /// top down-item stackpos. Replies to `gm_id` on success or failure.
     pub(crate) fn do_spawn_item(&mut self, gm_id: u32, pos: Position, server_id: u16, count: u16) {
-        let Some(meta) = self.map.item_meta(server_id) else {
+        let Some(meta) = self.meta.item_meta(server_id) else {
             self.push_status_message(gm_id, format!("Unknown item id {server_id}.").as_bytes());
             return;
         };
@@ -825,7 +826,7 @@ mod tests {
             b"version = 1\nfunction onUse(args) return true end",
         )
         .unwrap();
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         g.lua = Some(LuaRuntime::new(&dir));
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.players.get_mut(&player).unwrap().gamemaster = true;
@@ -881,7 +882,7 @@ mod tests {
 
     #[test]
     fn find_player_by_name_is_case_insensitive() {
-        let mut g = Game::new(stair_map());
+        let mut g = Game::from_static_map_arc(stair_map());
         let (id, _rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.players.get_mut(&id).unwrap().name = "God Diego".into();
         assert_eq!(g.find_player_by_name("god diego"), Some(id));
@@ -922,7 +923,7 @@ mod tests {
 
     #[test]
     fn ghost_toggle_on_sets_flag_and_changes_looktype_to_40() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
 
@@ -949,7 +950,7 @@ mod tests {
 
     #[test]
     fn ghost_toggle_off_restores_looktype_and_clears_flag() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         let orig_outfit = g.players[&gm].outfit;
@@ -973,7 +974,7 @@ mod tests {
 
     #[test]
     fn ghost_toggle_non_gm_is_silently_dropped() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (player, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         drain(&mut rx);
 
@@ -1023,7 +1024,7 @@ mod tests {
 
     #[test]
     fn speed_self_target_sets_speed_and_pushes_stats() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         drain(&mut rx);
@@ -1064,7 +1065,7 @@ mod tests {
 
     #[test]
     fn speed_named_target_sets_target_speed() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         let (target, _rt) = add_player(&mut g, Position::new(96, 117, 7));
@@ -1087,7 +1088,7 @@ mod tests {
 
     #[test]
     fn speed_invalid_name_returns_error() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         drain(&mut rx);
@@ -1114,7 +1115,7 @@ mod tests {
 
     #[test]
     fn speed_range_below_minimum_is_rejected() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         drain(&mut rx);
@@ -1134,7 +1135,7 @@ mod tests {
 
     #[test]
     fn speed_range_above_maximum_is_rejected() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         drain(&mut rx);
@@ -1154,7 +1155,7 @@ mod tests {
 
     #[test]
     fn speed_range_minimum_accepted() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
 
@@ -1168,7 +1169,7 @@ mod tests {
 
     #[test]
     fn speed_range_maximum_accepted() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
 
@@ -1182,7 +1183,7 @@ mod tests {
 
     #[test]
     fn speed_non_numeric_value_is_rejected() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         drain(&mut rx);
@@ -1206,7 +1207,7 @@ mod tests {
 
     #[test]
     fn speed_change_broadcasts_remove_and_reintroduce_to_spectators() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         let (target, _rt) = add_player(&mut g, Position::new(96, 117, 7));
@@ -1236,7 +1237,7 @@ mod tests {
 
     #[test]
     fn speed_no_packets_to_out_of_range_spectators() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         // Target is far away from spectator (out of view range).
@@ -1271,7 +1272,7 @@ mod tests {
 
     #[test]
     fn noclip_toggle_on_sets_flag_outfit_unchanged() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         let orig_outfit = g.players[&gm].outfit;
@@ -1286,7 +1287,7 @@ mod tests {
 
     #[test]
     fn noclip_toggle_off_clears_flag() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
 
@@ -1304,7 +1305,7 @@ mod tests {
 
     #[test]
     fn noclip_toggle_non_gm_is_silently_dropped() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (player, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         drain(&mut rx);
 
@@ -1327,7 +1328,7 @@ mod tests {
 
     #[test]
     fn non_gm_spectator_does_not_see_ghost_gm() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rg) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         // Non-GM player one tile east — both can see pos (95,117).
@@ -1346,7 +1347,7 @@ mod tests {
 
     #[test]
     fn gm_spectator_sees_ghost_gm() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rg) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         // GM viewer one tile east — both GMs, should see ghost.
@@ -1364,7 +1365,7 @@ mod tests {
 
     #[test]
     fn non_gm_visible_from_excludes_ghost_gm() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rg) = add_player(&mut g, Position::new(96, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         // Non-GM at 95,117 looks north? Actually they share same floor.
@@ -1382,7 +1383,7 @@ mod tests {
 
     #[test]
     fn gm_visible_from_includes_ghost_gm() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rg) = add_player(&mut g, Position::new(96, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         // GM viewer at 95,117.

@@ -30,7 +30,7 @@ impl Game {
             None => return,
         };
         // PZ check on the attacker's tile.
-        if self.map.is_protection_zone(attacker_pos) {
+        if self.chunks.is_protection_zone(attacker_pos) {
             self.push_status_message(
                 id,
                 b"You may not attack while you are in a protection zone.",
@@ -166,6 +166,12 @@ impl Game {
                 self.push(*sid, pkt);
             }
         }
+        // On-hit splash from player's race (always Blood by default).
+        if let Some(fluid) = self.players.get(&victim_id).and_then(|p| {
+            p.race.fluid_subtype()
+        }) {
+            self.spawn_splash(victim_pos, ITEM_SMALLSPLASH, fluid);
+        }
         // Death?
         if new_health == 0 {
             self.do_death(victim_id);
@@ -211,7 +217,48 @@ impl Game {
             Some(p) => p.position,
             None => return,
         };
-        let temple = self.map.temple_for(death_pos);
+        let temple = self.meta.temple_for(death_pos);
+
+        // On-death splash from player's race (always Blood by default). Exclude
+        // the victim from the broadcast — the dying player won't see the world
+        // around them, and including them could reap (via push) when their buffer
+        // is full, breaking the death flow (regression
+        // `death_with_full_client_buffer_still_saves_at_temple`).
+        let victim_race = self.players.get(&victim_id).map(|p| p.race);
+        if let Some(fluid) = victim_race.and_then(RaceType::fluid_subtype) {
+            if self.materialize(death_pos) {
+                let wi = WireItem {
+                    client_id: ITEM_FULLSPLASH,
+                    subtype: Some(fluid),
+                    animated: false,
+                };
+                let front = self
+                    .dynamic
+                    .get(&(death_pos.x, death_pos.y, death_pos.z))
+                    .map(|st| st.pre_creature_len)
+                    .unwrap_or(0);
+                let creatures = self.creatures_on(death_pos).len();
+                let sp = (front + creatures).min(9) as u8;
+                let pkt = tile_item::add_tile_item(
+                    (death_pos.x, death_pos.y, death_pos.z),
+                    sp,
+                    &wi,
+                );
+                // Push to all spectators EXCEPT the victim (non-reaping try_send).
+                for spec in self.spectators(death_pos, victim_id) {
+                    if let Some(p) = self.players.get(&spec) {
+                        let _ = p.push_tx.try_send(pkt.clone());
+                    }
+                }
+                {
+                    let st = self.dynamic.get_mut(&(death_pos.x, death_pos.y, death_pos.z)).unwrap();
+                    let front = st.pre_creature_len;
+                    st.items.insert(front, wi);
+                    st.server_ids.insert(front, ITEM_FULLSPLASH);
+                    st.counts.insert(front, Some(fluid));
+                }
+            }
+        }
 
         // Remove from the death tile for spectators. The id-form remove is
         // unambiguous under co-occupancy (stair/height landings); drop the victim
@@ -341,6 +388,16 @@ impl Game {
             }
         }
 
+        // On-hit splash from monster's race mapping.
+        if let Some(fluid) = self
+            .monsters
+            .get(&victim_id)
+            .and_then(|m| m.race)
+            .and_then(RaceType::fluid_subtype)
+        {
+            self.spawn_splash(victim_pos, ITEM_SMALLSPLASH, fluid);
+        }
+
         // Retaliation: if the monster survived, start attacking back.
         if new_health > 0 {
             if let Some(m) = self.monsters.get_mut(&victim_id) {
@@ -362,10 +419,15 @@ impl Game {
     /// from the monster registry, and spawn loot on the death tile. If the
     /// monster had a spawn entry, schedule a respawn.
     fn do_monster_death(&mut self, victim_id: u32, now_ms: u64) {
-        let (spawn_id, death_pos, loot) = match self.monsters.get(&victim_id) {
-            Some(m) => (m.spawn_id, m.position, m.loot.clone()),
+        let (spawn_id, death_pos, loot, race) = match self.monsters.get(&victim_id) {
+            Some(m) => (m.spawn_id, m.position, m.loot.clone(), m.race),
             None => return,
         };
+
+        // On-death splash from monster's race.
+        if let Some(fluid) = race.and_then(RaceType::fluid_subtype) {
+            self.spawn_splash(death_pos, ITEM_FULLSPLASH, fluid);
+        }
 
         // Clear all player fights targeting the monster.
         let all_players: Vec<u32> = self.players.keys().copied().collect();
@@ -408,6 +470,45 @@ impl Game {
         self.spawn_loot(death_pos, &loot);
     }
 
+    /// Spawn a splash item at `pos` with server id `item_id` and fluid subtype.
+    /// Reuses the same overlay pattern as `spawn_loot`: materialize → cap check →
+    /// insert at pre_creature_len → broadcast `0x6A` to spectators.
+    /// Silently returns if the tile is at capacity (≥10 things).
+    fn spawn_splash(&mut self, pos: Position, item_id: u16, fluid: u8) {
+        if !self.materialize(pos) {
+            return;
+        }
+        {
+            let st = match self.dynamic.get(&(pos.x, pos.y, pos.z)) {
+                Some(st) => st,
+                None => return,
+            };
+            if st.items.len() >= 10 {
+                return; // tile cap
+            }
+        }
+        let wi = WireItem {
+            client_id: item_id,
+            subtype: Some(fluid),
+            animated: false,
+        };
+        let dest_creatures = self.creatures_on(pos).len();
+        {
+            let st = self.dynamic.get_mut(&(pos.x, pos.y, pos.z)).unwrap();
+            let front = st.pre_creature_len;
+            st.items.insert(front, wi);
+            st.server_ids.insert(front, item_id);
+            st.counts.insert(front, Some(fluid));
+        }
+        let front = self
+            .dynamic
+            .get(&(pos.x, pos.y, pos.z))
+            .map(|st| st.pre_creature_len)
+            .unwrap_or(0);
+        let sp = (front + dest_creatures).min(9) as u8;
+        self.broadcast_dest(pos, sp, wi, false);
+    }
+
     /// Roll the loot table and spawn items on the ground at `pos`.
     fn spawn_loot(&mut self, pos: Position, loot: &[MonsterDrop]) {
         if !self.materialize(pos) {
@@ -427,7 +528,7 @@ impl Game {
                 continue;
             }
 
-            let Some(meta) = self.map.item_meta(drop.item_id) else {
+            let Some(meta) = self.meta.item_meta(drop.item_id) else {
                 continue;
             };
             let subtype = if meta.stackable {
@@ -522,6 +623,7 @@ impl Game {
                 list_walk_dir: VecDeque::new(),
                 follow_target: None,
                 target_distance: spawn.target_distance,
+                race: spawn.race,
             };
             self.monsters.insert(mid, monster);
             // Broadcast the resawned monster.
@@ -557,8 +659,8 @@ impl Game {
             None => return,
         };
         let target_is_player = self.players.contains_key(&target_id);
-        if self.map.is_protection_zone(attacker_pos)
-            || (target_is_player && self.map.is_protection_zone(target_pos))
+        if self.chunks.is_protection_zone(attacker_pos)
+            || (target_is_player && self.chunks.is_protection_zone(target_pos))
         {
             if let Some(p) = self.players.get_mut(&attacker_id) {
                 p.attacking = None;
@@ -604,8 +706,8 @@ impl Game {
             None => return,
         };
         // PZ check: attacker in PZ always clears; target PZ only matters for players.
-        if self.map.is_protection_zone(attacker_pos)
-            || (target_is_player && self.map.is_protection_zone(target_pos))
+        if self.chunks.is_protection_zone(attacker_pos)
+            || (target_is_player && self.chunks.is_protection_zone(target_pos))
         {
             if let Some(m) = self.monsters.get_mut(&attacker_id) {
                 m.attacking = None;
@@ -646,7 +748,7 @@ mod tests {
 
     #[test]
     fn set_target_sets_attacking_and_clear_resets_it() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
@@ -661,7 +763,7 @@ mod tests {
 
     #[test]
     fn set_target_self_is_ignored() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         g.do_set_target(a, a);
         assert_eq!(g.players[&a].attacking, None, "self-target must be ignored");
@@ -675,7 +777,7 @@ mod tests {
     fn set_target_from_pz_tile_rejects_and_pushes_0xb4() {
         // Attacker is standing on a PZ tile → attack must be rejected with 0xB4
         // and attacking must remain None.
-        let mut g = Game::new(combat_map(true)); // spawn is PZ
+        let mut g = Game::from_static_map_arc(combat_map(true)); // spawn is PZ
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7)); // PZ tile
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
@@ -694,7 +796,7 @@ mod tests {
     fn combat_tick_deals_damage_to_adjacent_target() {
         // A (attacker) and B (victim) are adjacent. After setting target and
         // advancing time past one attack interval, B must have lost HP.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
@@ -722,7 +824,7 @@ mod tests {
     #[test]
     fn combat_tick_sends_stats_to_victim() {
         // After a combat tick, the victim must also receive its own 0xA0 stats.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
@@ -743,7 +845,7 @@ mod tests {
     #[test]
     fn combat_tick_spectator_receives_health_bar() {
         // A third-party spectator of B's tile must also receive the 0x8C.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         // Spectator sits close enough to see B's tile.
@@ -759,7 +861,7 @@ mod tests {
     #[test]
     fn combat_tick_no_damage_when_target_out_of_melee_range() {
         // Target 2 tiles away → no swing, no packets.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(97, 117, 7)); // 2 tiles east
         g.do_set_target(a, b);
@@ -773,7 +875,7 @@ mod tests {
     #[test]
     fn combat_tick_respects_interval_no_damage_before_due() {
         // tick at now_ms < MELEE_ATTACK_INTERVAL_MS must not swing.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
@@ -790,13 +892,13 @@ mod tests {
         // Death == logout: the victim gets the 0x28 window, is removed from the
         // world, and a SaveRecord is emitted at the temple with full HP — so the
         // relog spawns at the temple (M8 `login` restores the saved position).
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
         g.save_tx = Some(save_tx);
         let (a, _ra) = add_player(&mut g, Position::new(97, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         let max_hp = g.players[&b].max_health;
-        let temple = g.map.spawn();
+        let temple = g.meta.spawn();
         g.do_set_target(a, b);
         g.players.get_mut(&b).unwrap().health = 1;
 
@@ -834,11 +936,11 @@ mod tests {
         // Regression: a saturated victim push buffer must NOT divert death through
         // the reaping push()/logout path (which saves at the death tile with the
         // current HP). do_death uses a non-reaping try_send for the death window.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
         g.save_tx = Some(save_tx);
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
-        let temple = g.map.spawn();
+        let temple = g.meta.spawn();
         g.players.get_mut(&b).unwrap().health = 1;
         // Fill B's push channel to capacity so a reaping send would log it out.
         for _ in 0..super::super::PUSH_CAPACITY {
@@ -867,7 +969,7 @@ mod tests {
         // Death clears every fight targeting the victim. `fist_damage` rolls
         // 0..=max (a swing can deal 0), so tick until the kill lands rather than
         // assuming one swing kills.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(97, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
@@ -896,7 +998,7 @@ mod tests {
         // Under co-occupancy (stair/height landings) a position+stackpos remove
         // is ambiguous when another creature shares the death tile. Matches
         // logout and do_move.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(97, 117, 7));
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         let max_hp = g.players[&b].max_health;
@@ -934,7 +1036,7 @@ mod tests {
     fn tick_clears_target_when_target_logs_out() {
         // If the target logs out, the attacker's attacking must be cleared on the
         // next tick (no panic, no stale fight).
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
@@ -959,7 +1061,7 @@ mod tests {
     // The tick must clear the fight, not just skip damage.
     #[test]
     fn combat_tick_clears_fight_when_target_enters_pz() {
-        let mut g = Game::new(wide_combat_map_with_pz());
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
         // Attacker A at (91,117,7); target B starts adjacent at (92,117,7).
         let (a, _ra) = add_player(&mut g, Position::new(91, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(92, 117, 7));
@@ -991,7 +1093,7 @@ mod tests {
 
     #[test]
     fn set_target_on_monster_sets_attacking() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, m);
@@ -1000,7 +1102,7 @@ mod tests {
 
     #[test]
     fn set_target_on_unknown_creature_is_ignored() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         // 0x4000_0001 doesn't exist as a player or monster.
         g.do_set_target(a, 0x4000_0001);
@@ -1009,7 +1111,7 @@ mod tests {
 
     #[test]
     fn set_target_on_monster_from_pz_rejects() {
-        let mut g = Game::new(wide_combat_map_with_pz());
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
         let (a, _ra) = add_player(&mut g, Position::new(90, 117, 7)); // PZ tile
         let m = add_monster(&mut g, Position::new(95, 117, 7));
         g.do_set_target(a, m);
@@ -1021,7 +1123,7 @@ mod tests {
 
     #[test]
     fn combat_tick_deals_damage_to_monster() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, m);
@@ -1044,7 +1146,7 @@ mod tests {
         // Monster with 50 HP: player with fist_skill 10 lands at most ~7 dmg per
         // swing; kill needs many ticks if damage rolls low (min 0). Loop and drain
         // packets until the monster dies.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.monsters.get_mut(&m).unwrap().health = 1;
@@ -1081,7 +1183,7 @@ mod tests {
 
     #[test]
     fn combat_tick_monster_spectator_receives_health_bar() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (_spec, mut rx_spec) = add_player(&mut g, Position::new(95, 116, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
@@ -1095,7 +1197,7 @@ mod tests {
 
     #[test]
     fn combat_tick_monster_no_damage_when_out_of_melee_range() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(97, 117, 7)); // 2 tiles east
         g.do_set_target(a, m);
@@ -1108,7 +1210,7 @@ mod tests {
 
     #[test]
     fn combat_tick_monster_respects_interval() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, m);
@@ -1123,7 +1225,7 @@ mod tests {
     fn combat_tick_monster_does_not_clear_in_pz() {
         // Monsters are never PZ-checked: combat in PZ against a monster is ok
         // (attacker not in PZ, monster on PZ tile — must NOT clear the fight).
-        let mut g = Game::new(wide_combat_map_with_pz());
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
         let (a, _ra) = add_player(&mut g, Position::new(91, 117, 7)); // normal ground
         let m = add_monster(&mut g, Position::new(90, 117, 7)); // PZ tile
         g.do_set_target(a, m);
@@ -1150,7 +1252,7 @@ mod tests {
     fn combat_tick_clears_monster_target_when_monster_dies_elsewhere() {
         // If the monster is removed outside of combat (e.g. manually), the next
         // tick must clear the attacker's fight without panicking.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, m);
@@ -1170,7 +1272,7 @@ mod tests {
     #[test]
     fn monster_retaliates_when_attacked() {
         // Player damages a monster → the monster starts attacking back.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         assert_eq!(
@@ -1189,7 +1291,7 @@ mod tests {
     #[test]
     fn monster_combat_tick_attacks_player() {
         // Monster with a target (player) must deal damage on combat tick.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.monsters.get_mut(&m).unwrap().attacking = Some(a);
@@ -1211,7 +1313,7 @@ mod tests {
     #[test]
     fn monster_combat_tick_kills_player() {
         // Monster kills player: player must be removed, death window sent, saved.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
         g.save_tx = Some(save_tx);
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
@@ -1251,7 +1353,7 @@ mod tests {
 
     #[test]
     fn monster_combat_tick_out_of_range() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(97, 117, 7)); // 2 tiles east
         g.monsters.get_mut(&m).unwrap().attacking = Some(a);
@@ -1264,7 +1366,7 @@ mod tests {
 
     #[test]
     fn monster_combat_tick_respects_interval() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.monsters.get_mut(&m).unwrap().attacking = Some(a);
@@ -1277,7 +1379,7 @@ mod tests {
 
     #[test]
     fn monster_attack_clears_when_target_logs_out() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.monsters.get_mut(&m).unwrap().attacking = Some(a);
@@ -1292,7 +1394,7 @@ mod tests {
     #[test]
     fn monster_attack_clears_when_attacker_in_pz() {
         // Monster on a PZ tile → fight clears (monsters can't attack from PZ).
-        let mut g = Game::new(wide_combat_map_with_pz());
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
         let (a, mut ra) = add_player(&mut g, Position::new(91, 117, 7)); // normal ground
         let m = add_monster(&mut g, Position::new(90, 117, 7)); // PZ tile
         g.monsters.get_mut(&m).unwrap().attacking = Some(a);
@@ -1315,7 +1417,7 @@ mod tests {
     fn combat_stats_push_uses_live_player_speed() {
         // After changing a player's speed, a combat tick that deals damage
         // must push 0xA0 with base_speed = p.speed.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7));
         // Set B's speed to a non-default value (even so /2 is lossless)
@@ -1342,7 +1444,7 @@ mod tests {
     #[test]
     fn monster_attack_clears_when_target_in_pz() {
         // Player on a PZ tile → monster fight clears.
-        let mut g = Game::new(wide_combat_map_with_pz());
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
         let (a, mut ra) = add_player(&mut g, Position::new(90, 117, 7)); // PZ tile
         let m = add_monster(&mut g, Position::new(91, 117, 7)); // normal ground
         g.monsters.get_mut(&m).unwrap().attacking = Some(a);
@@ -1363,7 +1465,7 @@ mod tests {
 
     #[test]
     fn monster_attacks_monster() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
         let m1 = add_monster(&mut g, Position::new(100, 117, 7));
         let m2 = add_monster(&mut g, Position::new(101, 117, 7));
@@ -1385,7 +1487,7 @@ mod tests {
 
     #[test]
     fn monster_kills_monster() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
         let m1 = add_monster(&mut g, Position::new(100, 117, 7));
         let m2 = add_monster(&mut g, Position::new(101, 117, 7));
@@ -1411,7 +1513,7 @@ mod tests {
     #[test]
     fn monster_vs_monster_retaliation() {
         // Monster A hits monster B → B starts attacking A.
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
         let m1 = add_monster(&mut g, Position::new(100, 117, 7));
         let m2 = add_monster(&mut g, Position::new(101, 117, 7));
@@ -1428,7 +1530,7 @@ mod tests {
 
     #[test]
     fn monster_vs_monster_out_of_range() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m1 = add_monster(&mut g, Position::new(100, 117, 7));
         let m2 = add_monster(&mut g, Position::new(102, 117, 7)); // 2 tiles east
@@ -1447,12 +1549,15 @@ mod tests {
 
     #[test]
     fn monster_drops_nothing_with_empty_loot() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, mut ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         // loot is empty by default
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster must be removed");
+        // Drain death splash (monsters have race → produce 0x6A splash).
+        let _ = ra.try_recv().ok();
+        // No loot 0x6A packets beyond the splash.
         while let Ok(pkt) = ra.try_recv() {
             assert_ne!(
                 pkt[0], 0x6A,
@@ -1463,7 +1568,7 @@ mod tests {
 
     #[test]
     fn monster_drops_item_on_death() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, mut ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.monsters.get_mut(&m).unwrap().loot = vec![MonsterDrop {
@@ -1474,20 +1579,23 @@ mod tests {
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster must be removed");
 
-        // First packet must be 0x6C (creature remove), then 0x6A (item add).
+        // Drain death splash (monsters have race → produce 0x6A splash).
+        let _ = ra.try_recv().ok();
+
+        // Then 0x6C (creature remove), then 0x6A (item add).
         let pkt_6c = ra.try_recv().expect("must receive 0x6C remove");
         assert_eq!(
             pkt_6c[0], 0x6C,
-            "first death packet must be creature remove"
+            "death packet must be creature remove"
         );
 
         let pkt_6a = ra.try_recv().expect("must receive 0x6A item add");
-        assert_eq!(pkt_6a[0], 0x6A, "second death packet must be item add");
+        assert_eq!(pkt_6a[0], 0x6A, "loot packet must be item add");
     }
 
     #[test]
     fn monster_drop_uses_chance() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, mut ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         // Two drops: one guaranteed (1.0), one impossible (0.0).
@@ -1505,6 +1613,9 @@ mod tests {
         ];
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster must be removed");
+
+        // Drain death splash (monsters have race → produces 0x6A splash).
+        let _ = ra.try_recv().ok();
 
         let mut count = 0u32;
         while let Ok(pkt) = ra.try_recv() {
@@ -1524,7 +1635,7 @@ mod tests {
 
     #[test]
     fn monster_respawns_after_death() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let sid = 1;
         g.spawns.insert(
@@ -1541,6 +1652,7 @@ mod tests {
                 attack: 7,
                 loot: vec![],
                 target_distance: 0,
+                race: None,
             },
         );
         let m = add_monster(&mut g, Position::new(96, 117, 7));
@@ -1572,7 +1684,7 @@ mod tests {
 
     #[test]
     fn monster_dies_without_respawn_when_no_spawn_id() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         // spawn_id is None by default — no spawn entry registered.
@@ -1591,7 +1703,7 @@ mod tests {
 
     #[test]
     fn monster_respawn_respects_interval() {
-        let mut g = Game::new(combat_map(false));
+        let mut g = Game::from_static_map_arc(combat_map(false));
         let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let sid = 1;
         g.spawns.insert(
@@ -1608,6 +1720,7 @@ mod tests {
                 attack: 7,
                 loot: vec![],
                 target_distance: 0,
+                race: None,
             },
         );
         let m = add_monster(&mut g, Position::new(96, 117, 7));
@@ -1623,5 +1736,113 @@ mod tests {
         // Tick at the exact boundary — respawn.
         g.process_respawns(200);
         assert_eq!(g.monsters.len(), 1, "respawn at exact boundary");
+    }
+
+    // -------------------------------------------------------------------------
+    // Blood-item-on-hit: splash tests (3.1 RED, 3.2 RED)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn blood_player_hit_spawns_small_splash() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
+        g.do_set_target(a, b);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        // Player B's tile should contain ITEM_SMALLSPLASH after damage.
+        let key = (96, 117, 7);
+        let st = g
+            .dynamic
+            .get(&key)
+            .expect("victim tile must be materialized by splash");
+        assert!(
+            st.server_ids.contains(&ITEM_SMALLSPLASH),
+            "on-hit splash must add SMALLSPLASH (2019) to victim tile; sids: {:?}",
+            st.server_ids
+        );
+    }
+
+    #[test]
+    fn blood_player_death_spawns_full_splash() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
+        g.players.get_mut(&b).unwrap().health = 1;
+        g.do_set_target(a, b);
+        // Drive combat ticks until B dies.
+        for tick in 1..=5u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+        }
+        // The death tile should contain ITEM_FULLSPLASH.
+        let key = (96, 117, 7);
+        let st = g
+            .dynamic
+            .get(&key)
+            .expect("death tile must be materialized by splash");
+        assert!(
+            st.server_ids.contains(&ITEM_FULLSPLASH),
+            "on-death splash must add FULLSPLASH (2016) to death tile; sids: {:?}",
+            st.server_ids
+        );
+    }
+
+    #[test]
+    fn undead_monster_hit_produces_no_splash() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().race = Some(RaceType::Undead);
+        g.do_set_target(a, m);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        // The monster tile must NOT have any splash in the overlay.
+        let key = (96, 117, 7);
+        if let Some(st) = g.dynamic.get(&key) {
+            assert!(
+                !st.server_ids.contains(&ITEM_SMALLSPLASH),
+                "Undead monster hit must NOT spawn splash; sids: {:?}",
+                st.server_ids
+            );
+        }
+        // No overlay at all is also fine (means no splash was attempted).
+    }
+
+    #[test]
+    fn monster_hit_spawns_small_splash_when_race_is_blood() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().race = Some(RaceType::Blood);
+        g.do_set_target(a, m);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        let key = (96, 117, 7);
+        let st = g
+            .dynamic
+            .get(&key)
+            .expect("monster tile must be materialized by splash");
+        assert!(
+            st.server_ids.contains(&ITEM_SMALLSPLASH),
+            "Blood monster hit must add SMALLSPLASH; sids: {:?}",
+            st.server_ids
+        );
+    }
+
+    #[test]
+    fn monster_death_spawns_full_splash_when_race_is_blood() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().race = Some(RaceType::Blood);
+        g.monsters.get_mut(&m).unwrap().health = 1;
+        g.do_monster_death(m, 0);
+        let key = (96, 117, 7);
+        let st = g
+            .dynamic
+            .get(&key)
+            .expect("death tile must be materialized by splash");
+        assert!(
+            st.server_ids.contains(&ITEM_FULLSPLASH),
+            "Blood monster death must add FULLSPLASH; sids: {:?}",
+            st.server_ids
+        );
     }
 }

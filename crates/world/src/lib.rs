@@ -14,8 +14,11 @@ pub mod map;
 pub mod outfit_catalog;
 pub mod pathfinding;
 
+// Chunked map loading types (PR 1 — coexist with StaticMap)
+pub use map::{CHUNK_DIM, Chunk, ChunkId, ChunkManager, ChunkedMap, WorldMeta};
+
 /// A position in the game world. `z` is the floor (7 = ground level).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Position {
     pub x: u16,
     pub y: u16,
@@ -128,5 +131,13 @@ mod tests {
         assert_eq!(p.offset(1, -1), Some(Position::new(101, 99, 7)));
         assert_eq!(Position::new(0, 0, 7).offset(-1, 0), None);
         assert_eq!(Position::new(u16::MAX, 0, 7).offset(1, 0), None);
+    }
+
+    #[test]
+    fn position_serde_round_trip() {
+        let pos = Position::new(123, 456, 7);
+        let bytes = bincode::serialize(&pos).expect("serialize");
+        let back: Position = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(pos, back);
     }
 }

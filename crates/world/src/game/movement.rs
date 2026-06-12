@@ -26,16 +26,16 @@ impl Game {
         let mut dest = dest;
         if !diagonal {
             // Mechanic A - up: standing on a raised tile, step onto the floor above.
-            if from.z != 8 && self.map.triggers_up(from) {
+            if from.z != 8 && self.chunks.triggers_up(from) {
                 let above_open = match from.offset_z(-1) {
-                    Some(a) => !self.map.has_ground(a) && !self.map.is_blocked(a),
+                    Some(a) => !self.chunks.has_ground(a) && !self.chunks.is_blocked(a),
                     None => true,
                 };
                 if above_open {
                     if let Some(da) = dest.offset_z(-1) {
-                        if self.map.has_ground(da)
+                        if self.chunks.has_ground(da)
                             && self
-                                .map
+                                .chunks
                                 .floor_change_at(i32::from(da.x), i32::from(da.y), i32::from(da.z))
                                 .is_empty()
                         {
@@ -46,10 +46,10 @@ impl Game {
             }
             // Mechanic A - down: stepping into a void above a raised lower tile.
             if from.z != 7 && from.z == dest.z {
-                let dest_void = !self.map.has_ground(dest) && !self.map.is_blocked(dest);
+                let dest_void = !self.chunks.has_ground(dest) && !self.chunks.is_blocked(dest);
                 if dest_void {
                     if let Some(db) = dest.offset_z(1) {
-                        if self.map.triggers_up(db) {
+                        if self.chunks.triggers_up(db) {
                             dest = db;
                         }
                     }
@@ -57,7 +57,7 @@ impl Game {
             }
         }
         // Mechanic B - floorChange staircase tile (queryDestination).
-        if let Some(landing) = self.map.resolve_floor_change(dest) {
+        if let Some(landing) = self.chunks.resolve_floor_change(dest) {
             dest = landing;
         }
         dest
@@ -76,6 +76,11 @@ impl Game {
         if from == to {
             return;
         }
+        // Ensure destination chunks are loaded before the position commit.
+        let dest_chunks: Vec<crate::map::ChunkId> =
+            crate::map::chunks_around(to).into_iter().collect();
+        self.chunks.ensure_loaded(&dest_chunks);
+
         if let Some(p) = self.players.get_mut(&id) {
             p.position = to;
         }
@@ -84,8 +89,8 @@ impl Game {
         self.auto_close_ground_containers(id);
 
         // PZ badge: resend icons if we crossed a protection-zone boundary.
-        if self.map.is_protection_zone(from) != self.map.is_protection_zone(to) {
-            let mask = if self.map.is_protection_zone(to) {
+        if self.chunks.is_protection_zone(from) != self.chunks.is_protection_zone(to) {
+            let mask = if self.chunks.is_protection_zone(to) {
                 enter_world::ICON_PIGEON
             } else {
                 0
@@ -204,13 +209,18 @@ impl Game {
                 | Direction::SouthWest
                 | Direction::NorthWest
         );
-        let dest = from
-            .offset(dx, dy)
+        let raw_dest = from.offset(dx, dy);
+        if let Some(d) = raw_dest {
+            let move_chunks: Vec<crate::map::ChunkId> =
+                crate::map::chunks_around(d).into_iter().collect();
+            self.chunks.ensure_loaded(&move_chunks);
+        }
+        let dest = raw_dest
             .map(|d| self.resolve_vertical(from, d, diagonal))
             .filter(|&d| {
                 // Ghost/noclip bypass walks through walls, creatures, etc.
                 if nocollide {
-                    return self.map.has_ground(d);
+                    return self.chunks.has_ground(d);
                 }
                 // A vertical landing (stair/height redirect) is reached with TFS
                 // FLAG_IGNOREBLOCKITEM | FLAG_IGNOREBLOCKCREATURE (game.cpp:799,815),
@@ -220,9 +230,9 @@ impl Game {
                 // steps set no such flag, so they keep the full walkability +
                 // occupancy check (tile.cpp:564 still blocks).
                 if d.z != from.z {
-                    self.map.has_ground(d)
+                    self.chunks.has_ground(d)
                 } else {
-                    self.map.is_walkable(d) && !self.tile_occupied(d, id)
+                    self.chunks.is_walkable(d) && !self.tile_occupied(d, id)
                 }
             });
 
@@ -260,8 +270,8 @@ impl Game {
 
         // PZ badge: if the mover crossed a protection-zone boundary, resend the
         // icons packet so the client shows/hides the dove (TFS getClientIcons).
-        if self.map.is_protection_zone(from) != self.map.is_protection_zone(to) {
-            let mask = if self.map.is_protection_zone(to) {
+        if self.chunks.is_protection_zone(from) != self.chunks.is_protection_zone(to) {
+            let mask = if self.chunks.is_protection_zone(to) {
                 enter_world::ICON_PIGEON
             } else {
                 0
@@ -448,9 +458,15 @@ impl Game {
 
         // Validate walkability: monsters can walk onto tiles occupied by other
         // monsters (not solid), but players still block.
+        // Floor-change tiles (holes, stairs) are rejected per TFS
+        // queryAdd(FLAG_PATHFINDING) — monsters have no vertical resolution.
         let Some(to) = from
             .offset(dx, dy)
-            .filter(|&d| self.map.is_walkable(d) && !self.tile_occupied(d, id))
+            .filter(|&d| {
+                self.chunks.is_walkable(d)
+                    && !self.tile_occupied(d, id)
+                    && self.chunks.floor_change_at(d.x as i32, d.y as i32, d.z as i32).is_empty()
+            })
         else {
             return; // blocked — skip silently
         };
@@ -511,7 +527,7 @@ mod tests {
 
     #[test]
     fn walking_onto_a_down_stair_drops_a_floor() {
-        let mut g = Game::new(stair_map());
+        let mut g = Game::from_static_map_arc(stair_map());
         let (mover, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_move(mover, Direction::East); // 100,100,7 -> stair 101,100,7 -> land 101,100,8
         assert_eq!(
@@ -532,7 +548,7 @@ mod tests {
         // its landing tile (as TFS GetFloorDescription lists the creature standing
         // there) or the client keeps the localPlayer object detached from any tile
         // and every later step trips "parseCreatureMove: unable to remove creature".
-        let mut g = Game::new(stair_map());
+        let mut g = Game::from_static_map_arc(stair_map());
         let (mover, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_move(mover, Direction::East); // 100,100,7 -> land 101,100,8
         let pkt = rx.try_recv().expect("mover gets a packet");
@@ -659,7 +675,7 @@ mod tests {
             waypoints: vec![],
         };
         let sm = Arc::new(StaticMap::from_formats(&map, &items));
-        let mut g = Game::new(sm);
+        let mut g = Game::from_static_map_arc(sm);
         let (mover, _rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.do_move(mover, Direction::East);
         assert_eq!(
@@ -674,7 +690,7 @@ mod tests {
         // (game.cpp:799,815; gated in tile.cpp:564), so a creature standing on
         // the landing does NOT cancel the descent — Tibia lets you stack onto
         // them. Same-floor steps still respect occupancy (no such flag there).
-        let mut g = Game::new(stair_map());
+        let mut g = Game::from_static_map_arc(stair_map());
         // B already stands on the landing tile one floor below the stair.
         let landing = Position::new(101, 100, 8);
         let (b, _rb) = add_player(&mut g, landing);
@@ -693,7 +709,7 @@ mod tests {
         );
         // The arriving creature renders on top of the one already there:
         // its stackpos is the item base plus the one creature below it.
-        let base = g.map.creature_stackpos(101, 100, 8);
+        let base = g.chunks.creature_stackpos(101, 100, 8);
         assert_eq!(
             g.creature_stackpos_on(landing, mover),
             base + 1,
@@ -799,7 +815,7 @@ mod tests {
             waypoints: vec![],
         };
         let sm = Arc::new(StaticMap::from_formats(&map, &items));
-        let mut g = Game::new(sm);
+        let mut g = Game::from_static_map_arc(sm);
         let (mover, mut rx) = add_player(&mut g, Position::new(100, 100, 9));
         g.do_move(mover, Direction::East); // raised z=9 -> climb to 101,100,8
         assert_eq!(
@@ -905,7 +921,7 @@ mod tests {
             }],
             waypoints: vec![],
         };
-        let mut g = Game::new(Arc::new(StaticMap::from_formats(&map, &items)));
+        let mut g = Game::from_static_map_arc(Arc::new(StaticMap::from_formats(&map, &items)));
         let (mover, _rm) = add_player(&mut g, Position::new(100, 100, 7));
         let (_spec, mut rx) = add_player(&mut g, Position::new(100, 101, 7)); // same floor, adjacent
         g.do_move(mover, Direction::East); // climbs 7 -> 6
@@ -924,7 +940,7 @@ mod tests {
     fn spectator_gets_remove_then_add_when_mover_crosses_to_underground() {
         // A z=8 spectator near the landing sees a mover descend 7->8: the
         // boundary must produce a clean remove (0x6C) then add (0x6A), not 0x6D.
-        let mut g = Game::new(stair_map());
+        let mut g = Game::from_static_map_arc(stair_map());
         let (mover, _rm) = add_player(&mut g, Position::new(100, 100, 7));
         let (_spec, mut rx) = add_player(&mut g, Position::new(102, 100, 8));
         g.do_move(mover, Direction::East); // 100,100,7 -> 101,100,8
@@ -942,7 +958,7 @@ mod tests {
         // prune, A's known-set keeps a stale B, introduce() later emits the short
         // 0x62 form for a creature A's client already dropped, and every 0x6D for
         // B trips OTClient's "parseCreatureMove: unable to remove creature".
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         // A one tile east of the wall at 94,117 so it can step west to 95,117.
         let (a, _ra) = add_player(&mut g, Position::new(96, 117, 7));
         // B sits at the +9x east edge of A@96: visible from 96 (dx=9, the edge)
@@ -964,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_pushes_creature_move_to_spectator() {
-        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
+        let (world, _save_rx) = spawn_from_static_map(walk_map(), GameConfig::default());
         let (tx_a, mut rx_a) = push_channel();
         let ack_a = world
             .login("A".into(), default_initial(knight()), tx_a)
@@ -990,7 +1006,7 @@ mod tests {
 
     #[test]
     fn move_out_of_view_pushes_remove_to_spectator() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (mover, _rm) = add_player(&mut g, Position::new(95, 117, 7));
         let (_spec, mut rx) = add_player(&mut g, Position::new(86, 117, 7)); // sees from (dx=9), not to (dx=10)
         g.do_move(mover, Direction::East); // 95,117 -> 96,117
@@ -1000,7 +1016,7 @@ mod tests {
 
     #[test]
     fn move_into_view_pushes_appear_to_spectator() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (mover, _rm) = add_player(&mut g, Position::new(95, 117, 7));
         let (_spec, mut rx) = add_player(&mut g, Position::new(104, 117, 7)); // sees to, not from
         g.do_move(mover, Direction::East); // 95,117 -> 96,117
@@ -1010,7 +1026,7 @@ mod tests {
 
     #[test]
     fn cannot_move_onto_tile_occupied_by_creature() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, mut rb) = add_player(&mut g, Position::new(96, 117, 7)); // east of A
         // A tries to step east onto B's tile -> blocked.
@@ -1025,7 +1041,7 @@ mod tests {
 
     #[test]
     fn moving_across_pz_boundary_pushes_icons() {
-        let mut g = Game::new(wide_combat_map_with_pz());
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
         // Start just east of the PZ tile (91,117); the PZ tile is (90,117).
         let (p, mut rp) = add_player(&mut g, Position::new(91, 117, 7));
         // Step West into the PZ tile (90,117).
@@ -1051,7 +1067,7 @@ mod tests {
     /// Floor-8 room where each tile carries two plain items: a ground item whose
     /// client id encodes x (1000 + dx) and a down item encoding y (2000 + dy). A
     /// torn / shifted column therefore surfaces as a wrong client id at a coord.
-    fn underground_room() -> Arc<StaticMap> {
+    fn underground_room() -> StaticMap {
         use formats::items_xml::FloorChange;
         let (x0, x1) = (33200u16, 33240u16);
         let (y0, y1) = (32448u16, 32468u16);
@@ -1128,17 +1144,13 @@ mod tests {
             }],
             waypoints: vec![],
         };
-        Arc::new(StaticMap::from_formats(&map, &items))
+        StaticMap::from_formats(&map, &items)
     }
 
-    fn server_floor8_ids(map: &StaticMap, x: i32, y: i32) -> Vec<u16> {
-        match map.tile(x, y, 8) {
-            Some(s) => s
-                .pre_creature
-                .iter()
-                .chain(s.post_creature)
-                .map(|w| w.client_id)
-                .collect(),
+    fn server_floor8_ids(chunks: &crate::map::ChunkManager, x: i32, y: i32) -> Vec<u16> {
+        let pos = Position::new(x as u16, y as u16, 8);
+        match chunks.tile_at(pos) {
+            Some(st) => st.items.iter().map(|w| w.client_id).collect(),
             None => Vec::new(),
         }
     }
@@ -1147,12 +1159,12 @@ mod tests {
     /// client already has this before any walk; steps only send edge slices.
     fn seed_floor8(
         cache: &mut HashMap<(i32, i32, u8), Vec<u16>>,
-        map: &StaticMap,
+        chunks: &crate::map::ChunkManager,
         center: Position,
     ) {
         for x in (i32::from(center.x) - 8)..=(i32::from(center.x) + 9) {
             for y in (i32::from(center.y) - 6)..=(i32::from(center.y) + 7) {
-                let ids = server_floor8_ids(map, x, y);
+                let ids = server_floor8_ids(chunks, x, y);
                 if !ids.is_empty() {
                     cache.insert((x, y, 8), ids);
                 }
@@ -1268,13 +1280,13 @@ mod tests {
         // live as a torn staircase / shifted left half on the returning client.
         // No other creatures here: this isolates pure map-slice geometry.
         let map = underground_room();
-        let mut g = Game::new(map);
+        let mut g = Game::from_static_map(map);
         let start = Position::new(33215, 32458, 8);
         let (b, mut rx) = add_player(&mut g, start);
         while rx.try_recv().is_ok() {} // drain login bookkeeping
 
         let mut cache: HashMap<(i32, i32, u8), Vec<u16>> = HashMap::new();
-        seed_floor8(&mut cache, g.map.as_ref(), start);
+        seed_floor8(&mut cache, &g.chunks, start);
 
         let mut seq = Vec::new();
         for _ in 0..8 {
@@ -1300,7 +1312,7 @@ mod tests {
         let mut mismatches = Vec::new();
         for x in (i32::from(p.x) - 8)..=(i32::from(p.x) + 9) {
             for y in (i32::from(p.y) - 6)..=(i32::from(p.y) + 7) {
-                let server = server_floor8_ids(g.map.as_ref(), x, y);
+                let server = server_floor8_ids(&g.chunks, x, y);
                 let client = cache.get(&(x, y, 8)).cloned().unwrap_or_default();
                 if client != server {
                     mismatches.push(format!("({x},{y}): client={client:?} server={server:?}"));
@@ -1393,7 +1405,7 @@ mod tests {
         // walk east out of view and back, and assert every band floor stays
         // byte-consistent with the server map.
         let map = underground_multifloor();
-        let mut g = Game::new(map);
+        let mut g = Game::from_static_map_arc(map);
         let start = Position::new(33215, 32458, 8);
         let (b, mut rx) = add_player(&mut g, start);
         while rx.try_recv().is_ok() {}
@@ -1404,7 +1416,7 @@ mod tests {
                 for y in (i32::from(start.y) - 6)..=(i32::from(start.y) + 7) {
                     // initial full-map description projects each floor by (z-nz).
                     let off = 8 - i32::from(z);
-                    let ids = server_floor8_ids_z(g.map.as_ref(), x + off, y + off, z);
+                    let ids = server_floor8_ids_z(&g.chunks, x + off, y + off, z);
                     if !ids.is_empty() {
                         cache.insert((x + off, y + off, z), ids);
                     }
@@ -1436,7 +1448,7 @@ mod tests {
             for sx in (i32::from(p.x) - 8)..=(i32::from(p.x) + 9) {
                 for sy in (i32::from(p.y) - 6)..=(i32::from(p.y) + 7) {
                     let (wx, wy) = (sx + off, sy + off);
-                    let server = server_floor8_ids_z(g.map.as_ref(), wx, wy, z);
+                    let server = server_floor8_ids_z(&g.chunks, wx, wy, z);
                     let client = cache.get(&(wx, wy, z)).cloned().unwrap_or_default();
                     if client != server {
                         mismatches.push(format!(
@@ -1459,14 +1471,10 @@ mod tests {
         );
     }
 
-    fn server_floor8_ids_z(map: &StaticMap, x: i32, y: i32, z: u8) -> Vec<u16> {
-        match map.tile(x, y, i32::from(z)) {
-            Some(s) => s
-                .pre_creature
-                .iter()
-                .chain(s.post_creature)
-                .map(|w| w.client_id)
-                .collect(),
+    fn server_floor8_ids_z(chunks: &crate::map::ChunkManager, x: i32, y: i32, z: u8) -> Vec<u16> {
+        let pos = Position::new(x as u16, y as u16, z);
+        match chunks.tile_at(pos) {
+            Some(st) => st.items.iter().map(|w| w.client_id).collect(),
             None => Vec::new(),
         }
     }
@@ -2026,7 +2034,7 @@ mod tests {
             for sx in (i32::from(start.x) - AR_LEFT)..=(i32::from(start.x) + AR_RIGHT) {
                 for sy in (i32::from(start.y) - AR_TOP)..=(i32::from(start.y) + AR_BOTTOM) {
                     let (wx, wy) = (sx + off, sy + off);
-                    let ids = server_floor8_ids_z(g.map.as_ref(), wx, wy, nz as u8);
+                    let ids = server_floor8_ids_z(&g.chunks, wx, wy, nz as u8);
                     if !ids.is_empty() {
                         sim.cache.insert((wx, wy, nz as u8), ids);
                     }
@@ -2053,7 +2061,7 @@ mod tests {
             for sx in (i32::from(p.x) - AR_LEFT)..=(i32::from(p.x) + AR_RIGHT) {
                 for sy in (i32::from(p.y) - AR_TOP)..=(i32::from(p.y) + AR_BOTTOM) {
                     let (wx, wy) = (sx + off, sy + off);
-                    let server = server_floor8_ids_z(g.map.as_ref(), wx, wy, nz as u8);
+                    let server = server_floor8_ids_z(&g.chunks, wx, wy, nz as u8);
                     let client = sim
                         .cache
                         .get(&(wx, wy, nz as u8))
@@ -2159,19 +2167,19 @@ mod tests {
         let down_stair = (32028, 32197); // SE neighbor of start
         let up_stair = (32027, 32197); // underground; WEST flag -> ascend
         let map = stair_multifloor(down_stair, up_stair, formats::items_xml::FloorChange::WEST);
-        let mut g = Game::new(map);
+        let mut g = Game::from_static_map_arc(map);
         let (mover, mut rx) = add_player(&mut g, start);
         while rx.try_recv().is_ok() {}
         let mut sim = seed_initial(&mut g, start, mover);
 
         eprintln!(
             "down_stair resolves: {:?}",
-            g.map
+            g.chunks
                 .resolve_floor_change(Position::new(down_stair.0, down_stair.1, 7))
         );
         eprintln!(
             "up_stair resolves: {:?}",
-            g.map
+            g.chunks
                 .resolve_floor_change(Position::new(up_stair.0, up_stair.1, 8))
         );
 
@@ -2198,15 +2206,15 @@ mod tests {
         seq: &[Direction],
     ) -> (Option<Position>, Option<Position>, Result<(), String>) {
         let map = stair_multifloor(down_stair, up_stair, up_flags);
-        let mut g = Game::new(map);
+        let mut g = Game::from_static_map_arc(map);
         let (mover, mut rx) = add_player(&mut g, start);
         while rx.try_recv().is_ok() {}
         let mut sim = seed_initial(&mut g, start, mover);
         let down_land = g
-            .map
+            .chunks
             .resolve_floor_change(Position::new(down_stair.0, down_stair.1, 7));
         let up_land = g
-            .map
+            .chunks
             .resolve_floor_change(Position::new(up_stair.0, up_stair.1, 8));
         let res = replay(&mut g, mover, &mut rx, &mut sim, seq);
         (down_land, up_land, res)
@@ -2413,13 +2421,13 @@ mod tests {
         let start = Position::new(32027, 32196, 8);
         let down_stair = (32028, 32196); // east neighbor; DOWN -> straight z9
         let map = deep_stair_multifloor(down_stair, 8);
-        let mut g = Game::new(map);
+        let mut g = Game::from_static_map_arc(map);
         let (mover, mut rx) = add_player(&mut g, start);
         while rx.try_recv().is_ok() {}
         let mut sim = seed_initial(&mut g, start, mover);
         eprintln!(
             "down_stair(z8) resolves: {:?}",
-            g.map
+            g.chunks
                 .resolve_floor_change(Position::new(down_stair.0, down_stair.1, 8))
         );
         let seq = vec![
@@ -2437,7 +2445,7 @@ mod tests {
     fn monster_known_set_updated_when_mover_sees_monster() {
         // The mover's view after a move adds visible monsters via introduce(),
         // which records them in the player's known-set.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (mover, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         let mid = add_monster(&mut g, Position::new(96, 117, 7));
         while rx.try_recv().is_ok() {}
@@ -2457,7 +2465,7 @@ mod tests {
 
     #[test]
     fn monster_out_of_viewport_not_introduced_to_mover() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (mover, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         let mid = add_monster(&mut g, Position::new(200, 200, 7));
         while rx.try_recv().is_ok() {}
@@ -2471,7 +2479,7 @@ mod tests {
 
     #[test]
     fn monster_does_not_block_movement_m12_1() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (mover, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         let _mid = add_monster(&mut g, Position::new(96, 117, 7));
         while rx.try_recv().is_ok() {}
@@ -2532,7 +2540,7 @@ mod tests {
 
     #[test]
     fn ghost_gm_walks_through_occupied_tile() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         // B occupies the tile east of A.
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (_b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
@@ -2558,7 +2566,7 @@ mod tests {
 
     #[test]
     fn ghost_gm_walks_through_wall() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&a).unwrap().gamemaster = true;
 
@@ -2583,7 +2591,7 @@ mod tests {
 
     #[test]
     fn noclip_gm_walks_through_occupied_tile() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (_b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.players.get_mut(&a).unwrap().gamemaster = true;
@@ -2600,7 +2608,7 @@ mod tests {
 
     #[test]
     fn noclip_gm_walks_through_wall() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&a).unwrap().gamemaster = true;
 
@@ -2610,6 +2618,45 @@ mod tests {
             g.players[&a].position,
             Position::new(94, 117, 7),
             "noclip GM must walk through wall"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 1.2: Monster rejects floor-change tiles (SDD: pathfinding-avoid-holes)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn monster_does_not_step_onto_floor_change_tile() {
+        // GIVEN a monster on a tile adjacent to a FloorChange::DOWN tile
+        let mut g = Game::from_static_map_arc(stair_map());
+        let mid = add_monster(&mut g, Position::new(100, 100, 7));
+
+        // WHEN the monster tries to step east onto the hole tile (101,100)
+        g.do_move_monster(mid, Direction::East);
+
+        // THEN the monster must not have moved (floor-change tile rejected)
+        assert_eq!(
+            g.monsters.get(&mid).unwrap().position,
+            Position::new(100, 100, 7),
+            "monster must not step onto a floor-change tile"
+        );
+    }
+
+    #[test]
+    fn monster_walks_normally_on_non_floor_change_tile() {
+        // GIVEN a monster on a tile adjacent to a normal walkable tile
+        // Use combat_map which has flat walkable tiles.
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let mid = add_monster(&mut g, Position::new(95, 117, 7));
+
+        // WHEN the monster steps east onto a normal tile
+        g.do_move_monster(mid, Direction::East);
+
+        // THEN the monster moved successfully
+        assert_eq!(
+            g.monsters.get(&mid).unwrap().position,
+            Position::new(96, 117, 7),
+            "monster must walk onto a normal tile"
         );
     }
 }

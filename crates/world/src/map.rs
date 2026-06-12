@@ -2,11 +2,13 @@
 //! Client ids are resolved once from items.otb (server_id -> client_id).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use formats::items_xml::{FloorChange, ItemsXml};
 use formats::otb::ItemsOtb;
 use formats::otbm::OtbmMap;
 use protocol::map_description::{TileSlices, TileSource, WireItem};
+use serde::{Deserialize, Serialize};
 
 use crate::pathfinding::{self, FindPathParams};
 use crate::{Direction, Position};
@@ -22,7 +24,7 @@ const MAX_TILE_THINGS: usize = 10;
 
 /// Which equipment slot(s) an item may occupy, derived from items.xml
 /// slotType/weaponType. Slot numbers are TFS `CONST_SLOT_*` (head=1 … ammo=10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EquipSlot {
     Head,     // 1
     Necklace, // 2
@@ -75,7 +77,7 @@ impl EquipSlot {
 
 /// Look-at metadata for one item type, combining `items.xml` text with the
 /// `items.otb` flags. Keyed by server id in `StaticMap::item_meta`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ItemMeta {
     pub name: String,
     pub article: String,
@@ -117,7 +119,7 @@ impl ItemMeta {
 }
 
 /// Wire-ordered items for one tile, split around the creature slot.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TileStack {
     /// `[ground, ...top items (by top_order), ...down items]`, capped at 10.
     pub(crate) items: Vec<WireItem>,
@@ -153,6 +155,723 @@ fn wire_item(it: &formats::otb::ItemType, count: Option<u8>) -> WireItem {
 /// the OTBM flag name here since we read it from the parsed `MapTile.flags`.
 const OTBM_TILEFLAG_PROTECTIONZONE: u32 = 1 << 0;
 
+// ---------------------------------------------------------------------------
+// Chunked map types — coexist with StaticMap; ChunkedMap replaces it later.
+// ---------------------------------------------------------------------------
+
+/// Identifies a 256×256-tile chunk in the world grid.
+/// `(chunk_x, chunk_y, floor_z)`. `i16` handles negative coordinates
+/// even though the map origin is (0,0).
+pub type ChunkId = (i16, i16, u8);
+
+/// Edge length of one square chunk, in tiles.
+pub const CHUNK_DIM: i32 = 256;
+
+/// One 256×256-tile slice of the world on a single floor.
+/// All tile keys are chunk-relative `(u8, u8)` — each coordinate in `0..=255`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Chunk {
+    pub(crate) tiles: HashMap<(u8, u8), TileStack>,
+    pub(crate) blocked: HashSet<(u8, u8)>,
+    pub(crate) block_projectile: HashSet<(u8, u8)>,
+    pub(crate) floor_change: HashMap<(u8, u8), FloorChange>,
+    pub(crate) tile_height: HashMap<(u8, u8), u8>,
+    pub(crate) protection_zone: HashSet<(u8, u8)>,
+}
+
+/// Compute the `ChunkId` for a world position.
+#[inline]
+pub fn chunk_id(pos: Position) -> ChunkId {
+    (
+        (pos.x as i32 / CHUNK_DIM) as i16,
+        (pos.y as i32 / CHUNK_DIM) as i16,
+        pos.z,
+    )
+}
+
+/// Compute the set of 27 `ChunkId`s within a ±1 floor and ±1 chunk range of `pos`
+/// (3×3 chunk grid × 3 floors). Floors are clamped to 0..=15.
+pub fn chunks_around(pos: Position) -> HashSet<ChunkId> {
+    let cx = (pos.x as i32 / CHUNK_DIM) as i16;
+    let cy = (pos.y as i32 / CHUNK_DIM) as i16;
+    let cz = pos.z as i32;
+    let mut ids = HashSet::new();
+    for dz in -1i32..=1 {
+        let nz = (cz + dz).clamp(0, 15) as u8;
+        for dcy in -1i16..=1 {
+            for dcx in -1i16..=1 {
+                ids.insert((cx + dcx, cy + dcy, nz));
+            }
+        }
+    }
+    ids
+}
+
+/// Manages the set of in-memory chunks, loaded on demand from `data/chunks/`.
+/// Owned by the game actor; all access is single-threaded.
+#[derive(Debug)]
+pub struct ChunkManager {
+    pub(crate) chunks: HashMap<ChunkId, Arc<Chunk>>,
+    pub(crate) pinned: HashSet<ChunkId>,
+}
+
+impl ChunkManager {
+    pub fn new() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            pinned: HashSet::new(),
+        }
+    }
+}
+
+impl Default for ChunkManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChunkManager {
+    /// Load chunks from `data/chunks/{z}/{x}_{y}.chunk` on demand.
+    /// Silently skips missing or corrupt files — chunk just stays absent.
+    pub fn ensure_loaded(&mut self, ids: &[ChunkId]) {
+        for &id in ids {
+            if self.chunks.contains_key(&id) {
+                continue;
+            }
+            let path = format!("data/chunks/{}/{}_{}.chunk", id.2, id.0, id.1);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let chunk: Chunk = match bincode::deserialize(&bytes) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            self.chunks.insert(id, Arc::new(chunk));
+        }
+    }
+
+    /// Evict chunks that are neither required nor pinned.
+    pub fn sweep(&mut self, required: &HashSet<ChunkId>) {
+        self.chunks
+            .retain(|id, _| required.contains(id) || self.pinned.contains(id));
+    }
+
+    /// Mark chunks as pinned (never unloaded by sweep).
+    pub fn pin(&mut self, chunks: &[ChunkId]) {
+        for id in chunks {
+            self.pinned.insert(*id);
+        }
+    }
+
+    /// Return the tile stack at `pos`, or `None` if the chunk isn't loaded
+    /// or the tile has no ground.
+    #[allow(dead_code)] // used by ChunkedMap (task 1.5)
+    pub(crate) fn tile_at(&self, pos: Position) -> Option<&TileStack> {
+        let id = chunk_id(pos);
+        let chunk = self.chunks.get(&id)?;
+        let rel = chunk_relative(pos);
+        chunk.tiles.get(&rel)
+    }
+
+    /// Whether a creature can walk onto `pos` (has ground AND no block-solid item).
+    pub fn is_walkable(&self, pos: Position) -> bool {
+        let id = chunk_id(pos);
+        match self.chunks.get(&id) {
+            Some(chunk) => {
+                let rel = chunk_relative(pos);
+                chunk.tiles.contains_key(&rel) && !chunk.blocked.contains(&rel)
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `pos` carries a block-solid item.
+    pub fn is_blocked(&self, pos: Position) -> bool {
+        let id = chunk_id(pos);
+        self.chunks
+            .get(&id)
+            .is_some_and(|chunk| chunk.blocked.contains(&chunk_relative(pos)))
+    }
+
+    /// Floor-change flags on `pos`, or `NONE` if absent / out of range.
+    pub fn floor_change_at(&self, x: i32, y: i32, z: i32) -> FloorChange {
+        StaticMap::key(x, y, z)
+            .and_then(|key| {
+                let pos = Position::new(key.0, key.1, key.2);
+                let id = chunk_id(pos);
+                self.chunks
+                    .get(&id)
+                    .and_then(|chunk| chunk.floor_change.get(&chunk_relative(pos)).copied())
+            })
+            .unwrap_or(FloorChange::NONE)
+    }
+
+    /// Whether `pos` is in a protection zone.
+    pub fn is_protection_zone(&self, pos: Position) -> bool {
+        let id = chunk_id(pos);
+        self.chunks
+            .get(&id)
+            .is_some_and(|chunk| chunk.protection_zone.contains(&chunk_relative(pos)))
+    }
+
+    /// Does this tile have a ground item (is it a real, steppable tile)?
+    pub fn has_ground(&self, pos: Position) -> bool {
+        self.tile_at(pos).is_some()
+    }
+
+    /// Cumulative item height on a tile (0 if none).
+    pub fn tile_height(&self, pos: Position) -> u8 {
+        let id = chunk_id(pos);
+        self.chunks
+            .get(&id)
+            .and_then(|chunk| chunk.tile_height.get(&chunk_relative(pos)).copied())
+            .unwrap_or(0)
+    }
+
+    /// TFS `Tile::hasHeight(3)`: does this tile raise enough to step up onto?
+    pub fn triggers_up(&self, pos: Position) -> bool {
+        self.tile_height(pos) >= 3
+    }
+
+    /// How many of a tile's items render below a creature (ground + top items).
+    pub fn tile_pre_creature_len(&self, pos: Position) -> usize {
+        self.tile_at(pos).map_or(0, |st| st.pre_creature_len)
+    }
+
+    /// Snapshot a tile's full stack for the copy-on-write overlay.
+    pub(crate) fn tile_stack_clone(&self, pos: Position) -> Option<TileStack> {
+        self.tile_at(pos).cloned()
+    }
+
+    /// The server id of the item at index `idx` in a tile's stack, or `None`.
+    pub fn tile_item_server_id(&self, pos: Position, idx: usize) -> Option<u16> {
+        self.tile_at(pos)
+            .and_then(|st| st.server_ids.get(idx).copied())
+    }
+
+    /// The OTBM stack count of the item at index `idx`.
+    pub fn tile_item_count(&self, pos: Position, idx: usize) -> Option<u8> {
+        self.tile_at(pos)
+            .and_then(|st| st.counts.get(idx).copied().flatten())
+    }
+
+    /// The wire stackpos base for a creature on this tile (pre_creature_len).
+    pub fn creature_stackpos(&self, x: i32, y: i32, z: i32) -> u8 {
+        StaticMap::key(x, y, z)
+            .and_then(|key| {
+                let pos = Position::new(key.0, key.1, key.2);
+                self.tile_at(pos).map(|st| st.pre_creature_len as u8)
+            })
+            .unwrap_or(1)
+    }
+
+    /// Is there a block-projectile item on this tile?
+    pub fn is_block_projectile(&self, pos: Position) -> bool {
+        let id = chunk_id(pos);
+        self.chunks
+            .get(&id)
+            .is_some_and(|chunk| chunk.block_projectile.contains(&chunk_relative(pos)))
+    }
+
+    // -------------------------------------------------------------------------
+    // Line-of-sight (ported from StaticMap)
+    // -------------------------------------------------------------------------
+
+    fn is_tile_clear(&self, x: u16, y: u16, z: u8, block_floor: bool) -> bool {
+        let pos = Position::new(x, y, z);
+        if self.is_block_projectile(pos) {
+            return false;
+        }
+        if block_floor && self.tile_at(pos).is_some() {
+            return false;
+        }
+        true
+    }
+
+    fn check_slight_line(&self, x0: u16, y0: u16, x1: u16, y1: u16, z: u8) -> bool {
+        let dx = f32::from(x1) - f32::from(x0);
+        let slope = if dx == 0.0 {
+            1.0
+        } else {
+            (f32::from(y1) - f32::from(y0)) / dx
+        };
+        let mut yi = f32::from(y0) + slope;
+        let mut x = x0 + 1;
+        while x < x1 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if !self.is_tile_clear(x, (yi + 0.1).floor() as u16, z, false) {
+                return false;
+            }
+            yi += slope;
+            x += 1;
+        }
+        true
+    }
+
+    fn check_steep_line(&self, x0: u16, y0: u16, x1: u16, y1: u16, z: u8) -> bool {
+        let dx = f32::from(x1) - f32::from(x0);
+        let slope = if dx == 0.0 {
+            1.0
+        } else {
+            (f32::from(y1) - f32::from(y0)) / dx
+        };
+        let mut yi = f32::from(y0) + slope;
+        let mut x = x0 + 1;
+        while x < x1 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if !self.is_tile_clear((yi + 0.1).floor() as u16, x, z, false) {
+                return false;
+            }
+            yi += slope;
+            x += 1;
+        }
+        true
+    }
+
+    fn check_sight_line(&self, x0: u16, y0: u16, x1: u16, y1: u16, z: u8) -> bool {
+        if x0 == x1 && y0 == y1 {
+            return true;
+        }
+        let dy = i32::from(y1) - i32::from(y0);
+        let dx = i32::from(x1) - i32::from(x0);
+        if dy.abs() > dx.abs() {
+            if y1 > y0 {
+                return self.check_steep_line(y0, x0, y1, x1, z);
+            }
+            return self.check_steep_line(y1, x1, y0, x0, z);
+        }
+        if x0 > x1 {
+            return self.check_slight_line(x1, y1, x0, y0, z);
+        }
+        self.check_slight_line(x0, y0, x1, y1, z)
+    }
+
+    /// TFS `Map::isSightClear` (faithful port).
+    pub fn is_sight_clear(&self, from: Position, to: Position, same_floor: bool) -> bool {
+        if from.z == to.z {
+            let ddx = (i32::from(from.x) - i32::from(to.x)).abs();
+            let ddy = (i32::from(from.y) - i32::from(to.y)).abs();
+            if ddx < 2 && ddy < 2 {
+                return true;
+            }
+            let clear = self.check_sight_line(from.x, from.y, to.x, to.y, from.z);
+            if clear || same_floor {
+                return clear;
+            }
+            if from.z == 0 {
+                return true;
+            }
+            let nz = from.z - 1;
+            return self.is_tile_clear(from.x, from.y, nz, true)
+                && self.is_tile_clear(to.x, to.y, nz, true)
+                && self.check_sight_line(from.x, from.y, to.x, to.y, nz);
+        }
+        if same_floor {
+            return false;
+        }
+        if (from.z < 8 && to.z > 7) || (from.z > 7 && to.z < 8) {
+            return false;
+        }
+        if from.z > to.z {
+            if (i32::from(from.z) - i32::from(to.z)).abs() > 1 {
+                return false;
+            }
+            let nz = from.z - 1;
+            return self.is_tile_clear(from.x, from.y, nz, true)
+                && self.check_sight_line(from.x, from.y, to.x, to.y, nz);
+        }
+        let mut z = from.z;
+        while z < to.z {
+            if !self.is_tile_clear(to.x, to.y, z, true) {
+                return false;
+            }
+            z += 1;
+        }
+        self.check_sight_line(from.x, from.y, to.x, to.y, from.z)
+    }
+
+    /// TFS `Map::canThrowObjectTo`.
+    pub fn can_throw_object_to(&self, from: Position, to: Position) -> bool {
+        const RANGE_X: i32 = 8;
+        const RANGE_Y: i32 = 6;
+        if (i32::from(from.x) - i32::from(to.x)).abs() > RANGE_X
+            || (i32::from(from.y) - i32::from(to.y)).abs() > RANGE_Y
+        {
+            return false;
+        }
+        self.is_sight_clear(from, to, false)
+    }
+
+    /// Port of TFS `Tile::queryDestination`: given a tile carrying floor-change
+    /// flags, compute the landing position.
+    pub fn resolve_floor_change(&self, from: Position) -> Option<Position> {
+        let fc = self.floor_change_at(i32::from(from.x), i32::from(from.y), i32::from(from.z));
+        if fc.is_empty() {
+            return None;
+        }
+        let (mut dx, mut dy) = (i32::from(from.x), i32::from(from.y));
+        if fc.contains(FloorChange::DOWN) {
+            let dz = i32::from(from.z) + 1;
+            if self
+                .floor_change_at(dx, dy - 1, dz)
+                .contains(FloorChange::SOUTH_ALT)
+            {
+                dy -= 2;
+            } else if self
+                .floor_change_at(dx - 1, dy, dz)
+                .contains(FloorChange::EAST_ALT)
+            {
+                dx -= 2;
+            } else {
+                let down = self.floor_change_at(dx, dy, dz);
+                if down.contains(FloorChange::NORTH) {
+                    dy += 1;
+                }
+                if down.contains(FloorChange::SOUTH) {
+                    dy -= 1;
+                }
+                if down.contains(FloorChange::SOUTH_ALT) {
+                    dy -= 2;
+                }
+                if down.contains(FloorChange::EAST) {
+                    dx -= 1;
+                }
+                if down.contains(FloorChange::EAST_ALT) {
+                    dx -= 2;
+                }
+                if down.contains(FloorChange::WEST) {
+                    dx += 1;
+                }
+            }
+            return to_position(dx, dy, dz);
+        }
+        let dz = i32::from(from.z) - 1;
+        if fc.contains(FloorChange::NORTH) {
+            dy -= 1;
+        }
+        if fc.contains(FloorChange::SOUTH) {
+            dy += 1;
+        }
+        if fc.contains(FloorChange::EAST) {
+            dx += 1;
+        }
+        if fc.contains(FloorChange::WEST) {
+            dx -= 1;
+        }
+        if fc.contains(FloorChange::SOUTH_ALT) {
+            dy += 2;
+        }
+        if fc.contains(FloorChange::EAST_ALT) {
+            dx += 2;
+        }
+        to_position(dx, dy, dz)
+    }
+
+    /// Run A* pathfinding from `start` to a tile satisfying `condition`.
+    /// Takes `&mut self` so the pathfinding closure can trigger chunk preloading
+    /// when the search reaches within 20 tiles of a chunk boundary.
+    pub fn get_path_matching(
+        &mut self,
+        start: Position,
+        target: Position,
+        creatures: &[Position],
+        params: &FindPathParams,
+        condition: pathfinding::FrozenPathingConditionCall,
+    ) -> VecDeque<Direction> {
+        let creature_coords: Vec<(u16, u16)> = creatures.iter().map(|p| (p.x, p.y)).collect();
+        let z = start.z;
+        // is_walkable closure with chunk-edge preload guard: when the A* frontier
+        // reaches within 20 tiles of its chunk's edge, trigger ensure_loaded on
+        // the adjacent chunk so the pathfinding never hits an unloaded tile.
+        let mut is_walkable = |x: u16, y: u16| -> bool {
+            let walkable = self.is_walkable(Position::new(x, y, z))
+                && self.floor_change_at(x as i32, y as i32, z as i32).is_empty();
+            if walkable {
+                let cx = x as i32 / CHUNK_DIM;
+                let cy = y as i32 / CHUNK_DIM;
+                let rel_x = x as i32 % CHUNK_DIM;
+                let rel_y = y as i32 % CHUNK_DIM;
+                let edge_dist = 20;
+                let near_left = rel_x < edge_dist;
+                let near_right = rel_x > CHUNK_DIM - edge_dist;
+                let near_top = rel_y < edge_dist;
+                let near_bottom = rel_y > CHUNK_DIM - edge_dist;
+                if near_left || near_right || near_top || near_bottom {
+                    let mut neighbors: Vec<ChunkId> = Vec::new();
+                    if near_left {
+                        neighbors.push((cx as i16 - 1, cy as i16, z));
+                    }
+                    if near_right {
+                        neighbors.push((cx as i16 + 1, cy as i16, z));
+                    }
+                    if near_top {
+                        neighbors.push((cx as i16, cy as i16 - 1, z));
+                    }
+                    if near_bottom {
+                        neighbors.push((cx as i16, cy as i16 + 1, z));
+                    }
+                    self.ensure_loaded(&neighbors);
+                }
+            }
+            walkable
+        };
+        pathfinding::get_path_matching(
+            start,
+            target,
+            &creature_coords,
+            params,
+            &condition,
+            &mut is_walkable,
+        )
+    }
+}
+
+/// Convert a world `Position` into chunk-relative `(u8, u8)`.
+#[inline]
+fn chunk_relative(pos: Position) -> (u8, u8) {
+    (
+        (pos.x as i32 % CHUNK_DIM) as u8,
+        (pos.y as i32 % CHUNK_DIM) as u8,
+    )
+}
+
+impl Chunk {
+    /// Build a [`Chunk`] from a set of OTBM tiles that all belong to the same
+    /// [`ChunkId`]. Tile stacks are built following the same rules as
+    /// [`StaticMap::from_formats_with_spawn`], but all coordinates are chunk-relative.
+    ///
+    /// `by_id` maps server item ids to their `items.otb` definitions.
+    pub fn from_otbm_tiles(
+        tiles: &[&formats::otbm::MapTile],
+        by_id: &std::collections::HashMap<u16, &formats::otb::ItemType>,
+    ) -> Self {
+        let mut chunk_tiles = HashMap::new();
+        let mut blocked = HashSet::new();
+        let mut block_projectile = HashSet::new();
+        let mut floor_change = HashMap::new();
+        let mut tile_height = HashMap::new();
+        let mut protection_zone = HashSet::new();
+
+        for tile in tiles {
+            let rel = (
+                (tile.x as u32 % CHUNK_DIM as u32) as u8,
+                (tile.y as u32 % CHUNK_DIM as u32) as u8,
+            );
+
+            let mut ground: Option<(WireItem, u16, Option<u8>)> = None;
+            let mut top: Vec<(u8, WireItem, u16, Option<u8>)> = Vec::new();
+            let mut down: Vec<(WireItem, u16, Option<u8>)> = Vec::new();
+            for (i, mi) in tile.items.iter().enumerate() {
+                let Some(it) = by_id.get(&mi.id) else {
+                    continue;
+                };
+                let wi = wire_item(it, mi.count);
+                if i == 0 {
+                    ground = Some((wi, mi.id, mi.count));
+                } else if it.always_on_top {
+                    top.push((it.top_order, wi, mi.id, mi.count));
+                } else {
+                    down.push((wi, mi.id, mi.count));
+                }
+            }
+
+            if let Some((ground_item, ground_sid, ground_count)) = ground {
+                top.sort_by_key(|(order, _, _, _)| *order);
+                let cap = 1 + top.len() + down.len();
+                let mut items: Vec<WireItem> = Vec::with_capacity(cap);
+                let mut server_ids: Vec<u16> = Vec::with_capacity(cap);
+                let mut counts: Vec<Option<u8>> = Vec::with_capacity(cap);
+                items.push(ground_item);
+                server_ids.push(ground_sid);
+                counts.push(ground_count);
+                for (_, wi, sid, c) in &top {
+                    items.push(*wi);
+                    server_ids.push(*sid);
+                    counts.push(*c);
+                }
+                let pre_creature_len = items.len().min(MAX_TILE_THINGS);
+                for (wi, sid, c) in &down {
+                    items.push(*wi);
+                    server_ids.push(*sid);
+                    counts.push(*c);
+                }
+                items.truncate(MAX_TILE_THINGS);
+                server_ids.truncate(MAX_TILE_THINGS);
+                counts.truncate(MAX_TILE_THINGS);
+                chunk_tiles.insert(
+                    rel,
+                    TileStack {
+                        items,
+                        server_ids,
+                        counts,
+                        pre_creature_len,
+                    },
+                );
+            }
+
+            // Block-solid check
+            let solid = tile.items.iter().any(|mi| {
+                by_id
+                    .get(&mi.id)
+                    .is_some_and(|it| it.flags & FLAG_BLOCK_SOLID != 0)
+            });
+            if solid {
+                blocked.insert(rel);
+            }
+
+            // Floor-change, height, and block-projectile metadata
+            let mut fc = FloorChange::NONE;
+            let mut height: u8 = 0;
+            for mi in &tile.items {
+                if let Some(it) = by_id.get(&mi.id) {
+                    if !it.floor_change.is_empty() {
+                        fc.insert(it.floor_change);
+                    }
+                    if it.has_height {
+                        height = height.saturating_add(1);
+                    }
+                    if it.is_block_projectile() {
+                        block_projectile.insert(rel);
+                    }
+                }
+            }
+            if !fc.is_empty() {
+                floor_change.insert(rel, fc);
+            }
+            if height > 0 {
+                tile_height.insert(rel, height);
+            }
+
+            // Protection-zone flag from OTBM tile flags
+            if tile.flags & OTBM_TILEFLAG_PROTECTIONZONE != 0 {
+                protection_zone.insert(rel);
+            }
+        }
+
+        Chunk {
+            tiles: chunk_tiles,
+            blocked,
+            block_projectile,
+            floor_change,
+            tile_height,
+            protection_zone,
+        }
+    }
+}
+
+/// Lightweight world metadata extracted from `StaticMap`: spawn, towns, item
+/// catalogue. Carried by `WorldHandle` so the network layer can encode inventory
+/// and enter-world bursts without holding the full tile grid.
+#[derive(Debug, Clone)]
+pub struct WorldMeta {
+    pub spawn: Position,
+    pub towns: Vec<formats::otbm::Town>,
+    pub item_meta: HashMap<u16, ItemMeta>,
+}
+
+impl WorldMeta {
+    pub fn spawn(&self) -> Position {
+        self.spawn
+    }
+
+    pub fn item_meta(&self, server_id: u16) -> Option<&ItemMeta> {
+        self.item_meta.get(&server_id)
+    }
+
+    /// Temple position of the town with the given case-insensitive name, if any.
+    pub fn town_temple_by_name(&self, name: &str) -> Option<Position> {
+        self.towns
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+            .map(|t| Position::new(t.x, t.y, t.z))
+    }
+
+    /// Temple position of the town with the given id, if any.
+    pub fn town_temple_by_id(&self, id: u32) -> Option<Position> {
+        self.towns
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| Position::new(t.x, t.y, t.z))
+    }
+
+    /// Return the respawn temple for any player (currently the spawn point).
+    pub fn temple_for(&self, _pos: Position) -> Position {
+        self.spawn
+    }
+
+    /// Find an item's server id by case-insensitive name (singular or plural).
+    /// Returns the lowest matching server id when several items share a name.
+    pub fn find_item_id_by_name(&self, name: &str) -> Option<u16> {
+        self.item_meta
+            .iter()
+            .filter(|(_, m)| {
+                m.name.eq_ignore_ascii_case(name) || m.plural_name().eq_ignore_ascii_case(name)
+            })
+            .map(|(&sid, _)| sid)
+            .min()
+    }
+}
+
+/// A TileSource adapter for `&ChunkManager`, used by MergedTiles for map encoding.
+/// Allows the game actor to produce map descriptions from the chunk-based world.
+impl TileSource for ChunkManager {
+    fn tile(&self, x: i32, y: i32, z: i32) -> Option<TileSlices<'_>> {
+        let key = StaticMap::key(x, y, z)?;
+        let pos = Position::new(key.0, key.1, key.2);
+        let st = self.tile_at(pos)?;
+        Some(TileSlices {
+            pre_creature: &st.items[..st.pre_creature_len],
+            post_creature: &st.items[st.pre_creature_len..],
+        })
+    }
+
+    fn creature_stackpos(&self, x: i32, y: i32, z: i32) -> u8 {
+        StaticMap::key(x, y, z)
+            .and_then(|key| {
+                let pos = Position::new(key.0, key.1, key.2);
+                self.tile_at(pos).map(|st| st.pre_creature_len as u8)
+            })
+            .unwrap_or(1)
+    }
+}
+
+/// Chunked world map: delegates tile access to an in-memory `ChunkManager`.
+/// Coexists with `StaticMap`; will replace it once game integration is complete.
+pub struct ChunkedMap {
+    pub chunks: ChunkManager,
+}
+
+impl ChunkedMap {
+    pub fn new(chunks: ChunkManager) -> Self {
+        Self { chunks }
+    }
+}
+
+impl TileSource for ChunkedMap {
+    fn tile(&self, x: i32, y: i32, z: i32) -> Option<TileSlices<'_>> {
+        let key = StaticMap::key(x, y, z)?;
+        let pos = Position::new(key.0, key.1, key.2);
+        let st = self.chunks.tile_at(pos)?;
+        Some(TileSlices {
+            pre_creature: &st.items[..st.pre_creature_len],
+            post_creature: &st.items[st.pre_creature_len..],
+        })
+    }
+
+    fn creature_stackpos(&self, x: i32, y: i32, z: i32) -> u8 {
+        StaticMap::key(x, y, z)
+            .and_then(|key| {
+                let pos = Position::new(key.0, key.1, key.2);
+                self.chunks.tile_at(pos).map(|st| st.pre_creature_len as u8)
+            })
+            .unwrap_or(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StaticMap {
     tiles: HashMap<(u16, u16, u8), TileStack>,
     blocked: HashSet<(u16, u16, u8)>,
@@ -170,10 +889,108 @@ pub struct StaticMap {
     /// Towns and their temple positions, retained for GM `/temple` lookups.
     towns: Vec<formats::otbm::Town>,
     /// Look-at metadata by server id; empty until `load_item_metadata` runs.
+    #[serde(skip)]
     item_meta: HashMap<u16, ItemMeta>,
 }
 
 impl StaticMap {
+    /// Build an empty map with no tiles, carrying only the spawn position and
+    /// town data. `item_meta` is empty; call [`Self::load_item_metadata`] after
+    /// construction. Used for the chunked-map boot path (PR 2) where tiles are
+    /// loaded on demand from pre-chunked files.
+    pub fn new_empty(spawn: Position, towns: Vec<formats::otbm::Town>) -> Self {
+        Self {
+            tiles: HashMap::new(),
+            blocked: HashSet::new(),
+            block_projectile: HashSet::new(),
+            floor_change: HashMap::new(),
+            tile_height: HashMap::new(),
+            protection_zone: HashSet::new(),
+            spawn,
+            towns,
+            item_meta: HashMap::new(),
+        }
+    }
+
+    /// Convert this StaticMap into a ChunkManager + WorldMeta pair.
+    #[allow(dead_code)]
+    pub fn into_chunks_and_meta(self) -> (ChunkManager, WorldMeta) {
+        let mut chunks_by_id: HashMap<ChunkId, HashMap<(u8, u8), &TileStack>> = HashMap::new();
+        let mut blocked_by_id: HashMap<ChunkId, HashSet<(u8, u8)>> = HashMap::new();
+        let mut bp_by_id: HashMap<ChunkId, HashSet<(u8, u8)>> = HashMap::new();
+        let mut fc_by_id: HashMap<ChunkId, HashMap<(u8, u8), FloorChange>> = HashMap::new();
+        let mut th_by_id: HashMap<ChunkId, HashMap<(u8, u8), u8>> = HashMap::new();
+        let mut pz_by_id: HashMap<ChunkId, HashSet<(u8, u8)>> = HashMap::new();
+
+        for (&(x, y, z), st) in &self.tiles {
+            let pos = Position::new(x, y, z);
+            let id = chunk_id(pos);
+            let rel = chunk_relative(pos);
+            chunks_by_id.entry(id).or_default().insert(rel, st);
+        }
+        for &(x, y, z) in &self.blocked {
+            let pos = Position::new(x, y, z);
+            let id = chunk_id(pos);
+            let rel = chunk_relative(pos);
+            blocked_by_id.entry(id).or_default().insert(rel);
+        }
+        for &(x, y, z) in &self.block_projectile {
+            let pos = Position::new(x, y, z);
+            let id = chunk_id(pos);
+            let rel = chunk_relative(pos);
+            bp_by_id.entry(id).or_default().insert(rel);
+        }
+        for (&(x, y, z), fc) in &self.floor_change {
+            let pos = Position::new(x, y, z);
+            let id = chunk_id(pos);
+            let rel = chunk_relative(pos);
+            fc_by_id.entry(id).or_default().insert(rel, *fc);
+        }
+        for (&(x, y, z), h) in &self.tile_height {
+            let pos = Position::new(x, y, z);
+            let id = chunk_id(pos);
+            let rel = chunk_relative(pos);
+            th_by_id.entry(id).or_default().insert(rel, *h);
+        }
+        for &(x, y, z) in &self.protection_zone {
+            let pos = Position::new(x, y, z);
+            let id = chunk_id(pos);
+            let rel = chunk_relative(pos);
+            pz_by_id.entry(id).or_default().insert(rel);
+        }
+
+        let mut cm = ChunkManager::new();
+        let all_ids: HashSet<ChunkId> = chunks_by_id
+            .keys()
+            .chain(blocked_by_id.keys())
+            .chain(bp_by_id.keys())
+            .chain(fc_by_id.keys())
+            .chain(th_by_id.keys())
+            .chain(pz_by_id.keys())
+            .copied()
+            .collect();
+        for id in all_ids {
+            let tiles_map = chunks_by_id.remove(&id).unwrap_or_default();
+            let chunk = Chunk {
+                tiles: tiles_map.into_iter().map(|(k, v)| (k, v.clone())).collect(),
+                blocked: blocked_by_id.remove(&id).unwrap_or_default(),
+                block_projectile: bp_by_id.remove(&id).unwrap_or_default(),
+                floor_change: fc_by_id.remove(&id).unwrap_or_default(),
+                tile_height: th_by_id.remove(&id).unwrap_or_default(),
+                protection_zone: pz_by_id.remove(&id).unwrap_or_default(),
+            };
+            cm.chunks.insert(id, Arc::new(chunk));
+        }
+
+        let meta = WorldMeta {
+            spawn: self.spawn,
+            towns: self.towns,
+            item_meta: self.item_meta,
+        };
+
+        (cm, meta)
+    }
+
     /// Build from a parsed map + item dictionary, picking the spawn from the first
     /// town (or [`FALLBACK_SPAWN`]). See [`StaticMap::from_formats_with_spawn`] to
     /// target a specific town by name.
@@ -721,14 +1538,14 @@ impl StaticMap {
         condition: pathfinding::FrozenPathingConditionCall,
     ) -> VecDeque<Direction> {
         let creature_coords: Vec<(u16, u16)> = creatures.iter().map(|p| (p.x, p.y)).collect();
-        let is_walkable = |x: u16, y: u16| self.is_walkable(Position::new(x, y, start.z));
+        let mut is_walkable = |x: u16, y: u16| self.is_walkable(Position::new(x, y, start.z));
         pathfinding::get_path_matching(
             start,
             target,
             &creature_coords,
             params,
             &condition,
-            &is_walkable,
+            &mut is_walkable,
         )
     }
 }
@@ -750,15 +1567,16 @@ impl TileSource for StaticMap {
     }
 }
 
-/// A read view over the immutable `StaticMap` plus the actor's runtime overlay.
+/// A read view over an immutable base map plus the actor's runtime overlay.
 /// Tile reads check the overlay first (a materialised dynamic stack), then fall
-/// back to the static map. Passed to the map encoder in place of `&StaticMap`.
-pub(crate) struct MergedTiles<'a> {
-    pub(crate) base: &'a StaticMap,
+/// back to the base map. Generic over the base type so both `StaticMap` and
+/// `ChunkedMap` can be used. Passed to the map encoder in place of `&StaticMap`.
+pub(crate) struct MergedTiles<'a, B: TileSource> {
+    pub(crate) base: &'a B,
     pub(crate) dynamic: &'a std::collections::HashMap<(u16, u16, u8), TileStack>,
 }
 
-impl TileSource for MergedTiles<'_> {
+impl<B: TileSource> TileSource for MergedTiles<'_, B> {
     fn tile(&self, x: i32, y: i32, z: i32) -> Option<TileSlices<'_>> {
         let key = StaticMap::key(x, y, z)?;
         if let Some(st) = self.dynamic.get(&key) {
@@ -798,6 +1616,94 @@ mod tests {
     use super::*;
     use formats::otb::ItemType;
     use formats::otbm::{MapItem, MapTile, Town};
+
+    /// Helper: round-trip a value through bincode.
+    fn bincode_round_trip<
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    >(
+        val: &T,
+    ) {
+        let bytes = bincode::serialize(val).expect("serialize");
+        let back: T = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(*val, back, "round-trip mismatch");
+    }
+
+    #[test]
+    fn equip_slot_serde_round_trip() {
+        bincode_round_trip(&EquipSlot::Head);
+        bincode_round_trip(&EquipSlot::Ammo);
+    }
+
+    #[test]
+    fn item_meta_serde_round_trip() {
+        let meta = ItemMeta {
+            name: "gold coin".into(),
+            article: "a".into(),
+            plural: "gold coins".into(),
+            description: "Shiny!".into(),
+            weight: 100,
+            show_count: true,
+            stackable: true,
+            pickupable: true,
+            client_id: 3031,
+            animated: false,
+            moveable: true,
+            equip_slot: None,
+            is_container: false,
+            container_capacity: 0,
+        };
+        bincode_round_trip(&meta);
+    }
+
+    #[test]
+    fn static_map_serde_skip_item_meta() {
+        // Serialize a StaticMap that has item_meta populated; after
+        // deserialization item_meta MUST be empty (serde skip).
+        let (map, items) = tiny_map();
+        let mut sm = StaticMap::from_formats(&map, &items);
+        sm.item_meta.insert(
+            100,
+            ItemMeta {
+                name: "test item".into(),
+                ..Default::default()
+            },
+        );
+        let bytes = bincode::serialize(&sm).expect("serialize");
+        let back: StaticMap = bincode::deserialize(&bytes).expect("deserialize");
+        assert!(back.item_meta.is_empty(), "item_meta must be skipped");
+        assert_eq!(back.spawn, sm.spawn, "spawn must survive round-trip");
+        assert_eq!(back.blocked, sm.blocked, "blocked must survive round-trip");
+    }
+
+    #[test]
+    fn static_map_round_trip_preserves_tiles_spawn_blocked() {
+        // Full round-trip: parse → serialize → deserialize → verify key fields.
+        let (map, items) = tiny_map();
+        let sm = StaticMap::from_formats(&map, &items);
+        let bytes = bincode::serialize(&sm).expect("serialize");
+        let back: StaticMap = bincode::deserialize(&bytes).expect("deserialize");
+        // Check tiles (private field access — same module).
+        assert_eq!(back.tiles, sm.tiles, "tiles must survive round-trip");
+        assert_eq!(back.blocked, sm.blocked, "blocked must survive round-trip");
+        assert_eq!(back.spawn, sm.spawn, "spawn must survive round-trip");
+        assert_eq!(back.towns, sm.towns, "towns must survive round-trip");
+        assert_eq!(
+            back.floor_change, sm.floor_change,
+            "floor_change must survive round-trip"
+        );
+        assert_eq!(
+            back.protection_zone, sm.protection_zone,
+            "protection_zone must survive round-trip"
+        );
+        assert_eq!(
+            back.block_projectile, sm.block_projectile,
+            "block_projectile must survive round-trip"
+        );
+        assert_eq!(
+            back.tile_height, sm.tile_height,
+            "tile_height must survive round-trip"
+        );
+    }
 
     /// Client ids of a wire-item slice, for terse stack-order assertions.
     fn cids(items: &[WireItem]) -> Vec<u16> {
@@ -1760,5 +2666,753 @@ mod tests {
             EquipSlot::Hand.admits(5) && EquipSlot::Hand.admits(6) && !EquipSlot::Hand.admits(4)
         );
         assert!(EquipSlot::Ammo.admits(10) && !EquipSlot::Ammo.admits(1));
+    }
+
+    // -----------------------------------------------------------------
+    // Chunk bincode round-trip (task 1.8)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn chunk_bincode_round_trip() {
+        let mut tiles = HashMap::new();
+        tiles.insert(
+            (10u8, 20u8),
+            TileStack {
+                items: vec![WireItem::plain(4526)],
+                server_ids: vec![100],
+                counts: vec![None],
+                pre_creature_len: 1,
+            },
+        );
+        let mut blocked: HashSet<(u8, u8)> = HashSet::new();
+        blocked.insert((5, 5));
+        let mut floor_change = HashMap::new();
+        floor_change.insert((0u8, 0u8), FloorChange::NORTH);
+        let chunk = Chunk {
+            tiles,
+            blocked,
+            block_projectile: HashSet::new(),
+            floor_change,
+            tile_height: HashMap::new(),
+            protection_zone: HashSet::new(),
+        };
+        bincode_round_trip(&chunk);
+    }
+
+    #[test]
+    fn chunk_bincode_round_trip_all_fields_populated() {
+        let mut tiles = HashMap::new();
+        tiles.insert(
+            (100, 200),
+            TileStack {
+                items: vec![WireItem::plain(3031), WireItem::plain(3035)],
+                server_ids: vec![200, 201],
+                counts: vec![Some(50), None],
+                pre_creature_len: 1,
+            },
+        );
+        let mut blocked: HashSet<(u8, u8)> = HashSet::new();
+        blocked.insert((10, 10));
+        blocked.insert((20, 30));
+        let mut block_projectile: HashSet<(u8, u8)> = HashSet::new();
+        block_projectile.insert((15, 15));
+        let mut floor_change = HashMap::new();
+        let mut fc = FloorChange::NONE;
+        fc.insert(FloorChange::NORTH);
+        fc.insert(FloorChange::EAST);
+        floor_change.insert((1, 1), fc);
+        let mut tile_height = HashMap::new();
+        tile_height.insert((3, 3), 2);
+        let mut protection_zone: HashSet<(u8, u8)> = HashSet::new();
+        protection_zone.insert((0, 0));
+        let chunk = Chunk {
+            tiles,
+            blocked,
+            block_projectile,
+            floor_change,
+            tile_height,
+            protection_zone,
+        };
+        bincode_round_trip(&chunk);
+    }
+
+    #[test]
+    fn chunk_bincode_round_trip_empty() {
+        let chunk = Chunk {
+            tiles: HashMap::new(),
+            blocked: HashSet::new(),
+            block_projectile: HashSet::new(),
+            floor_change: HashMap::new(),
+            tile_height: HashMap::new(),
+            protection_zone: HashSet::new(),
+        };
+        bincode_round_trip(&chunk);
+    }
+
+    // -----------------------------------------------------------------
+    // chunks_around (task 1.10)
+    // -----------------------------------------------------------------
+
+    fn empty_chunk() -> Chunk {
+        Chunk {
+            tiles: HashMap::new(),
+            blocked: HashSet::new(),
+            block_projectile: HashSet::new(),
+            floor_change: HashMap::new(),
+            tile_height: HashMap::new(),
+            protection_zone: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn chunks_around_returns_27_chunk_ids() {
+        let pos = Position::new(512, 512, 7); // chunk (2, 2, 7)
+        let ids = chunks_around(pos);
+        assert_eq!(
+            ids.len(),
+            27,
+            "chunks_around must return exactly 27 ChunkIds (3 floors × 3×3 grid)"
+        );
+        // Center chunk
+        assert!(ids.contains(&(2, 2, 7)), "center chunk must be included");
+        // Floor range: z-1 to z+1 (6, 7, 8)
+        assert!(
+            ids.iter().any(|(_, _, z)| *z == 6),
+            "floor 6 (z-1) must be included"
+        );
+        assert!(
+            ids.iter().any(|(_, _, z)| *z == 7),
+            "floor 7 (same floor) must be included"
+        );
+        assert!(
+            ids.iter().any(|(_, _, z)| *z == 8),
+            "floor 8 (z+1) must be included"
+        );
+        // x range: 1..=3 (cx-1, cx, cx+1)
+        for cx in 1..=3i16 {
+            assert!(
+                ids.iter().any(|(x, _, _)| *x == cx),
+                "chunk_x {cx} must be included"
+            );
+        }
+        // y range: 1..=3 (cy-1, cy, cy+1)
+        for cy in 1..=3i16 {
+            assert!(
+                ids.iter().any(|(_, y, _)| *y == cy),
+                "chunk_y {cy} must be included"
+            );
+        }
+    }
+
+    #[test]
+    fn chunks_around_at_origin() {
+        // At (0,0,0): floor clamping collapses dz=-1 into dz=0,
+        // yielding 3 floors: 0, 0, 1 → ~18 unique ChunkIds (floor 0×2 + floor 1).
+        let pos = Position::new(0, 0, 0);
+        let ids = chunks_around(pos);
+        // Expect 18: 9 chunks on floor 0 (from dz=-1 and dz=0 both clamping to 0)
+        // + 9 chunks on floor 1.
+        assert_eq!(
+            ids.len(),
+            18,
+            "at origin, floor 0 appears twice (dz=-1+0 clamp to 0)"
+        );
+        assert!(ids.contains(&(0, 0, 0)), "origin chunk must be included");
+    }
+
+    // -----------------------------------------------------------------
+    // ChunkManager::sweep (task 1.9)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn chunk_manager_sweep_keeps_required_evicts_orphans() {
+        let mut cm = ChunkManager::new();
+        // Insert 5 chunks
+        cm.chunks
+            .insert((0, 0, 7), std::sync::Arc::new(empty_chunk()));
+        cm.chunks
+            .insert((1, 0, 7), std::sync::Arc::new(empty_chunk()));
+        cm.chunks
+            .insert((2, 0, 7), std::sync::Arc::new(empty_chunk()));
+        cm.chunks
+            .insert((3, 0, 7), std::sync::Arc::new(empty_chunk()));
+        cm.chunks
+            .insert((4, 0, 7), std::sync::Arc::new(empty_chunk()));
+        assert_eq!(cm.chunks.len(), 5, "setup: 5 chunks loaded");
+
+        // Required set keeps only chunks (0,0,7) and (3,0,7)
+        let required: HashSet<ChunkId> = [(0, 0, 7), (3, 0, 7)].into_iter().collect();
+        cm.sweep(&required);
+
+        assert_eq!(
+            cm.chunks.len(),
+            2,
+            "after sweep, only required chunks should remain"
+        );
+        assert!(
+            cm.chunks.contains_key(&(0, 0, 7)),
+            "required chunk (0,0,7) must survive"
+        );
+        assert!(
+            cm.chunks.contains_key(&(3, 0, 7)),
+            "required chunk (3,0,7) must survive"
+        );
+        assert!(
+            !cm.chunks.contains_key(&(1, 0, 7)),
+            "orphan chunk (1,0,7) must be evicted"
+        );
+        assert!(
+            !cm.chunks.contains_key(&(2, 0, 7)),
+            "orphan chunk (2,0,7) must be evicted"
+        );
+        assert!(
+            !cm.chunks.contains_key(&(4, 0, 7)),
+            "orphan chunk (4,0,7) must be evicted"
+        );
+    }
+
+    #[test]
+    fn chunk_manager_sweep_empty_required_drops_all() {
+        let mut cm = ChunkManager::new();
+        cm.chunks
+            .insert((0, 0, 7), std::sync::Arc::new(empty_chunk()));
+        cm.sweep(&HashSet::new());
+        assert!(cm.chunks.is_empty(), "empty required set drops all chunks");
+    }
+
+    #[test]
+    fn chunk_manager_sweep_pinned_chunks_survive() {
+        let mut cm = ChunkManager::new();
+        cm.chunks
+            .insert((0, 0, 7), std::sync::Arc::new(empty_chunk()));
+        cm.chunks
+            .insert((1, 0, 7), std::sync::Arc::new(empty_chunk()));
+        cm.pinned.insert((1, 0, 7));
+        // Required set is empty, but pinned chunk survives
+        cm.sweep(&HashSet::new());
+        assert_eq!(cm.chunks.len(), 1, "only pinned chunk should survive");
+        assert!(
+            cm.chunks.contains_key(&(1, 0, 7)),
+            "pinned chunk (1,0,7) must survive"
+        );
+        assert!(
+            !cm.chunks.contains_key(&(0, 0, 7)),
+            "unpinned chunk (0,0,7) must be evicted"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ChunkedMap (task 1.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn chunked_map_tile_source_tile_and_stackpos() {
+        use protocol::map_description::TileSource;
+        let mut cm = ChunkManager::new();
+        // Build a Chunk with known tile data at chunk-relative (10, 20).
+        let mut tiles = HashMap::new();
+        tiles.insert(
+            (10u8, 20u8),
+            TileStack {
+                items: vec![WireItem::plain(4526), WireItem::plain(1059)],
+                server_ids: vec![100, 200],
+                counts: vec![None, None],
+                pre_creature_len: 1,
+            },
+        );
+        let chunk = Chunk {
+            tiles,
+            blocked: HashSet::new(),
+            block_projectile: HashSet::new(),
+            floor_change: HashMap::new(),
+            tile_height: HashMap::new(),
+            protection_zone: HashSet::new(),
+        };
+        // Place chunk at (0, 0, 7); tile (10, 20) in chunk maps to world (10, 20, 7).
+        cm.chunks.insert((0, 0, 7), Arc::new(chunk));
+        let map = ChunkedMap::new(cm);
+
+        let slices = map.tile(10, 20, 7).expect("tile must be found");
+        assert_eq!(slices.pre_creature.len(), 1);
+        assert_eq!(slices.pre_creature[0].client_id, 4526);
+        assert_eq!(slices.post_creature.len(), 1);
+        assert_eq!(slices.post_creature[0].client_id, 1059);
+        assert_eq!(map.creature_stackpos(10, 20, 7), 1);
+        // Missing tile
+        assert!(map.tile(0, 0, 7).is_none());
+        assert_eq!(map.creature_stackpos(0, 0, 7), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Chunk::from_otbm_tiles (tasks 2.1, 2.6)
+    // -----------------------------------------------------------------
+
+    /// Build a chunk from a set of OTBM tiles at known positions.
+    #[test]
+    fn chunk_from_otbm_tiles_builds_correct_chunk_relative_coords() {
+        // Items: ground (sid=100, client=4526) and block-solid wall (sid=200).
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: vec![
+                ItemType {
+                    group: 1,
+                    flags: 0,
+                    server_id: 100,
+                    client_id: 4526,
+                    always_on_top: false,
+                    top_order: 0,
+                    has_height: false,
+                    floor_change: FloorChange::NONE,
+                },
+                ItemType {
+                    group: 5,
+                    flags: 1, // FLAG_BLOCK_SOLID
+                    server_id: 200,
+                    client_id: 1059,
+                    always_on_top: false,
+                    top_order: 0,
+                    has_height: false,
+                    floor_change: FloorChange::NONE,
+                },
+            ],
+        };
+        // items is used indirectly via by_id built below
+        let by_id: HashMap<u16, &ItemType> =
+            items.items.iter().map(|it| (it.server_id, it)).collect();
+
+        // All tiles belong to chunk (0, 1, 7):
+        //   (95, 300, 7) → chunk-relative (95, 44)  — 300 % 256 = 44
+        //   (96, 300, 7) → chunk-relative (96, 44)  — has block-solid wall
+        //   (95, 301, 7) → chunk-relative (95, 45)
+        let map = OtbmMap {
+            width: 200,
+            height: 400,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles: vec![
+                MapTile {
+                    x: 95,
+                    y: 300,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
+                },
+                MapTile {
+                    x: 96,
+                    y: 300,
+                    z: 7,
+                    flags: OTBM_TILEFLAG_PROTECTIONZONE, // PZ tile
+                    house_id: None,
+                    items: vec![
+                        MapItem {
+                            id: 100,
+                            count: None,
+                            contents: vec![],
+                        },
+                        MapItem {
+                            id: 200,
+                            count: None,
+                            contents: vec![],
+                        },
+                    ],
+                },
+                MapTile {
+                    x: 95,
+                    y: 301,
+                    z: 7,
+                    flags: 0,
+                    house_id: None,
+                    items: vec![MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    }],
+                },
+            ],
+            towns: vec![],
+            waypoints: vec![],
+        };
+
+        // Collect tiles belonging to chunk (0, 1, 7)
+        let chunk_tiles: Vec<&MapTile> = map
+            .tiles
+            .iter()
+            .filter(|t| {
+                let cx = (t.x as i32 / CHUNK_DIM) as i16;
+                let cy = (t.y as i32 / CHUNK_DIM) as i16;
+                cx == 0 && cy == 1 && t.z == 7
+            })
+            .collect();
+        assert_eq!(chunk_tiles.len(), 3, "3 tiles in chunk (0, 1, 7)");
+
+        let chunk = Chunk::from_otbm_tiles(&chunk_tiles, &by_id);
+
+        // Verify chunk-relative tile positions
+        assert!(
+            chunk.tiles.contains_key(&(95, 44)),
+            "tile (95,300,7) → rel (95,44)"
+        );
+        assert!(
+            chunk.tiles.contains_key(&(96, 44)),
+            "tile (96,300,7) → rel (96,44)"
+        );
+        assert!(
+            chunk.tiles.contains_key(&(95, 45)),
+            "tile (95,301,7) → rel (95,45)"
+        );
+
+        // Tile (96,44) is blocked (carries block-solid item)
+        assert!(
+            chunk.blocked.contains(&(96, 44)),
+            "tile with block-solid wall must be blocked"
+        );
+        assert!(
+            !chunk.blocked.contains(&(95, 44)),
+            "plain ground must not be blocked"
+        );
+
+        // Tile (96,44) is protection zone (OTBM flag)
+        assert!(
+            chunk.protection_zone.contains(&(96, 44)),
+            "PZ-flagged tile must be in protection_zone"
+        );
+        assert!(
+            !chunk.protection_zone.contains(&(95, 44)),
+            "non-PZ tile must not be in protection_zone"
+        );
+
+        // Ground tile stack at (95,44): one WireItem with client_id 4526
+        let st = chunk.tiles.get(&(95, 44)).unwrap();
+        assert_eq!(st.items.len(), 1);
+        assert_eq!(st.items[0].client_id, 4526);
+        assert_eq!(st.pre_creature_len, 1);
+    }
+
+    #[test]
+    fn chunk_from_otbm_tiles_serializes_and_deserializes() {
+        // Same fixture as above, but verify bincode round-trip
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: vec![ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            }],
+        };
+        let by_id: HashMap<u16, &ItemType> =
+            items.items.iter().map(|it| (it.server_id, it)).collect();
+        let map = OtbmMap {
+            width: 200,
+            height: 400,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles: vec![MapTile {
+                x: 95,
+                y: 300,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![MapItem {
+                    id: 100,
+                    count: None,
+                    contents: vec![],
+                }],
+            }],
+            towns: vec![],
+            waypoints: vec![],
+        };
+        let chunk_tiles: Vec<&MapTile> = map
+            .tiles
+            .iter()
+            .filter(|t| {
+                let cx = (t.x as i32 / CHUNK_DIM) as i16;
+                let cy = (t.y as i32 / CHUNK_DIM) as i16;
+                cx == 0 && cy == 1 && t.z == 7
+            })
+            .collect();
+        let chunk = Chunk::from_otbm_tiles(&chunk_tiles, &by_id);
+        bincode_round_trip(&chunk);
+    }
+
+    #[test]
+    fn chunk_from_otbm_tiles_empty_tiles_yields_empty_chunk() {
+        let by_id: HashMap<u16, &ItemType> = HashMap::new();
+        let chunk = Chunk::from_otbm_tiles(&[], &by_id);
+        assert!(chunk.tiles.is_empty(), "no tiles → empty chunk");
+        assert!(chunk.blocked.is_empty(), "no tiles → no blocked");
+        assert!(
+            chunk.protection_zone.is_empty(),
+            "no tiles → no protection zones"
+        );
+    }
+
+    /// Simulate the prechunker flow: build a chunk from tiles, serialize to disk,
+    /// then deserialize back — verifying the chunk file format.
+    #[test]
+    fn prechunker_writes_chunk_file_that_deserializes_back() {
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: vec![ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            }],
+        };
+        let by_id: HashMap<u16, &ItemType> =
+            items.items.iter().map(|it| (it.server_id, it)).collect();
+        let map = OtbmMap {
+            width: 200,
+            height: 200,
+            major_items: 3,
+            minor_items: 57,
+            description: String::new(),
+            spawn_file: None,
+            house_file: None,
+            tiles: vec![MapTile {
+                x: 95,
+                y: 117,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![MapItem {
+                    id: 100,
+                    count: None,
+                    contents: vec![],
+                }],
+            }],
+            towns: vec![],
+            waypoints: vec![],
+        };
+        let chunk_tiles: Vec<&MapTile> = map.tiles.iter().collect();
+        let chunk = Chunk::from_otbm_tiles(&chunk_tiles, &by_id);
+
+        // Serialize to a "chunk file" in a temp directory.
+        let tmp = std::env::temp_dir().join(format!("prechunk_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(tmp.join("7"));
+        let path = tmp.join("7/0_0.chunk");
+        let data = bincode::serialize(&chunk).expect("serialize chunk");
+        std::fs::write(&path, &data).expect("write chunk file");
+
+        // Verify the file exists and has content.
+        assert!(path.exists(), "chunk file must exist on disk");
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(file_size > 0, "chunk file must have content");
+
+        // Read back and deserialize.
+        let read_bytes = std::fs::read(&path).expect("read chunk file");
+        let deserialized: Chunk = bincode::deserialize(&read_bytes).expect("deserialize chunk");
+        assert_eq!(deserialized, chunk, "round-trip via disk must match");
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------
+    // StaticMap::new_empty (task 2.4)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn static_map_new_empty_has_no_tiles_but_retains_spawn_and_towns() {
+        let towns = vec![Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 95,
+            y: 117,
+            z: 7,
+        }];
+        let spawn = Position::new(200, 300, 7);
+        let sm = StaticMap::new_empty(spawn, towns.clone());
+        assert_eq!(sm.spawn(), spawn);
+        assert_eq!(sm.towns, towns);
+        assert!(sm.tiles.is_empty(), "new_empty must have no tiles");
+        assert!(!sm.has_ground(spawn), "empty map has no ground anywhere");
+        assert!(
+            sm.item_meta.is_empty(),
+            "item_meta is empty until load_item_metadata"
+        );
+    }
+
+    #[test]
+    fn static_map_new_empty_with_load_item_metadata_populates_catalogue() {
+        let mut sm = StaticMap::new_empty(Position::new(95, 117, 7), vec![]);
+        let items = ItemsOtb {
+            major_version: 3,
+            minor_version: 57,
+            build_number: 0,
+            items: vec![ItemType {
+                group: 0,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: FloorChange::NONE,
+            }],
+        };
+        let items_xml =
+            formats::items_xml::parse_items_xml("<items></items>").expect("parse empty items.xml");
+        sm.load_item_metadata(&items, &items_xml);
+        assert!(
+            sm.item_meta(100).is_some(),
+            "item catalogue must be populated"
+        );
+        assert_eq!(
+            sm.item_meta(100).unwrap().client_id,
+            4526,
+            "client_id must match items.otb"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Pathfinding hole-avoidance tests (SDD: pathfinding-avoid-holes)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn get_path_matching_rejects_floor_change_tile() {
+        use crate::pathfinding::{FindPathParams, FrozenPathingConditionCall};
+
+        let fc_map = || -> (OtbmMap, ItemsOtb) {
+            use formats::items_xml::FloorChange;
+            let items = ItemsOtb {
+                major_version: 3,
+                minor_version: 57,
+                build_number: 0,
+                items: vec![
+                    ItemType {
+                        group: 1,
+                        flags: 0,
+                        server_id: 100,
+                        client_id: 1,
+                        always_on_top: false,
+                        top_order: 0,
+                        has_height: false,
+                        floor_change: FloorChange::NONE,
+                    },
+                    ItemType {
+                        group: 5,
+                        flags: 0,
+                        server_id: 300,
+                        client_id: 2,
+                        always_on_top: false,
+                        top_order: 0,
+                        has_height: false,
+                        floor_change: FloorChange::DOWN,
+                    },
+                ],
+            };
+            let ground = |x: u16, y: u16| MapTile {
+                x,
+                y,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![MapItem {
+                    id: 100,
+                    count: None,
+                    contents: vec![],
+                }],
+            };
+            let hole = |x: u16, y: u16| MapTile {
+                x,
+                y,
+                z: 7,
+                flags: 0,
+                house_id: None,
+                items: vec![
+                    MapItem {
+                        id: 100,
+                        count: None,
+                        contents: vec![],
+                    },
+                    MapItem {
+                        id: 300,
+                        count: None,
+                        contents: vec![],
+                    },
+                ],
+            };
+            let map = OtbmMap {
+                width: 200,
+                height: 200,
+                major_items: 3,
+                minor_items: 57,
+                description: String::new(),
+                spawn_file: None,
+                house_file: None,
+                tiles: vec![
+                    ground(100, 100), // start
+                    hole(101, 100),   // FloorChange::DOWN — blocked
+                    ground(102, 100), // target
+                    ground(100, 99),  // bypass route: north
+                    ground(101, 99),  // bypass route: north-east
+                ],
+                towns: vec![],
+                waypoints: vec![],
+            };
+            (map, items)
+        };
+
+        let (otbm, items) = fc_map();
+        let sm = StaticMap::from_formats(&otbm, &items);
+        let (mut chunks, _meta) = sm.into_chunks_and_meta();
+
+        let start = Position::new(100, 100, 7);
+        let target = Position::new(102, 100, 7);
+        let params = FindPathParams {
+            full_search: false,
+            clear_sight: false,
+            max_search_dist: 30,
+        };
+        let condition: FrozenPathingConditionCall = Box::new(move |p| p == target);
+
+        let path = chunks.get_path_matching(start, target, &[], &params, condition);
+
+        assert!(!path.is_empty(), "A* must find a detour around the hole tile");
+
+        // Trace the path and verify no intermediate step lands on the hole tile.
+        let hole_x = 101i32;
+        let hole_y = 100i32;
+        let mut cur = start;
+        for &dir in &path {
+            let (dx, dy) = dir.delta();
+            cur = Position::new(
+                (i32::from(cur.x) + dx) as u16,
+                (i32::from(cur.y) + dy) as u16,
+                cur.z,
+            );
+            assert!(
+                i32::from(cur.x) != hole_x || i32::from(cur.y) != hole_y,
+                "path must not route through the hole tile at (101, 100); intermediate step landed on ({}, {})",
+                cur.x, cur.y,
+            );
+        }
     }
 }

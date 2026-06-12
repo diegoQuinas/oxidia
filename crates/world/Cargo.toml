@@ -13,4 +13,6 @@ protocol.workspace = true
 formats.workspace = true
 rand = "0.8"
 mlua.workspace = true
+serde.workspace = true
 roxmltree.workspace = true
+bincode.workspace = true

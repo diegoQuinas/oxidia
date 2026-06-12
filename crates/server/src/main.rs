@@ -14,6 +14,7 @@ use persistence::Store;
 use protocol::rsa::RsaPrivateKey;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use world::map::StaticMap;
 
 use config::Config;
 use game_service::handle_game;
@@ -60,35 +61,48 @@ async fn main() -> Result<()> {
         motd_num: 1,
     });
 
-    // Load the world for the game port.
+    // Load items.otb + items.xml for the item catalogue (needed by game_service).
     let items_bytes =
         std::fs::read("reference/tfs/data/items/items.otb").context("reading items.otb")?;
-    let map_path = &cfg.world.map_path;
     let mut items = formats::otb::parse(&items_bytes).context("parsing items.otb")?;
-    // Merge items.xml (floorChange, etc.) onto the otb dictionary so the live
-    // world has stair/floor-change data on its tiles.
     let items_xml_bytes = std::fs::read_to_string("reference/tfs/data/items/items.xml")
         .context("reading items.xml")?;
     let items_xml =
         formats::items_xml::parse_items_xml(&items_xml_bytes).context("parsing items.xml")?;
     formats::items_xml::merge_items_xml(&mut items, &items_xml);
-    // A missing or unparseable map is fatal: the server must not start without a
-    // world (mirrors TFS `startupErrorMessage` on `loadMainMap` failure). The
-    // full real map is ~119 MB and takes tens of seconds to parse, so announce
-    // it — otherwise startup looks hung.
-    info!(map_path, "loading world map (large maps take a while)…");
-    let map_bytes = std::fs::read(map_path).with_context(|| {
-        format!("map file '{map_path}' could not be read — set [world].map_path to a valid .otbm")
-    })?;
-    let map = formats::otbm::parse(&map_bytes)
-        .with_context(|| format!("parsing map file '{map_path}'"))?;
-    let mut static_map = world::map::StaticMap::from_formats_with_spawn(
-        &map,
-        &items,
-        cfg.world.spawn_town.as_deref(),
-    );
+
+    // Read world metadata from the prechunker's output: spawn position + towns.
+    let meta_path = "data/chunks/meta.bin";
+    let (spawn, towns) = std::fs::read(meta_path)
+        .with_context(|| {
+            format!(
+                "reading {meta_path} — run `cargo run --bin prechunk -- <map.otbm> <items.otb>` first"
+            )
+        })
+        .and_then(|bytes| {
+            bincode::deserialize::<(world::Position, Vec<formats::otbm::Town>)>(&bytes)
+                .context("deserializing world meta")
+        })?;
+
+    // Resolve spawn by config's spawn_town, or use the prechunker's default.
+    let spawn = if let Some(ref name) = cfg.world.spawn_town {
+        towns
+            .iter()
+            .find(|t| t.name == *name)
+            .map(|t| world::Position::new(t.x, t.y, t.z))
+            .unwrap_or(spawn)
+    } else {
+        spawn
+    };
+
+    // Build a minimal StaticMap with item metadata populated. Tiles are empty —
+    // the game actor loads chunks on demand (PR 3). The StaticMap carries only
+    // the item catalogue, spawn point, and town data needed by game_service.
+    let mut static_map = StaticMap::new_empty(spawn, towns);
     static_map.load_item_metadata(&items, &items_xml);
-    let static_map = std::sync::Arc::new(static_map);
+    let (chunks, meta) = static_map.into_chunks_and_meta();
+    let meta = std::sync::Arc::new(meta);
+
     let actions_xml = std::fs::read_to_string("config/lua/actions.xml").unwrap_or_else(|e| {
         warn!(%e, "config/lua/actions.xml not found — script hooks disabled");
         String::new()
@@ -102,14 +116,16 @@ async fn main() -> Result<()> {
     };
     let monsters_xml = std::fs::read_to_string("config/monsters.xml").unwrap_or_default();
     let spawns_xml = std::fs::read_to_string("data/world/map1-spawn.xml").unwrap_or_default();
+    let monsters_data_dir = Some(std::path::PathBuf::from("data/monster"));
     let game_cfg = world::game::GameConfig {
         lua_scripts_dir,
         actions_xml,
         monsters_xml,
         spawns_xml,
+        monsters_data_dir,
     };
-    let (world_handle, mut save_rx) = world::game::spawn(static_map, game_cfg);
-    info!(spawn = ?world_handle.map.spawn(), "world loaded");
+    let (world_handle, mut save_rx) = world::game::spawn(chunks, meta.clone(), game_cfg);
+    info!(spawn = ?world_handle.meta.spawn(), "world loaded");
 
     // Background save worker: drains save records emitted by the world actor on
     // logout and persists them. Fields the world doesn't track (mana, level)

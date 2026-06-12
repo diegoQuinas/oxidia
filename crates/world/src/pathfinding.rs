@@ -154,7 +154,7 @@ pub fn get_path_matching(
     creatures: &[(u16, u16)],
     params: &FindPathParams,
     condition: &dyn Fn(Position) -> bool,
-    is_walkable: &dyn Fn(u16, u16) -> bool,
+    is_walkable: &mut dyn FnMut(u16, u16) -> bool,
 ) -> VecDeque<Direction> {
     let mut n = AStarNodes::new();
     if !n.add_node(
@@ -268,7 +268,7 @@ mod tests {
                 max_search_dist: 30,
             },
             &|p| p == Position::new(8, 8, 7),
-            &|x, y| x < 20 && y < 20,
+            &mut |x, y| x < 20 && y < 20,
         );
         assert!(!p.is_empty());
     }
@@ -285,7 +285,7 @@ mod tests {
                 max_search_dist: 30,
             },
             &|_| false,
-            &|x, y| x == 5 && y == 5,
+            &mut |x, y| x == 5 && y == 5,
         );
         assert!(p.is_empty());
     }

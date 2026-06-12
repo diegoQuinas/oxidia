@@ -26,6 +26,8 @@ bytes = "1"
 byteorder = "1"
 roxmltree = "0.20"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+bincode = "1"
 toml = "0.9"
 num-bigint-dig = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }

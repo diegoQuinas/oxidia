@@ -20,6 +20,9 @@ impl Game {
             Some(saved) => self.free_spawn_near(saved, id),
             None => self.free_spawn(),
         };
+        let login_chunks: Vec<crate::map::ChunkId> =
+            crate::map::chunks_around(position).into_iter().collect();
+        self.chunks.ensure_loaded(&login_chunks);
         let direction = initial.direction;
         let outfit = initial.outfit;
 
@@ -31,7 +34,7 @@ impl Game {
             if !(1..=10).contains(&slot) {
                 continue;
             }
-            if let Some(meta) = self.map.item_meta(server_id) {
+            if let Some(meta) = self.meta.item_meta(server_id) {
                 let cnt = if meta.stackable {
                     Some(count.max(1))
                 } else {
@@ -48,7 +51,7 @@ impl Game {
 
         // Restore container contents from InitialState.
         let open_containers =
-            Self::restore_containers(&initial.container_items, &inventory, &self.map);
+            Self::restore_containers(&initial.container_items, &inventory, &self.meta);
 
         self.players.insert(
             id,
@@ -62,6 +65,7 @@ impl Game {
                 health: initial.health,
                 max_health: initial.max_health,
                 fist_skill: 10,
+                race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
                 sex: initial.sex,
@@ -335,7 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_pushes_appear_to_existing_spectator() {
-        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
+        let (world, _save_rx) = spawn_from_static_map(walk_map(), GameConfig::default());
         let (tx_a, mut rx_a) = push_channel();
         let ack_a = world
             .login("A".into(), default_initial(knight()), tx_a)
@@ -357,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_login_sees_first_in_ack_others() {
-        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
+        let (world, _save_rx) = spawn_from_static_map(walk_map(), GameConfig::default());
         let (tx_a, _rx_a) = push_channel();
         world
             .login("A".into(), default_initial(knight()), tx_a)
@@ -373,7 +377,7 @@ mod tests {
 
     #[test]
     fn login_includes_visible_monster_in_others() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         // Add a monster next to spawn BEFORE the player logs in
         let _mid = add_monster(&mut g, Position::new(96, 117, 7));
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
@@ -389,7 +393,7 @@ mod tests {
 
     #[test]
     fn login_visible_monster_uses_creaturetype_monster() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let _mid = add_monster(&mut g, Position::new(96, 117, 7));
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
         let ack = g.login("Hero".into(), default_initial(knight()), tx);
@@ -416,7 +420,7 @@ mod tests {
 
     #[test]
     fn login_out_of_range_monster_not_included() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         // Monster far from spawn (outside viewport).
         let _mid = add_monster(&mut g, Position::new(200, 200, 7));
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
@@ -440,7 +444,7 @@ mod tests {
         // fix it was encoded from the raw `StaticMap` in the server layer, so the
         // relogging client was blind to dynamic ground items while online
         // spectators (fed by `merged()`) still saw them.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let drop_pos = Position::new(96, 117, 7); // adjacent to spawn, in viewport
         // A client id absent from the static encoding (ground 4526, wall 1059) so
         // its presence proves the dynamic item — not a coincidence — leaked in.
@@ -481,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn logout_pushes_remove_to_spectator() {
-        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
+        let (world, _save_rx) = spawn_from_static_map(walk_map(), GameConfig::default());
         let (tx_a, mut rx_a) = push_channel();
         world
             .login("A".into(), default_initial(knight()), tx_a)
@@ -507,7 +511,7 @@ mod tests {
     async fn shutdown_and_save_persists_online_players_then_stops_actor() {
         // Graceful shutdown through the live actor: shutdown_and_save resolves
         // once the save record is queued, and the actor stops afterwards.
-        let (world, mut save_rx) = spawn(walk_map(), GameConfig::default());
+        let (world, mut save_rx) = spawn_from_static_map(walk_map(), GameConfig::default());
         let (tx_a, _rx_a) = push_channel();
         let ack = world
             .login("Diego".into(), default_initial(wizard_outfit()), tx_a)
@@ -543,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_login_on_occupied_spawn_gets_free_tile() {
-        let (world, _save_rx) = spawn(walk_map(), GameConfig::default());
+        let (world, _save_rx) = spawn_from_static_map(walk_map(), GameConfig::default());
         let (tx_a, _ra) = push_channel();
         let ack_a = world
             .login("A".into(), default_initial(knight()), tx_a)
@@ -566,7 +570,7 @@ mod tests {
         // standing on that tile, login must bump them to a free adjacent tile —
         // you never log in on top of another creature. (Stair/height co-occupancy
         // is allowed during movement, but NOT on login.)
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let saved = Position::new(95, 117, 7);
         let (_occupant, _ro) = add_player(&mut g, saved); // someone is already there
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
@@ -585,7 +589,7 @@ mod tests {
         let ps = g.players.get(&ack.snapshot.id).expect("player must exist");
         assert_ne!(ps.position, saved, "must not log in on top of the occupant");
         assert!(
-            g.map.is_walkable(ps.position),
+            g.chunks.is_walkable(ps.position),
             "bumped tile must be walkable"
         );
         let sharing = g
@@ -603,7 +607,7 @@ mod tests {
     fn login_with_initial_position_places_player_at_that_position() {
         // RED: Game::login accepts InitialState { position: Some(p) } and places
         // the player at p with the given outfit and health.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
         let pos = Position::new(96, 117, 7);
         let outfit = wizard_outfit();
@@ -642,9 +646,9 @@ mod tests {
     fn login_with_no_position_falls_back_to_free_spawn() {
         // RED: Game::login with InitialState { position: None } resolves position
         // from free_spawn(), using default outfit/health for a new player.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
-        let spawn = g.map.spawn();
+        let spawn = g.meta.spawn();
         let initial = InitialState {
             position: None,
             direction: Direction::South,
@@ -668,7 +672,7 @@ mod tests {
     fn logout_with_save_tx_emits_save_record() {
         // RED: Game::logout emits a SaveRecord on save_tx when one is set.
         // The record must carry the player's current name/position/direction/outfit/health.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
         g.save_tx = Some(save_tx);
 
@@ -689,6 +693,7 @@ mod tests {
                 health: 77,
                 max_health: 150,
                 fist_skill: 10,
+                race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
                 sex: 1,
@@ -724,7 +729,7 @@ mod tests {
         // Graceful shutdown: save_all must emit a SaveRecord for EVERY online
         // player (carrying their live outfit/position) and leave them in the map
         // — it persists without logging anyone out.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
         g.save_tx = Some(save_tx);
 
@@ -744,6 +749,7 @@ mod tests {
                 health: 90,
                 max_health: 150,
                 fist_skill: 10,
+                race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
                 sex: 1,
@@ -779,6 +785,7 @@ mod tests {
                 health: 145,
                 max_health: 145,
                 fist_skill: 10,
+                race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
                 sex: 0,
@@ -837,7 +844,7 @@ mod tests {
     fn save_all_with_no_save_tx_is_a_noop() {
         // With no save channel wired, save_all must not panic (and there is
         // nowhere for records to go).
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
         let id = g.next_id;
         g.next_id += 1;
@@ -853,6 +860,7 @@ mod tests {
                 health: 100,
                 max_health: 100,
                 fist_skill: 10,
+                race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
                 sex: 1,
@@ -884,7 +892,7 @@ mod tests {
     fn push_to_dead_channel_reap_also_emits_save_record() {
         // RED: The internal dead-session reap path (push() -> logout()) also emits
         // a SaveRecord when save_tx is set.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
         g.save_tx = Some(save_tx);
 
@@ -897,7 +905,7 @@ mod tests {
             id,
             PlayerState {
                 name: "Ghost".into(),
-                position: g.map.spawn(),
+                position: g.meta.spawn(),
                 direction: Direction::South,
                 outfit: knight(),
                 push_tx: tx,
@@ -905,6 +913,7 @@ mod tests {
                 health: 50,
                 max_health: 150,
                 fist_skill: 10,
+                race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
                 sex: 1,
@@ -935,7 +944,7 @@ mod tests {
 
     #[test]
     fn change_outfit_updates_player_state() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (id, _rx) = add_player(&mut g, Position::new(95, 117, 7));
         let new_outfit = Outfit {
             look_type: 130,
@@ -952,7 +961,7 @@ mod tests {
 
     #[test]
     fn change_outfit_broadcasts_0x8e_to_player_and_spectator() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         // Both players at the same tile so they are each other's spectators.
         let (id, mut rx_self) = add_player(&mut g, Position::new(95, 117, 7));
         let (_spec, mut rx_spec) = add_player(&mut g, Position::new(95, 117, 7));
@@ -1000,7 +1009,7 @@ mod tests {
 
     #[test]
     fn change_outfit_unknown_id_is_noop() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         // Should not panic; game has no players.
         g.do_change_outfit(
             0xDEAD_BEEF,
@@ -1018,7 +1027,7 @@ mod tests {
 
     #[test]
     fn request_outfit_sends_0xc8_to_requester_only() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (id, mut rx_self) = add_player(&mut g, Position::new(95, 117, 7));
         let (_spec, mut rx_spec) = add_player(&mut g, Position::new(95, 117, 7));
         // Drain any login-side packets first.
@@ -1039,7 +1048,7 @@ mod tests {
 
     #[test]
     fn request_outfit_male_gets_male_catalog() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (id, mut rx) = add_player(&mut g, Position::new(95, 117, 7)); // sex = 1 (male)
         while rx.try_recv().is_ok() {}
         g.do_request_outfit(id);
@@ -1059,7 +1068,7 @@ mod tests {
 
     #[test]
     fn request_outfit_female_gets_female_catalog() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (id, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&id).unwrap().sex = 0; // female
         while rx.try_recv().is_ok() {}
@@ -1081,7 +1090,7 @@ mod tests {
     fn sex_is_set_from_initial_state_on_login() {
         // RED: InitialState must carry a `sex` field that is stored in the live
         // PlayerState and exposed via do_request_outfit catalog selection later.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
         let initial = InitialState {
             position: None,
@@ -1104,7 +1113,7 @@ mod tests {
     #[test]
     fn sex_is_emitted_in_save_record_on_logout() {
         // RED: logout must carry sex into SaveRecord so the server can persist it.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
         g.save_tx = Some(save_tx);
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
@@ -1136,7 +1145,7 @@ mod tests {
 
     #[test]
     fn introduce_ghost_gm_has_walkthrough_byte_set() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (gm, _rg) = add_player(&mut g, Position::new(95, 117, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
         let (viewer, _rv) = add_player(&mut g, Position::new(96, 117, 7));
@@ -1164,7 +1173,7 @@ mod tests {
     fn ghost_not_persisted_in_save_record() {
         // When saving, the ghost flag must NOT appear in the SaveRecord.
         // SaveRecord only has explicit fields — ghost is runtime-only.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveRecord>();
         g.save_tx = Some(save_tx);
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
@@ -1174,7 +1183,7 @@ mod tests {
             id,
             PlayerState {
                 name: "GhostGuy".into(),
-                position: g.map.spawn(),
+                position: g.meta.spawn(),
                 direction: Direction::South,
                 outfit: knight(),
                 push_tx: tx,
@@ -1182,6 +1191,7 @@ mod tests {
                 health: 150,
                 max_health: 150,
                 fist_skill: 10,
+                race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
                 sex: 1,
@@ -1216,7 +1226,7 @@ mod tests {
     #[test]
     fn ghost_resets_on_login() {
         // Fresh login must have ghost = false.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
         let initial = InitialState {
             position: Some(Position::new(95, 117, 7)),
@@ -1245,7 +1255,7 @@ mod tests {
 
     #[test]
     fn creature_speed_returns_player_speed_from_state() {
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (id, _rx) = add_player(&mut g, Position::new(95, 117, 7));
         // Default speed from add_player() -> 220
         assert_eq!(g.creature_speed(id), 220, "default speed must be 220");
@@ -1272,7 +1282,7 @@ mod tests {
     #[test]
     fn noclip_resets_on_login() {
         // Fresh login must have noclip = false.
-        let mut g = Game::new(walk_map());
+        let mut g = Game::from_static_map_arc(walk_map());
         let (tx, _rx) = mpsc::channel(super::super::PUSH_CAPACITY);
         let initial = InitialState {
             position: Some(Position::new(95, 117, 7)),

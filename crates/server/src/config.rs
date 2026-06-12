@@ -26,6 +26,9 @@ pub struct ServerConfig {
 pub struct WorldConfig {
     /// Path to the `.otbm` map file, relative to the working directory or
     /// absolute. The server refuses to start if it is missing or fails to parse.
+    /// In the chunked-map world (PR 2+) this is used by the `prechunk` binary
+    /// at build time, not at server boot.
+    #[allow(dead_code)]
     pub map_path: String,
     /// Name of the town whose temple players spawn at. When absent or unknown,
     /// the world falls back to the map's first town.

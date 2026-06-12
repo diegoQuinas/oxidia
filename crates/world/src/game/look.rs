@@ -65,7 +65,7 @@ impl Game {
         gm: bool,
     ) -> Option<String> {
         let sid = self.merged_server_id(pos, idx)?;
-        let meta = self.map.item_meta(sid)?;
+        let meta = self.meta.item_meta(sid)?;
         let count = u32::from(self.merged_count(pos, idx).unwrap_or(1).max(1));
 
         let mut dist = (i32::from(looker_pos.x) - i32::from(pos.x))
@@ -136,6 +136,7 @@ impl Game {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::map::StaticMap;
     use formats::items_xml::{FloorChange, ItemsXml, parse_items_xml};
     use formats::otb::{ItemType as OtbItemType, ItemsOtb};
     use formats::otbm::{MapItem, MapTile, OtbmMap, Town};
@@ -146,7 +147,7 @@ mod tests {
 
     #[test]
     fn do_look_ground_item_adjacent_shows_article_name_and_weight() {
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         // Looker at (100,100,7), stone is at (101,100,7) — distance 1 (adjacent).
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         // stackpos 1 = stone on tile (101,100,7)
@@ -163,7 +164,7 @@ mod tests {
 
     #[test]
     fn do_look_ground_item_far_away_omits_weight() {
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         // Looker at (100,100,7). Put another player at (103,100,7) to create a
         // position 3 tiles away. Actually just move the looker far from the stone.
         // Stone is at (101,100,7). Place looker at (103,100,7) → dist = 2.
@@ -181,7 +182,7 @@ mod tests {
     #[test]
     fn do_look_non_pickupable_item_no_weight_line() {
         // Ground item (sid 100) is not pickupable → no weight line even when adjacent.
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         // stackpos 0 = ground at (100,100,7) itself
         g.do_look(looker, 100, 100, 7, 0);
@@ -195,7 +196,7 @@ mod tests {
     #[test]
     fn do_look_stackable_item_with_count_shows_count_and_plural() {
         // gold coins (sid 300) at (102,100,7), count 50. show_count true.
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         // stackpos 1 = gold coins at (102,100,7)
         g.do_look(looker, 102, 100, 7, 1);
@@ -206,7 +207,7 @@ mod tests {
 
     #[test]
     fn do_look_other_player_shows_name_level_and_pronoun() {
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         // Add a target player with a distinctive name, placed adjacent.
         let (tx2, _rx2) = mpsc::channel(PUSH_CAPACITY);
@@ -224,6 +225,7 @@ mod tests {
                 health: 150,
                 max_health: 150,
                 fist_skill: 10,
+                race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
                 sex: 0, // female
@@ -267,7 +269,7 @@ mod tests {
 
     #[test]
     fn do_look_self_shows_yourself() {
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         // pre_creature_len = 1 (ground), stackpos 1 = looker itself.
         g.do_look(looker, 100, 100, 7, 1);
@@ -278,7 +280,7 @@ mod tests {
 
     #[test]
     fn do_look_gamemaster_item_appends_item_id_and_position() {
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         // Elevate to GM.
         g.players.get_mut(&looker).unwrap().gamemaster = true;
@@ -293,7 +295,7 @@ mod tests {
 
     #[test]
     fn do_look_non_gamemaster_no_debug_suffix() {
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         // gamemaster = false (default)
         g.do_look(looker, 101, 100, 7, 1);
@@ -399,7 +401,7 @@ mod tests {
         let mut sm = StaticMap::from_formats(&map, &otb);
         sm.load_item_metadata(&otb, &xml);
         let sm = Arc::new(sm);
-        let mut g = Game::new(sm);
+        let mut g = Game::from_static_map_arc(sm);
 
         // pre_creature_len = 2 (ground + ladder). No creatures on (101,100,7).
         // Ladder is always_on_top (top group) → pre_creature → stackpos 1.
@@ -499,7 +501,7 @@ mod tests {
         let mut sm = StaticMap::from_formats(&map, &otb);
         sm.load_item_metadata(&otb, &xml);
         let sm = Arc::new(sm);
-        let mut g = Game::new(sm);
+        let mut g = Game::from_static_map_arc(sm);
 
         // Looker at (100,100,7), second player on (101,100,7) on the ladder tile.
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
@@ -592,7 +594,7 @@ mod tests {
         let mut sm = StaticMap::from_formats(&map, &otb);
         sm.load_item_metadata(&otb, &xml);
         let sm = Arc::new(sm);
-        let mut g = Game::new(sm);
+        let mut g = Game::from_static_map_arc(sm);
         // Add a GM player at (100,100,7)
         let (gm, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
@@ -680,7 +682,7 @@ mod tests {
         let mut sm = StaticMap::from_formats(&map, &otb);
         sm.load_item_metadata(&otb, &xml);
         let sm = Arc::new(sm);
-        let mut g = Game::new(sm);
+        let mut g = Game::from_static_map_arc(sm);
         // Add GM at (101,100,7) — adjacent to the spawn tile
         let (gm, mut rx) = add_player(&mut g, Position::new(101, 100, 7));
         g.players.get_mut(&gm).unwrap().gamemaster = true;
@@ -699,7 +701,7 @@ mod tests {
 
     #[test]
     fn do_look_out_of_viewport_pushes_nothing() {
-        let mut g = Game::new(look_map());
+        let mut g = Game::from_static_map_arc(look_map());
         // Looker at (100,100,7). A tile that is far out of the viewport
         // (dx = 50 > 9) must produce no packet.
         let (looker, mut rx) = add_player(&mut g, Position::new(100, 100, 7));

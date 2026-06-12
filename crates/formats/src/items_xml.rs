@@ -8,10 +8,12 @@ use std::collections::HashMap;
 
 use crate::FormatError;
 
+use serde::{Deserialize, Serialize};
+
 /// Per-item floor-change directions, mirroring TFS `TILESTATE_FLOORCHANGE_*`
 /// (`tile.h`). A staircase item carries one or more of these; the destination is
 /// resolved by `world::map::StaticMap::resolve_floor_change`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FloorChange(u8);
 
 impl FloorChange {
@@ -354,5 +356,20 @@ mod tests {
         let xml = r#"<items><item id="100" name="grass"/></items>"#;
         let parsed = parse_items_xml(xml).unwrap();
         assert!(parsed.attrs(9999).is_none(), "absent item must return None");
+    }
+
+    #[test]
+    fn floor_change_serde_round_trip() {
+        let fc = FloorChange::DOWN;
+        let bytes = bincode::serialize(&fc).expect("serialize");
+        let back: FloorChange = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(fc, back);
+
+        let mut fc = FloorChange::NONE;
+        fc.insert(FloorChange::NORTH);
+        fc.insert(FloorChange::EAST);
+        let bytes = bincode::serialize(&fc).expect("serialize");
+        let back: FloorChange = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(fc, back);
     }
 }

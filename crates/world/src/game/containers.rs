@@ -36,7 +36,7 @@ impl Game {
     pub(super) fn restore_containers(
         rows: &[(u8, String, u16, u8)],
         inventory: &[Option<InvItem>; 10],
-        map: &StaticMap,
+        meta: &WorldMeta,
     ) -> [Option<OpenContainer>; 16] {
         // Group rows by inv_slot, sorting by the numeric path so items are in order.
         let mut by_slot: std::collections::HashMap<u8, Vec<(usize, u16, u8)>> = Default::default();
@@ -56,17 +56,17 @@ impl Game {
         for (slot_0, inv_item) in inventory.iter().enumerate() {
             let inv_slot = (slot_0 + 1) as u8;
             let Some(it) = inv_item else { continue };
-            let Some(meta) = map.item_meta(it.server_id) else {
+            let Some(item_meta) = meta.item_meta(it.server_id) else {
                 continue;
             };
-            if !meta.is_container {
+            if !item_meta.is_container {
                 continue;
             }
             let items_for_slot = by_slot.remove(&inv_slot).unwrap_or_default();
             let items: Vec<ContainerItem> = items_for_slot
                 .into_iter()
                 .filter_map(|(_, sid, cnt)| {
-                    let m = map.item_meta(sid)?;
+                    let m = meta.item_meta(sid)?;
                     Some(ContainerItem {
                         server_id: sid,
                         client_id: m.client_id,
@@ -78,9 +78,9 @@ impl Game {
             if cid < 16 {
                 result[cid as usize] = Some(OpenContainer {
                     server_id: it.server_id,
-                    client_id: meta.client_id,
-                    capacity: meta.container_capacity.max(1),
-                    name: meta.name.clone(),
+                    client_id: item_meta.client_id,
+                    capacity: item_meta.container_capacity.max(1),
+                    name: item_meta.name.clone(),
                     items,
                     source: ContainerSource::Slot(inv_slot),
                     is_open: false,
@@ -151,7 +151,7 @@ impl Game {
         let wire_items: Vec<protocol::container::ContainerWireItem> =
             oc.items.iter().map(|i| i.wire()).collect();
         let animated = self
-            .map
+            .meta
             .item_meta(server_id)
             .map(|m| m.animated)
             .unwrap_or(false);
@@ -237,7 +237,7 @@ impl Game {
                 .dynamic
                 .get(&(pos_x, pos_y, pos_z))
                 .map(|st| st.pre_creature_len)
-                .unwrap_or_else(|| self.map.tile_pre_creature_len(pos));
+                .unwrap_or_else(|| self.chunks.tile_pre_creature_len(pos));
             let creatures_len = self.creatures_on(pos).len();
             let sp = stackpos as usize;
             let src_idx = if sp < pre {
@@ -253,7 +253,7 @@ impl Game {
             (sid, ContainerSource::Ground(pos)) // ground container, tracked by tile; not persisted
         };
 
-        let Some(meta) = self.map.item_meta(server_id) else {
+        let Some(meta) = self.meta.item_meta(server_id) else {
             return;
         };
         if !meta.is_container {
@@ -515,19 +515,13 @@ impl Game {
                     }
                 };
                 let stackable = self
-                    .map
+                    .meta
                     .item_meta(_server_id)
                     .map(|m| m.stackable)
                     .unwrap_or(false);
                 let creatures = self.creatures_on(pos).len();
-                let from_stackpos = if idx < pre {
-                    idx
-                } else {
-                    idx + creatures
-                }
-                .min(9) as u8;
-                let Some((_moved, removed_fully)) =
-                    self.take_from_ground(pos, idx, 1, stackable)
+                let from_stackpos = if idx < pre { idx } else { idx + creatures }.min(9) as u8;
+                let Some((_moved, removed_fully)) = self.take_from_ground(pos, idx, 1, stackable)
                 else {
                     return;
                 };
@@ -715,7 +709,7 @@ impl Game {
             let oc = p.open_containers[parent_cid as usize].as_ref()?;
             oc.items.get(slot_idx)?.server_id
         };
-        let meta = self.map.item_meta(sid)?;
+        let meta = self.meta.item_meta(sid)?;
         if !meta.is_container {
             return None;
         }
@@ -863,7 +857,7 @@ impl Game {
                 .get(&id)
                 .and_then(|p| p.open_containers[fc as usize].as_ref())
                 .and_then(|oc| oc.items.get(fs))
-                .and_then(|it| self.map.item_meta(it.server_id))
+                .and_then(|it| self.meta.item_meta(it.server_id))
                 .is_some_and(|m| m.is_container);
             let dest_cid = if moving_is_container {
                 tc
@@ -925,7 +919,7 @@ impl Game {
                 .dynamic
                 .get(&(from_pos.x, from_pos.y, from_pos.z))
                 .map(|st| st.pre_creature_len)
-                .unwrap_or_else(|| self.map.tile_pre_creature_len(from_pos));
+                .unwrap_or_else(|| self.chunks.tile_pre_creature_len(from_pos));
             let sp = from_stackpos as usize;
             let src_idx = if sp < pre {
                 sp
@@ -938,7 +932,7 @@ impl Game {
             let Some(src_sid) = self.merged_server_id(from_pos, src_idx) else {
                 return;
             };
-            let Some(meta) = self.map.item_meta(src_sid) else {
+            let Some(meta) = self.meta.item_meta(src_sid) else {
                 return;
             };
             if !meta.moveable {
@@ -995,17 +989,17 @@ impl Game {
                 return;
             };
             let player_pos = p.position;
-            if player_pos.z != to_pos.z || !self.map.can_throw_object_to(player_pos, to_pos) {
+            if player_pos.z != to_pos.z || !self.chunks.can_throw_object_to(player_pos, to_pos) {
                 self.push_cannot_move(id, "You cannot throw there.");
                 return;
             }
-            if self.map.tile_pre_creature_len(to_pos) == 0
-                && self.map.tile_stack_clone(to_pos).is_none()
+            if self.chunks.tile_pre_creature_len(to_pos) == 0
+                && self.chunks.tile_stack_clone(to_pos).is_none()
             {
                 self.push_cannot_move(id, "You cannot put that there.");
                 return;
             }
-            if self.map.is_blocked(to_pos) {
+            if self.chunks.is_blocked(to_pos) {
                 self.push_cannot_move(id, "You cannot put that there.");
                 return;
             }
@@ -1016,7 +1010,7 @@ impl Game {
             };
             self.close_orphaned_nested_container(id, fc, fs);
             let meta_stackable = self
-                .map
+                .meta
                 .item_meta(item.server_id)
                 .map(|m| m.stackable)
                 .unwrap_or(false);
@@ -1125,7 +1119,7 @@ impl Game {
 
             // Check equip slot compatibility.
             let admits = self
-                .map
+                .meta
                 .item_meta(item.server_id)
                 .and_then(|m| m.equip_slot)
                 .map(|eq| eq.admits(inv_slot))
@@ -1158,7 +1152,7 @@ mod tests {
         // contents on the old slot window. The window follows the item to the
         // ground tile (contents intact) and closes if the throw lands out of
         // range — exactly one window, no duplicate, no empty ground bag.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         {
             let p = g.players.get_mut(&player).unwrap();
@@ -1223,7 +1217,7 @@ mod tests {
         // Issue 3: a ground container auto-closes when the player walks more than
         // one tile away; an inventory container travels with the player and stays
         // open. Player starts on (102,100,7) with both open.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(102, 100, 7));
         {
             let p = g.players.get_mut(&player).unwrap();
@@ -1293,7 +1287,7 @@ mod tests {
         // the same source, and the empty stale cid shadows the one holding the item
         // on reopen -> the item is stranded. The fix keeps exactly one nested cid,
         // open, holding the item.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         g.players.get_mut(&player).unwrap().inventory[2] = Some(InvItem {
             server_id: 600,
@@ -1377,7 +1371,7 @@ mod tests {
         // (vanishing from the parent window, no false re-add) and be retrievable
         // by opening that nested bag. Parent = cid 0 (inventory slot 3) holding
         // [stone@slot0, inner-backpack@slot1].
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         {
             let p = g.players.get_mut(&player).unwrap();
@@ -1474,7 +1468,7 @@ mod tests {
         // Issue 4: using (0x82) a container that is already open must CLOSE it
         // (TFS actions.cpp toggle), not re-send another 0x6E open. A third use
         // re-opens it. Source is inventory slot 3 (pos_x=0xFFFF, pos_y=3, no 0x40).
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         // Put the backpack (sid 600) in inventory slot 3.
         g.players.get_mut(&player).unwrap().inventory[2] = Some(InvItem {
@@ -1578,7 +1572,7 @@ mod tests {
             b"test = {}\ncall_count = 0\nfunction test.onUse(args) call_count = call_count + 1 return true end",
         )
         .unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         g.registry = XmlRegistry::from_actions_xml(
             r#"<actions><action itemid="200" script="test.onUse"/></actions>"#,
@@ -1608,7 +1602,7 @@ mod tests {
             b"test = {}\ncall_count = 0\nfunction test.onUse(args) call_count = call_count + 1 return true end",
         )
         .unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         // Empty registry — no items registered.
         g.registry = XmlRegistry::default();
@@ -1632,7 +1626,7 @@ mod tests {
         // The tile-to-tile move re-keys the window to the new tile and auto-closes
         // it when it lands out of range. Backpack on (100,110,7); player adjacent
         // on (100,111,7); throw to (100,113,7) (2 tiles from the player).
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let (player, mut rx) = add_player(&mut g, Position::new(100, 111, 7));
         // Open the ground backpack window (cid keyed to its tile).
         g.players.get_mut(&player).unwrap().open_containers[0] = Some(OpenContainer {
@@ -1682,7 +1676,7 @@ mod tests {
             b"test = {}\nfunction test.onUse(args) do_teleport(args.player_id, args.pos_x, args.pos_y, args.pos_z - 1) return true end",
         )
         .unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         g.registry = XmlRegistry::from_actions_xml(
             r#"<actions><action itemid="200" script="test.onUse"/></actions>"#,
@@ -1703,6 +1697,38 @@ mod tests {
     }
 
     #[test]
+    fn lua_onuse_teleports_player_downstairs_for_hole_433() {
+        // RED: Item 433 (hole) is not yet registered in the teleport dispatch.
+        // After registering 433 → teleport.onUse, using the hole must teleport
+        // the player one floor down (z+1).
+        let script_dir = lua_test_dir("teleport_down_433");
+        std::fs::write(
+            script_dir.join("test.lua"),
+            b"test = {}\nfunction test.onUse(args) do_teleport(args.player_id, args.pos_x, args.pos_y, args.pos_z + 1) return true end",
+        )
+        .unwrap();
+        let mut g = Game::from_static_map_arc(move_map());
+        g.lua = Some(LuaRuntime::new(&script_dir));
+        g.registry = XmlRegistry::from_actions_xml(
+            r#"<actions><action itemid="433" script="test.onUse"/></actions>"#,
+        )
+        .unwrap();
+        // Spawn adjacent to the hole at (107,100,7) so it's in range.
+        let (player, mut rx) = add_player(&mut g, Position::new(106, 100, 7));
+        drain(&mut rx);
+
+        // Use the hole (sid 433) at (107,100,7), stackpos 1.
+        g.do_use_item(player, 107, 100, 7, 1, 0);
+
+        assert_eq!(
+            g.players[&player].position,
+            Position::new(107, 100, 8),
+            "player must be teleported downstairs (z+1) after using hole item 433"
+        );
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    #[test]
     fn lua_error_during_onuse_does_not_crash_server() {
         // RED: a Lua script that calls error() must be caught by the dispatch
         // pcall and logged, not propagated as a Rust panic.
@@ -1712,7 +1738,7 @@ mod tests {
             b"test = {}\nfunction test.onUse(args) error('boom') return true end",
         )
         .unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         g.registry = XmlRegistry::from_actions_xml(
             r#"<actions><action itemid="200" script="test.onUse"/></actions>"#,
@@ -1753,7 +1779,7 @@ mod tests {
     ) -> (Game, u32, mpsc::Receiver<Vec<u8>>, std::path::PathBuf) {
         let script_dir = lua_test_dir("feed_flow");
         std::fs::write(script_dir.join("food.lua"), script_content).unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         g.registry = XmlRegistry::from_actions_xml(feed_test_registry_xml()).unwrap();
         let (player, rx) = add_player(&mut g, Position::new(100, 100, 7));
@@ -1840,7 +1866,7 @@ mod tests {
         // Create a separate registry that maps sid 200 to food.
         let script_dir = lua_test_dir("feed_nonstack");
         std::fs::write(script_dir.join("food.lua"), &script).unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         g.registry = XmlRegistry::from_actions_xml(
             r##"<actions><action itemid="200" script="food.onUse"/></actions>"##,
@@ -1966,7 +1992,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         // Registry: sid 300 → food.onUse, sid 200 → teleport.onUse
         g.registry = XmlRegistry::from_actions_xml(
@@ -2055,7 +2081,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         g.registry = XmlRegistry::from_actions_xml(
             r#"<actions><action itemid="300" script="food.onUse"/></actions>"#,
@@ -2193,7 +2219,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         g.registry = XmlRegistry::from_actions_xml(
             r##"<actions><action itemid="300" script="food.onUse"/></actions>"##,
@@ -2214,8 +2240,13 @@ mod tests {
         g.do_use_item(player, 0xFFFF, 1, 0, 0, 0);
 
         let pkts = drain(&mut rx);
-        let creature_say: Vec<&Vec<u8>> = pkts.iter().filter(|p| p.first() == Some(&0xAA)).collect();
-        assert!(!creature_say.is_empty(), "at least one 0xAA packet must be broadcast; pkts: {:?}", pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>());
+        let creature_say: Vec<&Vec<u8>> =
+            pkts.iter().filter(|p| p.first() == Some(&0xAA)).collect();
+        assert!(
+            !creature_say.is_empty(),
+            "at least one 0xAA packet must be broadcast; pkts: {:?}",
+            pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
         // Verify the speak type is MonsterSay (36) at byte offset 8
         let pkt = creature_say[0];
         assert_eq!(pkt[0], 0xAA, "opcode must be 0xAA");
@@ -2239,7 +2270,7 @@ mod tests {
     fn decrement_food_ground_removes_item_and_broadcasts_0x6c() {
         // EAT-09: RED — decrement_food with Ground(pos) must remove the item
         // from the dynamic overlay and broadcast a 0x6C (full remove) packet.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         // move_map: (101,100,7) has a stone (sid 200, non-stackable) at index 1.
         let pos = Position::new(101, 100, 7);
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
@@ -2249,7 +2280,10 @@ mod tests {
         g.decrement_food(player, 200, ContainerSource::Ground(pos));
 
         // The item must be removed from the dynamic overlay.
-        let st = g.dynamic.get(&(101, 100, 7)).expect("tile must be materialized");
+        let st = g
+            .dynamic
+            .get(&(101, 100, 7))
+            .expect("tile must be materialized");
         assert!(
             !st.server_ids.contains(&200),
             "sid 200 must be removed from ground overlay"
@@ -2268,7 +2302,7 @@ mod tests {
     fn decrement_food_ground_stackable_decrements_count() {
         // EAT-09 TRIANGULATE: stackable food count > 1 on ground → count decrements
         // and 0x6B update packet is broadcast (not 0x6C remove).
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         // move_map: (102,100,7) has 10 gold coins (sid 300, stackable) at index 1.
         let pos = Position::new(102, 100, 7);
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
@@ -2277,13 +2311,17 @@ mod tests {
         g.decrement_food(player, 300, ContainerSource::Ground(pos));
 
         // Item must still be on the tile, count reduced by 1.
-        let st = g.dynamic.get(&(102, 100, 7)).expect("tile must be materialized");
-        let idx = st.server_ids.iter().position(|&sid| sid == 300).expect("sid 300 must still be present");
+        let st = g
+            .dynamic
+            .get(&(102, 100, 7))
+            .expect("tile must be materialized");
+        let idx = st
+            .server_ids
+            .iter()
+            .position(|&sid| sid == 300)
+            .expect("sid 300 must still be present");
         let remaining = st.counts[idx].unwrap_or(0);
-        assert_eq!(
-            remaining, 9,
-            "stackable count must decrement from 10 to 9"
-        );
+        assert_eq!(remaining, 9, "stackable count must decrement from 10 to 9");
 
         // A 0x6B update packet must be broadcast (not 0x6C remove).
         let pkts = drain(&mut rx);
@@ -2302,7 +2340,7 @@ mod tests {
     fn decrement_food_ground_missing_item_returns_silently() {
         // EAT-11: RED — decrement_food(Ground(pos)) with no matching item on the
         // tile must return silently without panic or packet.
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         let pos = Position::new(100, 100, 7); // ground-only tile, no items
         let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
         drain(&mut rx);
@@ -2340,7 +2378,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         g.registry = XmlRegistry::from_actions_xml(
             r##"<actions><action itemid="300" script="food.onUse"/></actions>"##,
@@ -2402,7 +2440,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut g = Game::new(move_map());
+        let mut g = Game::from_static_map_arc(move_map());
         g.lua = Some(LuaRuntime::new(&script_dir));
         // Map sid 200 (stone on ground) to food.onUse.
         g.registry = XmlRegistry::from_actions_xml(
@@ -2416,7 +2454,10 @@ mod tests {
         g.do_use_item(player, 101, 100, 7, 1, 0);
 
         // 1. Stone removed from ground.
-        let st = g.dynamic.get(&(101, 100, 7)).expect("tile must be materialized");
+        let st = g
+            .dynamic
+            .get(&(101, 100, 7))
+            .expect("tile must be materialized");
         assert!(
             !st.server_ids.contains(&200),
             "stone must be removed from ground after eating"

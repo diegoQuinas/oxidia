@@ -13,5 +13,7 @@ function teleport.onUse(args)
         do_teleport(args.player_id, args.pos_x, args.pos_y, args.pos_z + 1)
     elseif args.item_id == 384 then
         do_teleport(args.player_id, args.pos_x, args.pos_y, args.pos_z + 1)
+    elseif args.item_id == 433 then
+        do_teleport(args.player_id, args.pos_x, args.pos_y, args.pos_z + 1)
     end
 end

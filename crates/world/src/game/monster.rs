@@ -12,9 +12,11 @@
 //! reference these names; unknown names fall back to hardcoded defaults.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 
 use crate::Direction;
 use crate::Position;
+use crate::game::RaceType;
 use formats::FormatError;
 
 /// A monster blueprint loaded from `config/monsters.xml`.
@@ -30,6 +32,8 @@ pub(crate) struct MonsterType {
     pub(crate) loot: Vec<MonsterDrop>,
     /// Preferred distance from target (0 = melee, 1+ = ranged).
     pub(crate) target_distance: i32,
+    /// Creature race for splash fluid on hit/death. `None` = no splash.
+    pub(crate) race: Option<RaceType>,
 }
 
 /// Parse `<monsters>` XML and return a name-indexed map.
@@ -76,6 +80,20 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
             .attribute("attack")
             .and_then(|s| s.parse().ok())
             .unwrap_or(7);
+        let race = node.attribute("race").and_then(|s| match s {
+            "blood" => Some(RaceType::Blood),
+            "venom" => Some(RaceType::Venom),
+            "fire" => Some(RaceType::Fire),
+            "energy" => Some(RaceType::Energy),
+            "drown" => Some(RaceType::Drown),
+            "physical" => Some(RaceType::Physical),
+            "earth" => Some(RaceType::Earth),
+            "holy" => Some(RaceType::Holy),
+            "death" => Some(RaceType::Death),
+            "undead" => Some(RaceType::Undead),
+            "diamond" => Some(RaceType::Diamond),
+            _ => None,
+        }).or(Some(RaceType::Blood));
         map.insert(
             name.to_ascii_lowercase(),
             MonsterType {
@@ -87,9 +105,155 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
                 attack,
                 loot: vec![],
                 target_distance: 0,
+                race,
             },
         );
     }
+    Ok(map)
+}
+
+/// Parse the individual monster XML files under `data_dir`.
+///
+/// Reads the root `monsters.xml` index, then for each entry loads the
+/// individual monster XML and extracts race, look type, health, speed,
+/// and attack values — fields missing from the flat `config/monsters.xml`.
+///
+/// Expected individual format:
+/// ```xml
+/// <monster name="Rat" race="blood" speed="134">
+///   <health now="20" max="20"/>
+///   <look type="21" corpse="5964"/>
+///   <attacks>
+///     <attack name="melee" attack="7"/>
+///   </attacks>
+/// </monster>
+/// ```
+pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, MonsterType>, FormatError> {
+    let root_xml = std::fs::read_to_string(data_dir.join("monsters.xml")).map_err(|e| {
+        FormatError::InvalidNode {
+            what: Box::leak(format!("cannot read monsters.xml index: {e}").into_boxed_str()),
+        }
+    })?;
+    let doc = roxmltree::Document::parse(&root_xml).map_err(|_| FormatError::InvalidNode {
+        what: "monsters.xml index is not well-formed",
+    })?;
+
+    let mut map = HashMap::new();
+
+    for node in doc.descendants().filter(|n| n.has_tag_name("monster")) {
+        let name = node
+            .attribute("name")
+            .ok_or(FormatError::InvalidNode {
+                what: "monster entry missing name attribute",
+            })?
+            .to_string();
+
+        let file = node.attribute("file").ok_or(FormatError::InvalidNode {
+            what: "monster entry missing file attribute",
+        })?;
+
+        // Read and parse the individual monster XML
+        let individual_path = data_dir.join(file);
+        let individual_xml = std::fs::read_to_string(&individual_path).map_err(|e| {
+            FormatError::InvalidNode {
+                what: Box::leak(
+                    format!("cannot read {}: {e}", individual_path.display()).into_boxed_str(),
+                ),
+            }
+        })?;
+
+        let ind_doc =
+            roxmltree::Document::parse(&individual_xml).map_err(|_| FormatError::InvalidNode {
+                what: Box::leak(
+                    format!("{} is not well-formed", individual_path.display()).into_boxed_str(),
+                ),
+            })?;
+
+        let root = ind_doc.root().first_element_child().ok_or(
+            FormatError::InvalidNode {
+                what: Box::leak(
+                    format!("{} has no root element", individual_path.display()).into_boxed_str(),
+                ),
+            },
+        )?;
+
+        // Extract race from root monster element
+        let race = root.attribute("race").and_then(|s| match s {
+            "blood" => Some(RaceType::Blood),
+            "venom" => Some(RaceType::Venom),
+            "fire" => Some(RaceType::Fire),
+            "energy" => Some(RaceType::Energy),
+            "drown" => Some(RaceType::Drown),
+            "physical" => Some(RaceType::Physical),
+            "earth" => Some(RaceType::Earth),
+            "holy" => Some(RaceType::Holy),
+            "death" => Some(RaceType::Death),
+            "undead" => Some(RaceType::Undead),
+            "diamond" => Some(RaceType::Diamond),
+            _ => None,
+        });
+
+        // Extract <look type="..."/>
+        let look_type: u16 = root
+            .descendants()
+            .find(|n| n.has_tag_name("look"))
+            .and_then(|n| n.attribute("type"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
+        // Extract <health now="..." max="..."/>
+        let (health, max_health) = root
+            .descendants()
+            .find(|n| n.has_tag_name("health"))
+            .map(|n| {
+                let now: u32 = n.attribute("now").and_then(|s| s.parse().ok()).unwrap_or(50);
+                let max: u32 = n.attribute("max").and_then(|s| s.parse().ok()).unwrap_or(50);
+                (now, max)
+            })
+            .unwrap_or((50, 50));
+
+        // Extract speed from root monster element
+        let speed: u16 = root
+            .attribute("speed")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+
+        // Extract attack from <attacks><attack name="melee" .../>
+        let attack: u16 = root
+            .descendants()
+            .find(|n| n.has_tag_name("attack") && n.attribute("name") == Some("melee"))
+            .and_then(|n| {
+                n.attribute("attack")
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| {
+                        // Fall back to min/max format: min="-N" max="-M"
+                        let max_abs: Option<u16> = n
+                            .attribute("max")
+                            .and_then(|s| {
+                                let v: i16 = s.parse().ok()?;
+                                Some(v.unsigned_abs())
+                            });
+                        max_abs
+                    })
+            })
+            .unwrap_or(7);
+
+        map.insert(
+            name.to_ascii_lowercase(),
+            MonsterType {
+                name,
+                look_type,
+                health,
+                max_health,
+                speed,
+                attack,
+                loot: vec![],
+                target_distance: 0,
+                race,
+            },
+        );
+    }
+
     Ok(map)
 }
 
@@ -166,6 +330,7 @@ pub(crate) fn parse_spawns_xml(xml: &str) -> Result<Vec<MonsterSpawn>, FormatErr
                 attack: 7,
                 loot: vec![],
                 target_distance: 0,
+                race: Some(RaceType::Blood),
             });
         }
     }
@@ -206,6 +371,8 @@ pub(crate) struct MonsterSpawn {
     pub(crate) loot: Vec<MonsterDrop>,
     /// Preferred distance from target (0 = melee, 1+ = ranged).
     pub(crate) target_distance: i32,
+    /// Creature race for splash fluid on hit/death. `None` = no splash.
+    pub(crate) race: Option<RaceType>,
 }
 
 /// Runtime state for a single monster.
@@ -238,6 +405,8 @@ pub(crate) struct MonsterState {
     pub(crate) follow_target: Option<u32>,
     /// Desired distance from target (1 = melee adjacent, N = ranged).
     pub(crate) target_distance: i32,
+    /// Creature race for splash fluid on hit/death. `None` = no splash.
+    pub(crate) race: Option<RaceType>,
 }
 
 impl MonsterState {

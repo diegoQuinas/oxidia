@@ -15,6 +15,7 @@
 use crate::FormatError;
 use crate::node::Node;
 use crate::props::PropReader;
+use serde::{Deserialize, Serialize};
 
 // Node types (OTBM_NodeTypes_t).
 const OTBM_MAP_DATA: u8 = 2;
@@ -101,7 +102,7 @@ pub struct MapItem {
 }
 
 /// A town and its temple position.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Town {
     /// Town id.
     pub id: u32,
@@ -626,5 +627,19 @@ mod tests {
             items[0].count, None,
             "unknown trailing attr yields count: None"
         );
+    }
+
+    #[test]
+    fn town_serde_round_trip() {
+        let town = Town {
+            id: 1,
+            name: "Thais".into(),
+            x: 32369,
+            y: 32206,
+            z: 7,
+        };
+        let bytes = bincode::serialize(&town).expect("serialize");
+        let back: Town = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(town, back);
     }
 }

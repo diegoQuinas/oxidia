@@ -1,72 +1,80 @@
-## Exploration: Food/Eating Bug — Control+Click on Meat Does Nothing
+## Exploration: Blood item on hit (TFS-style)
 
 ### Current State
 
-The server has **no food consumption system**. When control+click is performed on a food item:
+The server has a complete combat system (M7) that applies damage and pushes the **EFFECT_DRAWBLOOD** magic-effect animation (a visual splash above the creature), but **no floor item is created** — there are no blood pools/splashes on the ground. The existing code path in `apply_damage()` / `apply_monster_damage()` (`crates/world/src/game/combat.rs`):
+- Reduces HP and pushes `0x8C` health-bar + `0xA0` stats
+- Pushes `EFFECT_DRAWBLOOD` magic effect (animation only)
+- Pushes floating damage text via `0xB4`
+- On death, removes the creature and spawns loot via `spawn_loot()`
 
-1. **Client** sends opcode `0x82` (use-item) to the server, with the item's position and sprite id.
-2. **Server** (`game_service.rs:447-452`) routes `0x82` to `world.use_item()` → `Game::do_use_item()`.
-3. **`do_use_item()`** (`containers.rs:135-267`) resolves the item's location and checks its metadata:
-   - **Is it a container?** No → skip the open-container path.
-   - **Is it registered in `actions.xml`?** Only items 1386, 1391, 384 are registered (all teleport items) → meat (2666) is NOT registered.
-   - Since neither condition is met → **returns silently** at line 204 with no action taken.
-4. Nothing happens — no packet is sent back, no state change occurs.
+The **copy-on-write overlay system** (`materialize`, `dynamic`, `add_to_ground_front`, `broadcast_dest`) already supports spawning items on tiles — proven by `spawn_loot()` in `do_monster_death()`. The **item system** already handles splash/fluid items via `is_fluid_or_splash()` in `formats::otb`, and the wire encoder already writes a subtype byte for fluid-type items.
+
+**Key gap:** No `race` (health type) field exists on `MonsterType` / `MonsterState` or `PlayerState`. No decay system exists for items.
+
+### TFS Reference Behavior
+
+**On combat hit** (`reference/tfs/src/game.cpp:3874-3915` — `Game::combatGetTypeInfo`):
+- Creates `ITEM_SMALLSPLASH` (2019) on target's tile, subtype = fluid type
+- `RACE_VENOM` → `FLUID_SLIME` (green, wire = 3)
+- `RACE_BLOOD` → `FLUID_BLOOD` (red, wire = 1)
+- `RACE_UNDEAD` / `RACE_FIRE` / `RACE_ENERGY` → no splash
+- Starts decay on the splash item
+
+**On creature death** (`reference/tfs/src/creature.cpp:727-746` — `Creature::dropCorpse`):
+- Creates `ITEM_FULLSPLASH` (2016) on death tile, same fluid-type logic
+- Starts decay
+
+**Item data** (`data/items/items.xml` lines 1684-1707):
+- `2016` (full splash): decays `2016→2017→2018→0` (45s/45s/600s)
+- `2019` (small splash): decays `2019→2020→2021→0` (45s/45s/60s)
+- Group = `ITEM_GROUP_SPLASH` (11) → `is_fluid_or_splash()` = true
+
+**Fluid types** (`reference/tfs/src/const.h`):
+- `FLUID_BLOOD = 1` (FLUID_RED), `FLUID_SLIME = 3` (FLUID_GREEN)
+- Wire subtype byte renders the appropriate colored pool on the client
 
 ### Affected Areas
 
-- `server/crates/world/src/game/containers.rs` (lines 135-267) — `do_use_item()` is the handler, but it has no food-specific branch.
-- `server/crates/world/src/game/lua.rs` — `GameAction` enum only has `Teleport`; needs a `Feed` action.
-- `server/crates/world/src/game/condition.rs` — `ConditionRegeneration` already exists and supports health-over-time; needs a way to be added from Lua actions.
-- `server/crates/world/src/game/xml_registry.rs` — Already works; just needs food items registered.
-- `server/config/lua/actions.xml` — Only registers teleport items; needs food entries.
-- `server/config/lua/scripts/` — Only has `teleport.lua`; needs a `food.lua` script.
-- `server/crates/formats/src/items_xml.rs` — Item XML parser; could optionally parse a `food`/`nutrition` attribute, but TFS uses action registration (not item attributes) to identify food.
+- `crates/world/src/game/mod.rs` — `PlayerState` needs `race` field, `MonsterState` already exists, `Game` needs `RaceType` enum + `spawn_splash()` method
+- `crates/world/src/game/monster.rs` — `MonsterType` / `MonsterState` need `race` field; `parse_monsters_xml` needs `race` attribute parsing
+- `crates/world/src/game/combat.rs` — `apply_damage()` and `apply_monster_damage()` need to spawn splash on hit; `do_monster_death()` and `do_death()` need to spawn full splash on death
+- `crates/world/src/game/items.rs` — broadcast helpers already exist (`broadcast_dest`), may be reused
+- `crates/world/src/game/condition.rs` or `mod.rs` — optional decay system for splash items
+- `crates/world/src/map.rs` — `wire_item()` already handles splash/fluid subtype in line 141
+- `data/items/items.xml` — already has decay chains for splashes (no changes needed)
+- `config/monsters.xml` — needs `race` attribute on monster entries
 
 ### Approaches
 
-1. **Lua-based food system (recommended — matches TFS)**
-   - Add a `Feed` variant to `GameAction` in `lua.rs` with fields: `player_id`, `health_gain`, `interval_ms`, `duration_ms`, `total_heal_cap`.
-   - Drain the `Feed` action in `do_use_item()` (or in the Lua dispatch area) to add a `ConditionRegeneration` to the player's `conditions` vec.
-   - Create `config/lua/scripts/food.lua` with an `onUse(args)` function that calls the builtin `do_feed(...)` function.
-   - Register food item ranges in `config/lua/actions.xml`: e.g. `<action fromid="2666" toid="2691" script="food.onUse"/>`.
-   - **Pros**: Faithful to TFS behavior; Lua makes it easy to configure custom food values; no schema changes needed.
-   - **Cons**: Requires implementing the feed action drain + Lua binding.
-   - **Effort**: Medium (new Lua binding, action drain in Rust, new Lua script, config changes).
+1. **Minimal: race field + splash spawn (no decay)** — Add `RaceType` enum to world crate, add `race` field to `MonsterType`/`MonsterState`/`PlayerState`, spawn `ITEM_SMALLSPLASH` on hit and `ITEM_FULLSPLASH` on death. Skip item decay — splash stays forever (or until server restart, since the overlay is not persisted).
+   - Pros: Minimal changes, works immediately, matches TFS mechanics
+   - Cons: Splashes never decay (not TFS-faithful), no decay system
+   - Effort: Low
 
-2. **Attribute-based food system**
-   - Add a `food_nutrition` field to `ItemXmlAttrs` and `ItemMeta`.
-   - Parse `<attribute key="food" value="N">` in `items_xml.rs`.
-   - Add a `do_feed()` method to `Game` that checks `ItemMeta.food_nutrition` > 0 and adds a regeneration condition.
-   - **Pros**: Self-describing items; no Lua dependency for basic food.
-   - **Cons**: Doesn't match TFS convention; actual TFS items.xml has no `food` attribute — food is identified by being registered in actions.xml, not by item flags.
-   - **Effort**: Medium (schema change + parser change + logic).
+2. **Full: race field + splash spawn + decay tick** — Same as approach 1 but also implement an item decay system: a per-item `decay_to` / `duration` reference from `items.xml`, and a `DecayTick` command on the actor that iterates decay-tracked items and transforms or removes them.
+   - Pros: TFS-faithful, splash pools dry up
+   - Cons: More complex, requires decay data model and tick scheduling
+   - Effort: High
 
-3. **Hybrid (recommended for production)**
-   - Use Lua actions to identify food items (approach 1), but implement the core `do_feed()` Rust function so the Lua script is thin (just nutrition values).
-   - **Pros**: Best of both; TFS-compatible registration path, Rust-native health-over-time handling.
-   - **Effort**: Medium-High.
+3. **Hit splash only (no death splash)** — Only spawn `ITEM_SMALLSPLASH` on combat hits, skip the full splash on death. Useful if death is handled separately (M13 corpses).
+   - Pros: Simplest possible, covers the main visible effect
+   - Cons: Missing a key TFS behavior, bare ground on death looks odd
+   - Effort: Very Low
 
 ### Recommendation
 
-**Approach 1 (Lua-based food system)** is the right fit for this codebase's current architecture. The server already has:
-- The `LuaRuntime` with dispatch mechanism
-- The `ConditionRegeneration` struct ready to use
-- The `XmlRegistry` for item-to-script mapping
-- The `GameAction` pattern for Lua-to-Rust communication
-
-The missing pieces are:
-1. A `Feed` variant in `GameAction`
-2. Drain logic in `do_use_item()` to apply `ConditionRegeneration` from a `Feed` action
-3. A `food.lua` script
-4. `actions.xml` entries for food item ranges
+**Approach 1** (race field + both splashes, no decay) — it's the sweet spot. The race/fluid-type mechanic is central to TFS blood behavior, the overlay system already supports item spawning, and splash decay is a stretch goal. The PROGRESS.md already deferred decay as a later concern ("floor blood splat (ITEM_SMALLSPLASH + decay) → M9" was deferred). Splashes reset on server restart (the overlay is in-memory only), which matches TFS's non-persistent behavior — decay just makes them look nicer mid-session.
 
 ### Risks
 
-- The `GameAction::Feed` action must be drained in the Lua dispatch section of `do_use_item()` (`containers.rs:184-204`), alongside the existing `Teleport` drain.
-- The `ConditionRegeneration` struct is minimal and already tested; the feed system must calculate nutrition-based health regen values.
-- Item removal on consumption must be implemented (the food item must be removed from the inventory/ground after eating).
-- No `mana_gain` field exists in `ConditionRegeneration` — only HP regen. Mana food (e.g. brown mushrooms) would need a separate condition or an extended struct.
+- **No decay means splashes accumulate on popular PvP tiles** — acceptable for now; TFS also has them persist for at least 45-60s per stage
+- **Race attribute must be added to monsters.xml** — existing spawn entries lack it, must default to `RACE_BLOOD` for backward compat
+- **Player race is always `RACE_BLOOD`** — matches TFS `player.h:511`
+- **Splash items (2016/2019) must exist in items.otb + items.xml** — verified they do in the real files
+- **Item count/subtype for fluid items** — the subtype byte carries the fluid type (1=blood, 3=slime), not a count. The existing `wire_item()` function already handles this: `is_fluid_or_splash()` items pass the subtype through
+- **Tile cap (10 things)** — splashes count toward the 10-thing cap. Must check before spawning (same as `spawn_loot()` does)
 
 ### Ready for Proposal
 
-Yes — the root cause is clear and well-understood. The orchestrator should present these findings to the user and confirm the approach before proceeding to design.
+Yes — the exploration is complete. The orchestrator should tell the user this maps to **M13** (loot & corpses) with overlap into M7.2 (hit effects). The implementation adds a `RaceType` enum, race fields to creatures, splash spawn methods, and leverages the existing copy-on-write overlay + broadcast system. No model changes to the item system needed.
