@@ -1197,7 +1197,7 @@ impl Game {
             p.go_to_position = Some(target);
         }
 
-        // Collect creature positions on the same floor for A* blocking.
+        // Collect creature positions on the same floor for A* penalties.
         let creature_positions: Vec<Position> = self
             .monsters
             .values()
@@ -1493,12 +1493,28 @@ impl Game {
                     p.list_walk_dir.pop_front()
                 };
                 if let Some(direction) = dir {
+                    let pos_before = self.players.get(&id).map(|p| p.position);
                     if let Some(p) = self.players.get_mut(&id) {
                         p.last_walk_ms = self.now_ms;
                     }
                     self.do_move(id, direction);
+                    // If the move was blocked (position unchanged), stop silently.
+                    if self.players.get(&id).map(|p| p.position) == pos_before
+                        && pos_before.is_some()
+                    {
+                        if let Some(p) = self.players.get_mut(&id) {
+                            p.go_to_position = None;
+                            p.follow_target = None;
+                            p.list_walk_dir.clear();
+                            p.failed_repaths = None;
+                        }
+                    }
                 }
             } else if let Some(target) = go_to_target {
+                // If do_move failed and already cleared go_to_position, skip.
+                if self.players.get(&id).map(|p| p.go_to_position).is_none() {
+                    continue;
+                }
                 // -------------------------------------------------------------
                 // 2b. Click-to-move GoTo (0x64)
                 // -------------------------------------------------------------
