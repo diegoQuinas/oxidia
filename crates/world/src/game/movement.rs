@@ -2462,11 +2462,15 @@ mod tests {
             "mover should not know monster before introduction"
         );
         g.do_move(mover, Direction::East);
-        let _pkt = rx.try_recv().expect("mover must receive walk_update");
-        // After the move, the mover knows the monster (introduce was called).
+        // Monsters block movement — the mover stays in place.
+        assert_eq!(
+            g.players.get(&mover).unwrap().position,
+            Position::new(95, 117, 7),
+            "mover must be blocked by monster on destination tile"
+        );
         assert!(
-            g.players.get(&mover).unwrap().known.contains(&mid),
-            "mover must know monster after walking onto its tile"
+            !g.players.get(&mover).unwrap().known.contains(&mid),
+            "mover must not know monster after blocked move"
         );
     }
 
@@ -2485,18 +2489,17 @@ mod tests {
     }
 
     #[test]
-    fn monster_does_not_block_movement_m12_1() {
+    fn monster_blocks_movement() {
         let mut g = Game::from_static_map_arc(walk_map());
         let (mover, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
         let _mid = add_monster(&mut g, Position::new(96, 117, 7));
         while rx.try_recv().is_ok() {}
-        // M12.1: monsters do NOT block movement. Player walks onto the same tile.
         g.do_move(mover, Direction::East);
         let pos = g.players.get(&mover).map(|p| p.position);
         assert_eq!(
             pos,
-            Some(Position::new(96, 117, 7)),
-            "player must walk onto monster tile (monsters don't block in M12.1)"
+            Some(Position::new(95, 117, 7)),
+            "player must be blocked by monster on destination tile"
         );
     }
 
@@ -2664,6 +2667,21 @@ mod tests {
             g.monsters.get(&mid).unwrap().position,
             Position::new(96, 117, 7),
             "monster must walk onto a normal tile"
+        );
+    }
+
+    #[test]
+    fn monster_blocked_by_another_monster() {
+        let mut g = Game::from_static_map_arc(walk_map());
+        let mid = add_monster(&mut g, Position::new(95, 117, 7));
+        let _other = add_monster(&mut g, Position::new(96, 117, 7));
+
+        g.do_move_monster(mid, Direction::East);
+
+        assert_eq!(
+            g.monsters.get(&mid).unwrap().position,
+            Position::new(95, 117, 7),
+            "monster must be blocked by another monster on destination tile"
         );
     }
 }

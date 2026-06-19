@@ -909,6 +909,10 @@ impl Game {
         self.players
             .iter()
             .any(|(&pid, p)| pid != exclude && p.position == pos)
+            || self
+                .monsters
+                .iter()
+                .any(|(&mid, m)| mid != exclude && m.position == pos)
     }
 
     /// The wire stackpos a creature with id `exclude` occupies on `pos`, placed
