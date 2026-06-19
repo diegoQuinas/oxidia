@@ -4,7 +4,6 @@ use std::collections::{HashMap, VecDeque};
 const MAX_NODES: usize = 512;
 const CARDINAL_COST: u32 = 10;
 const DIAGONAL_COST: u32 = 25;
-const CREATURE_PENALTY: u32 = 30;
 #[derive(Debug, Clone)]
 pub struct FindPathParams {
     pub full_search: bool,
@@ -228,8 +227,10 @@ pub fn get_path_matching(
             } else {
                 CARDINAL_COST
             };
-            let occupied = creatures.iter().any(|&(cx, cy)| cx == nx && cy == ny);
-            let step_cost = sc + if occupied { CREATURE_PENALTY } else { 0 };
+            if creatures.iter().any(|&(cx, cy)| cx == nx && cy == ny) {
+                continue;
+            }
+            let step_cost = sc;
             let child_g = pg + step_cost;
             let child_f = child_g + heuristic(nx, ny, target.x, target.y);
             if n.try_reopen(nx, ny, child_g, child_f, bi as u16) {

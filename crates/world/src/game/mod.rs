@@ -1197,7 +1197,7 @@ impl Game {
             p.go_to_position = Some(target);
         }
 
-        // Collect creature positions on the same floor for A* penalties.
+        // Collect creature positions on the same floor for A* blocking.
         let creature_positions: Vec<Position> = self
             .monsters
             .values()
