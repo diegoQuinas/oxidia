@@ -70,7 +70,7 @@ impl Game {
                     Some(ContainerItem {
                         server_id: sid,
                         client_id: m.client_id,
-                        count: if m.stackable { Some(cnt) } else { None },
+                        count: if m.stackable || m.is_fluid { Some(cnt) } else { None },
                         animated: m.animated,
                     })
                 })
@@ -521,7 +521,7 @@ impl Game {
                     .unwrap_or(false);
                 let creatures = self.creatures_on(pos).len();
                 let from_stackpos = if idx < pre { idx } else { idx + creatures }.min(9) as u8;
-                let Some((_moved, removed_fully)) = self.take_from_ground(pos, idx, 1, stackable)
+                let Some((_moved, removed_fully, _)) = self.take_from_ground(pos, idx, 1, stackable)
                 else {
                     return;
                 };
@@ -960,14 +960,14 @@ impl Game {
             let animated = meta.animated;
             let want = if stackable { count.max(1) } else { 1 };
 
-            let Some((moved, removed_fully)) =
+            let Some((moved, removed_fully, original_count)) =
                 self.take_from_ground(from_pos, src_idx, want, stackable)
             else {
                 return;
             };
             self.broadcast_source(from_pos, from_stackpos, removed_fully, src_idx);
 
-            let cnt = if stackable { Some(moved) } else { None };
+            let cnt = if stackable { Some(moved) } else { original_count };
             let item = ContainerItem {
                 server_id: src_sid,
                 client_id,
@@ -1021,6 +1021,7 @@ impl Game {
                 item.server_id,
                 item.client_id,
                 moved,
+                item.count,
                 item.animated,
                 meta_stackable,
             ) else {

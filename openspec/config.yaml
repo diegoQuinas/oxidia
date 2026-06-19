@@ -6,7 +6,8 @@ context: |
     Tokio async runtime, SQLx + SQLite persistence, mlua (Lua 5.4) scripting.
   Architecture: Actor model — single tokio actor owns all world state, mpsc channels
     for commands, no Arc<Mutex>. Protocol: TFS 10.98, OTClient Redemption (mehah/otclient).
-  Testing: cargo test (403 tests, 49 files), clippy -D warnings, rustfmt.
+  Testing: cargo test (543 tests across 49 source files + 2 integration tests),
+    clippy -D warnings, rustfmt.
     #![forbid(unsafe_code)] in every crate.
   Safety: Memory-safe by construction — no unsafe, lock-free via actor model.
 

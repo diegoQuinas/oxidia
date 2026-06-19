@@ -28,9 +28,10 @@ use crate::{Direction, Position};
 
 use self::condition::ConditionRegeneration;
 use self::lua::LuaRuntime;
+#[allow(unused_imports)]
 pub(super) use self::monster::{
     MonsterDrop, MonsterSpawn, MonsterState, MonsterType, name_hash_looktype,
-    parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml,
+    parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml, roll_drops,
 };
 use self::xml_registry::XmlRegistry;
 
@@ -94,7 +95,7 @@ const MSG_CONSOLE_BLUE: u8 = 4;
 
 /// Ghost sprite looktype used when GM `/ghost` mode is active.
 /// Verify against client `.dat` if visual mismatch occurs.
-const GHOST_LOOKTYPE: u16 = 40;
+const GHOST_LOOKTYPE: u16 = 48;
 
 /// Creature race determining splash fluid type on combat hit/death.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,9 +117,9 @@ impl RaceType {
     /// Fluid subtype byte for splash items, or `None` for races that produce no splash.
     pub(crate) fn fluid_subtype(self) -> Option<u8> {
         match self {
-            Self::Blood => Some(5),   // FLUID_BLOOD (OTClient: 5 = red)
-            Self::Venom => Some(6),   // FLUID_SLIME (OTClient: 6 = green)
-            _ => None,                // no splash
+            Self::Blood => Some(5), // FLUID_BLOOD (OTClient: 5 = red)
+            Self::Venom => Some(6), // FLUID_SLIME (OTClient: 6 = green)
+            _ => None,              // no splash
         }
     }
 }
@@ -130,6 +131,9 @@ const ITEM_SMALLSPLASH: u16 = 2889;
 /// Client sprite id for the full (on-death) splash item.
 /// items.otb: server_id=2016, client_id=2886, group=11 (SPLASH).
 const ITEM_FULLSPLASH: u16 = 2886;
+
+/// Server id for the human corpse item placed on player death.
+const ITEM_HUMAN_CORPSE: u16 = 3058;
 
 /// Client viewport extents from the player's tile, matching the 18x14 map
 /// description anchored at center-8 / center-6 (TFS `Map::maxClientViewportX/Y`).
@@ -472,6 +476,7 @@ impl Game {
                     respawn_at_ms: None,
                     name: t.name.clone(),
                     look_type: t.look_type,
+                    look_corpse: t.look_corpse,
                     health: t.health,
                     max_health: t.max_health,
                     speed: t.speed,
@@ -493,6 +498,7 @@ impl Game {
                     max_health: t.max_health,
                     speed: t.speed,
                     look_type: t.look_type,
+                    look_corpse: t.look_corpse,
                     attacking: None,
                     last_attack_ms: 0,
                     attack: t.attack,
@@ -522,6 +528,7 @@ impl Game {
                     max_health: 50,
                     speed: 200,
                     look_type: name_hash_looktype(&spawn.name),
+                    look_corpse: spawn.look_corpse,
                     attacking: None,
                     last_attack_ms: 0,
                     attack: 7,
@@ -2535,10 +2542,7 @@ mod tests {
         let p = g.players.get(&pid).unwrap();
 
         // THEN go_to_position is set (target is reachable via bypass)
-        assert_eq!(
-            p.go_to_position,
-            Some(Position::new(102, 100, 7))
-        );
+        assert_eq!(p.go_to_position, Some(Position::new(102, 100, 7)));
         // AND the walk queue is filled (A* found the detour)
         assert!(
             !p.list_walk_dir.is_empty(),
@@ -3019,11 +3023,14 @@ mod tests {
 
         // Write index monster.xml
         let mut idx = std::fs::File::create(dir.join("monsters.xml")).unwrap();
-        idx.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+        idx.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
 <monsters>
     <monster name="Rat" file="Rats/rat.xml"/>
     <monster name="Dragon" file="Dragons/dragon.xml"/>
-</monsters>"#).unwrap();
+</monsters>"#,
+        )
+        .unwrap();
 
         // Create subdirs
         std::fs::create_dir_all(dir.join("Rats")).unwrap();
@@ -3031,24 +3038,31 @@ mod tests {
 
         // Write individual XMLs
         let mut rat = std::fs::File::create(dir.join("Rats/rat.xml")).unwrap();
-        rat.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+        rat.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
 <monster name="Rat" nameDescription="a rat" race="blood" experience="5" speed="134" manacost="200">
     <health now="20" max="20"/>
     <look type="21" corpse="5964"/>
     <attacks>
         <attack name="melee" interval="2000" skill="15" attack="7"/>
     </attacks>
-</monster>"#).unwrap();
+</monster>"#,
+        )
+        .unwrap();
 
         let mut dragon = std::fs::File::create(dir.join("Dragons/dragon.xml")).unwrap();
-        dragon.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+        dragon
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
 <monster name="Dragon" nameDescription="a dragon" race="fire" experience="1000" speed="180">
     <health now="300" max="300"/>
     <look type="92" corpse="5991"/>
     <attacks>
         <attack name="melee" interval="2000" min="-30" max="-50"/>
     </attacks>
-</monster>"#).unwrap();
+</monster>"#,
+            )
+            .unwrap();
 
         let map = parse_monsters_data_dir(&dir).unwrap();
 

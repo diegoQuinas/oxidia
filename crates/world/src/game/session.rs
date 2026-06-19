@@ -466,7 +466,7 @@ mod tests {
         );
 
         // Drop a non-stackable item on the ground next to spawn.
-        let _ = g.add_to_ground_front(drop_pos, 999, DROP_CID, 1, false, false);
+        let _ = g.add_to_ground_front(drop_pos, 999, DROP_CID, 1, None, false, false);
 
         // A fresh login near the same spot must now carry the dropped item.
         let (tx1, _rx1) = mpsc::channel(super::super::PUSH_CAPACITY);

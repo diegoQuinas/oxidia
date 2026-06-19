@@ -338,6 +338,7 @@ pub(super) fn add_monster(g: &mut Game, pos: Position) -> u32 {
             max_health: 50,
             speed: 200,
             look_type: 100,
+            look_corpse: 0,
             attacking: None,
             last_attack_ms: 0,
             attack: 7,
@@ -391,23 +392,61 @@ pub(super) fn add_player(g: &mut Game, pos: Position) -> (u32, mpsc::Receiver<Ve
     (id, rx)
 }
 
-pub(super) fn combat_map(spawn_pz: bool) -> Arc<StaticMap> {
-    use formats::items_xml::{ItemsXml, parse_items_xml};
-    let items = ItemsOtb {
+/// Common test item definitions: ground (100), loot (500), corpse (3058).
+fn test_items() -> formats::otb::ItemsOtb {
+    ItemsOtb {
         major_version: 3,
         minor_version: 57,
         build_number: 0,
-        items: vec![ItemType {
-            group: 1,
-            flags: 0,
-            server_id: 100,
-            client_id: 4526,
-            always_on_top: false,
-            top_order: 0,
-            has_height: false,
-            floor_change: formats::items_xml::FloorChange::NONE,
-        }],
-    };
+        items: vec![
+            ItemType {
+                group: 1,
+                flags: 0,
+                server_id: 100,
+                client_id: 4526,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            },
+            ItemType {
+                group: 2,
+                flags: 1 << 5, // FLAG_PICKUPABLE
+                server_id: 500,
+                client_id: 5741,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            },
+            ItemType {
+                group: 2,
+                flags: 1 << 5, // FLAG_PICKUPABLE
+                server_id: 3058,
+                client_id: 6108,
+                always_on_top: false,
+                top_order: 0,
+                has_height: false,
+                floor_change: formats::items_xml::FloorChange::NONE,
+            },
+        ],
+    }
+}
+
+/// Common test item XML metadata.
+fn test_items_xml() -> formats::items_xml::ItemsXml {
+    formats::items_xml::parse_items_xml(
+        r#"<items>
+    <item id="100" article="a" name="ground"/>
+    <item id="500" article="a" name="test loot"/>
+    <item id="3058" article="a" name="corpse"/>
+</items>"#,
+    )
+    .unwrap()
+}
+
+pub(super) fn combat_map(spawn_pz: bool) -> Arc<StaticMap> {
+    let items = test_items();
     let ground = |x: u16, y: u16, pz: bool| MapTile {
         x,
         y,
@@ -442,30 +481,14 @@ pub(super) fn combat_map(spawn_pz: bool) -> Arc<StaticMap> {
         }],
         waypoints: vec![],
     };
-    let xml: ItemsXml =
-        parse_items_xml(r#"<items><item id="100" article="a" name="ground"/></items>"#).unwrap();
+    let xml = test_items_xml();
     let mut sm = StaticMap::from_formats(&map, &items);
     sm.load_item_metadata(&items, &xml);
     Arc::new(sm)
 }
 
 pub(super) fn wide_combat_map_with_pz() -> Arc<StaticMap> {
-    use formats::items_xml::{ItemsXml, parse_items_xml};
-    let items = ItemsOtb {
-        major_version: 3,
-        minor_version: 57,
-        build_number: 0,
-        items: vec![ItemType {
-            group: 1,
-            flags: 0,
-            server_id: 100,
-            client_id: 4526,
-            always_on_top: false,
-            top_order: 0,
-            has_height: false,
-            floor_change: formats::items_xml::FloorChange::NONE,
-        }],
-    };
+    let items = test_items();
     let ground = |x: u16, y: u16, pz: bool| MapTile {
         x,
         y,
@@ -498,8 +521,7 @@ pub(super) fn wide_combat_map_with_pz() -> Arc<StaticMap> {
         }],
         waypoints: vec![],
     };
-    let xml: ItemsXml =
-        parse_items_xml(r#"<items><item id="100" article="a" name="ground"/></items>"#).unwrap();
+    let xml = test_items_xml();
     let mut sm = StaticMap::from_formats(&map, &items);
     sm.load_item_metadata(&items, &xml);
     Arc::new(sm)

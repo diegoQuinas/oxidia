@@ -37,20 +37,24 @@ impl Game {
     }
 
     /// COW the source tile and remove (or split) `want` units of the item at stack
-    /// index `src_idx`. Returns the amount actually taken and whether the slot was
-    /// fully removed. `src_idx` must already be validated by the caller.
+    /// index `src_idx`. Returns the amount actually taken, whether the slot was
+    /// fully removed, and the original count from the tile (fluid type for
+    /// non-stackable fluid items, `None` for regular non-stackable items, and
+    /// the pre-split count for stackable items). `src_idx` must already be
+    /// validated by the caller.
     pub(super) fn take_from_ground(
         &mut self,
         from: Position,
         src_idx: usize,
         want: u8,
         stackable: bool,
-    ) -> Option<(u8, bool)> {
+    ) -> Option<(u8, bool, Option<u8>)> {
         if !self.materialize(from) {
             return None;
         }
         let st = self.dynamic.get_mut(&(from.x, from.y, from.z)).unwrap();
-        let cur = st.counts[src_idx].unwrap_or(1).max(1);
+        let original_count = st.counts[src_idx];
+        let cur = original_count.unwrap_or(1).max(1);
         let moved = if stackable { want.max(1).min(cur) } else { 1 };
         let removed_fully;
         if stackable && cur > moved {
@@ -67,18 +71,23 @@ impl Game {
             }
             removed_fully = true;
         }
-        Some((moved, removed_fully))
+        Some((moved, removed_fully, original_count))
     }
 
     /// COW the dest tile and insert `moved` units of item `src_sid` at the FRONT of
     /// the down-items, merging into a same-type front stack (cap 100, spill on
     /// overflow). Returns `(merged_update, added)` wire items to broadcast at slot S.
+    ///
+    /// `subtype_override` is the fluid type for non-stackable fluid items (e.g.
+    /// bucket with water). Pass `None` for regular non-stackable items; the
+    /// function uses it instead of the stackable-derived count.
     pub(super) fn add_to_ground_front(
         &mut self,
         to: Position,
         src_sid: u16,
         client_id: u16,
         moved: u8,
+        subtype_override: Option<u8>,
         animated: bool,
         stackable: bool,
     ) -> Option<(Option<WireItem>, Option<WireItem>)> {
@@ -110,7 +119,11 @@ impl Game {
                 Some((Some(merged_item), None))
             }
         } else {
-            let subtype = if stackable { Some(moved) } else { None };
+            let subtype = if stackable {
+                Some(moved)
+            } else {
+                subtype_override
+            };
             let wi = WireItem {
                 client_id,
                 subtype,
@@ -216,15 +229,16 @@ impl Game {
 
         let moved_req = if stackable { count.max(1) } else { 1 };
 
-        let Some((moved, removed_fully)) =
+        let Some((moved, removed_fully, original_count)) =
             self.take_from_ground(from, src_idx, moved_req, stackable)
         else {
             return;
         };
 
         let dest_creatures = self.creatures_on(to).len();
-        let Some((dest_merged_update, dest_added)) =
-            self.add_to_ground_front(to, src_sid, client_id, moved, animated, stackable)
+        let Some((dest_merged_update, dest_added)) = self.add_to_ground_front(
+            to, src_sid, client_id, moved, original_count, animated, stackable,
+        )
         else {
             return;
         };
@@ -349,14 +363,14 @@ impl Game {
                     (meta.stackable, meta.client_id, meta.animated);
                 let want = if stackable { count.max(1) } else { 1 };
 
-                let Some((moved, removed_fully)) =
+                let Some((moved, removed_fully, original_count)) =
                     self.take_from_ground(from, src_idx, want, stackable)
                 else {
                     return;
                 };
                 self.broadcast_source(from, from_stackpos, removed_fully, src_idx);
 
-                let cnt = if stackable { Some(moved) } else { None };
+                let cnt = if stackable { Some(moved) } else { original_count };
                 if let Some(p) = self.players.get_mut(&id) {
                     p.inventory[(slot - 1) as usize] = Some(InvItem {
                         server_id: src_sid,
@@ -424,6 +438,7 @@ impl Game {
                     it.server_id,
                     it.client_id,
                     moved,
+                    it.count,
                     it.animated,
                     meta_stackable,
                 ) else {

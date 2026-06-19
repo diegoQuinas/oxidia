@@ -501,6 +501,7 @@ impl Game {
             max_health: template.map(|t| t.max_health).unwrap_or(100),
             speed: template.map(|t| t.speed).unwrap_or(200),
             look_type: template.map(|t| t.look_type).unwrap_or(100),
+            look_corpse: template.map(|t| t.look_corpse).unwrap_or(0),
             attacking: None,
             last_attack_ms: 0,
             attack: template.map(|t| t.attack).unwrap_or(7),
@@ -541,6 +542,7 @@ impl Game {
         let client_id = meta.client_id;
         let animated = meta.animated;
         let stackable = meta.stackable;
+        let is_fluid = meta.is_fluid;
 
         if !self.materialize(pos) {
             self.push_status_message(gm_id, b"You cannot create an item there.");
@@ -559,6 +561,8 @@ impl Game {
 
         let subtype = if stackable {
             Some(count.clamp(1, 100) as u8)
+        } else if is_fluid {
+            Some(0) // empty fluid container
         } else {
             None
         };

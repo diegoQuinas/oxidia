@@ -249,6 +249,13 @@ impl Game {
             self.push(id, walk::cancel_walk(cur_dir.to_byte()));
             return;
         };
+        // Ensure destination chunks are loaded for the resolved landing.
+        // resolve_vertical may redirect to a different floor or position
+        // (stair/height) not covered by the raw_dest pre-load above.
+        let land_chunks: Vec<crate::map::ChunkId> =
+            crate::map::chunks_around(to).into_iter().collect();
+        self.chunks.ensure_loaded(&land_chunks);
+
         // Successful move: now commit the new facing and position. `vertical` is
         // true when resolve_vertical redirected a step to another floor — the
         // prime suspect for underground "desync" when a flat step changes z.

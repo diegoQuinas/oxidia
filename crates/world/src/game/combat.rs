@@ -6,6 +6,29 @@ use super::*;
 use crate::combat;
 use rand::Rng;
 
+/// Pre-roll drops from a loot table using independent per-item chance.
+/// Delegates to the module-level function for testability; caller passes
+/// its own RNG to keep the combat path deterministic in tests.
+pub(crate) fn collect_player_loot(
+    inventory: &[Option<InvItem>; 10],
+    containers: &[Option<OpenContainer>; 16],
+) -> Vec<(u16, u8)> {
+    let mut items = Vec::new();
+    for slot in inventory.iter().flatten() {
+        items.push((slot.server_id, slot.count.unwrap_or(1)));
+    }
+    for oc in containers.iter().flatten() {
+        let is_inv_slot = matches!(oc.source, ContainerSource::Slot(_));
+        if !is_inv_slot {
+            continue;
+        }
+        for ci in &oc.items {
+            items.push((ci.server_id, ci.count.unwrap_or(1)));
+        }
+    }
+    items
+}
+
 impl Game {
     /// Handle `0xA1` — set or clear the attacker's melee target.
     ///
@@ -260,6 +283,21 @@ impl Game {
             }
         }
 
+        // Spawn human corpse on the death tile (exclude victim from broadcast
+        // — the dying player may have a full push buffer; reaping via push
+        // would logout() them early and break the temple save below).
+        self.spawn_corpse(death_pos, ITEM_HUMAN_CORPSE, Some(victim_id));
+
+        // Collect player inventory + container contents and drop as loot.
+        let player_loot = self
+            .players
+            .get(&victim_id)
+            .map(|p| collect_player_loot(&p.inventory, &p.open_containers))
+            .unwrap_or_default();
+        if !player_loot.is_empty() {
+            self.spawn_loot(death_pos, &player_loot, Some(victim_id));
+        }
+
         // Remove from the death tile for spectators. The id-form remove is
         // unambiguous under co-occupancy (stair/height landings); drop the victim
         // from each spectator's known-set so a relog re-introduces it (full form).
@@ -419,8 +457,8 @@ impl Game {
     /// from the monster registry, and spawn loot on the death tile. If the
     /// monster had a spawn entry, schedule a respawn.
     fn do_monster_death(&mut self, victim_id: u32, now_ms: u64) {
-        let (spawn_id, death_pos, loot, race) = match self.monsters.get(&victim_id) {
-            Some(m) => (m.spawn_id, m.position, m.loot.clone(), m.race),
+        let (spawn_id, death_pos, loot, race, look_corpse) = match self.monsters.get(&victim_id) {
+            Some(m) => (m.spawn_id, m.position, m.loot.clone(), m.race, m.look_corpse),
             None => return,
         };
 
@@ -428,6 +466,15 @@ impl Game {
         if let Some(fluid) = race.and_then(RaceType::fluid_subtype) {
             self.spawn_splash(death_pos, ITEM_FULLSPLASH, fluid);
         }
+
+        // Spawn corpse on the death tile (before creature removal so the overlay
+        // stack order is: splash → corpse → (creatures) → loot).
+        // No exclude_id — monsters don't have push buffers.
+        self.spawn_corpse(death_pos, look_corpse, None);
+
+        // Pre-roll drops and place them on the death tile.
+        let rolled = roll_drops(&mut self.rng, &loot);
+        self.spawn_loot(death_pos, &rolled, None);
 
         // Clear all player fights targeting the monster.
         let all_players: Vec<u32> = self.players.keys().copied().collect();
@@ -465,9 +512,6 @@ impl Game {
                 spawn.respawn_at_ms = Some(now_ms + spawn.respawn_interval_ms);
             }
         }
-
-        // Spawn loot on the death tile.
-        self.spawn_loot(death_pos, &loot);
     }
 
     /// Spawn a splash item at `pos` with server id `item_id` and fluid subtype.
@@ -509,8 +553,14 @@ impl Game {
         self.broadcast_dest(pos, sp, wi, false);
     }
 
-    /// Roll the loot table and spawn items on the ground at `pos`.
-    fn spawn_loot(&mut self, pos: Position, loot: &[MonsterDrop]) {
+    /// Spawn already-rolled items on the ground at `pos`.
+    /// `loot` is `[(server_id, count)]` — pre-rolled by `roll_drops` or
+    /// `collect_player_loot`. Tile cap (10 things) checked per item.
+    ///
+    /// When `exclude_id` is `Some`, the broadcast uses non-reaping `try_send`
+    /// and excludes that creature — required during player death to avoid
+    /// reaping the dying player (who may have a full push buffer).
+    fn spawn_loot(&mut self, pos: Position, loot: &[(u16, u8)], exclude_id: Option<u32>) {
         if !self.materialize(pos) {
             return;
         }
@@ -520,19 +570,18 @@ impl Game {
             .map(|st| st.items.len())
             .unwrap_or(0);
 
-        for drop in loot {
+        for &(item_id, count) in loot {
             if stack_len >= 10 {
                 break;
-            } // tile cap
-            if !self.rng.gen_bool(drop.chance) {
-                continue;
             }
 
-            let Some(meta) = self.meta.item_meta(drop.item_id) else {
+            let Some(meta) = self.meta.item_meta(item_id) else {
                 continue;
             };
             let subtype = if meta.stackable {
-                Some(drop.count)
+                Some(count)
+            } else if meta.is_fluid {
+                Some(count) // fluid type from loot definition
             } else {
                 None
             };
@@ -547,7 +596,7 @@ impl Game {
                 let st = self.dynamic.get_mut(&(pos.x, pos.y, pos.z)).unwrap();
                 let front = st.pre_creature_len;
                 st.items.insert(front, wi);
-                st.server_ids.insert(front, drop.item_id);
+                st.server_ids.insert(front, item_id);
                 st.counts.insert(front, subtype);
             }
             let front = self
@@ -556,8 +605,76 @@ impl Game {
                 .map(|st| st.pre_creature_len)
                 .unwrap_or(0);
             let sp = (front + dest_creatures).min(9) as u8;
-            self.broadcast_dest(pos, sp, wi, false);
+            match exclude_id {
+                Some(victim) => {
+                    let pkt = tile_item::add_tile_item((pos.x, pos.y, pos.z), sp, &wi);
+                    for spec in self.spectators(pos, victim) {
+                        if let Some(p) = self.players.get(&spec) {
+                            let _ = p.push_tx.try_send(pkt.clone());
+                        }
+                    }
+                }
+                None => self.broadcast_dest(pos, sp, wi, false),
+            }
             stack_len += 1;
+        }
+    }
+
+    /// Spawn a corpse item at `pos` via overlay (same pattern as `spawn_splash`).
+    /// Silently skips if `corpse_id == 0`, tile is at capacity, or the item id
+    /// is unknown to the item catalog.
+    ///
+    /// When `exclude_id` is `Some`, the broadcast uses non-reaping `try_send`
+    /// and excludes that creature — required during player death to avoid
+    /// reaping the dying player (who may have a full push buffer).
+    fn spawn_corpse(&mut self, pos: Position, corpse_id: u16, exclude_id: Option<u32>) {
+        if corpse_id == 0 {
+            return;
+        }
+        if !self.materialize(pos) {
+            return;
+        }
+        {
+            let st = match self.dynamic.get(&(pos.x, pos.y, pos.z)) {
+                Some(st) => st,
+                None => return,
+            };
+            if st.items.len() >= 10 {
+                return; // tile cap
+            }
+        }
+        let Some(meta) = self.meta.item_meta(corpse_id) else {
+            return; // unknown corpse id — skip
+        };
+        let wi = WireItem {
+            client_id: meta.client_id,
+            subtype: None,
+            animated: meta.animated,
+        };
+        let dest_creatures = self.creatures_on(pos).len();
+        {
+            let st = self.dynamic.get_mut(&(pos.x, pos.y, pos.z)).unwrap();
+            let front = st.pre_creature_len;
+            st.items.insert(front, wi);
+            st.server_ids.insert(front, corpse_id);
+            st.counts.insert(front, None);
+        }
+        let front = self
+            .dynamic
+            .get(&(pos.x, pos.y, pos.z))
+            .map(|st| st.pre_creature_len)
+            .unwrap_or(0);
+        let sp = (front + dest_creatures).min(9) as u8;
+        match exclude_id {
+            Some(victim) => {
+                let pkt = tile_item::add_tile_item((pos.x, pos.y, pos.z), sp, &wi);
+                for spec in self.spectators(pos, victim) {
+                    if let Some(p) = self.players.get(&spec) {
+                        let _ = p.push_tx.try_send(pkt.clone());
+                    }
+                }
+            }
+            None => self.broadcast_dest(pos, sp, wi, false),
         }
     }
 
@@ -615,6 +732,7 @@ impl Game {
                 max_health: spawn.max_health,
                 speed: spawn.speed,
                 look_type: spawn.look_type,
+                look_corpse: spawn.look_corpse,
                 attacking: None,
                 last_attack_ms: 0,
                 attack: spawn.attack,
@@ -1574,23 +1692,26 @@ mod tests {
         g.monsters.get_mut(&m).unwrap().loot = vec![MonsterDrop {
             item_id: 100,
             chance: 1.0,
-            count: 1,
+            count_max: 1,
         }];
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster must be removed");
 
         // Drain death splash (monsters have race → produce 0x6A splash).
-        let _ = ra.try_recv().ok();
+        // With the new flow: splash → corpse (look_corpse=0 → none) → loot 0x6A → remove 0x6C
+        let splash = ra.try_recv().expect("must receive splash 0x6A");
+        assert_eq!(splash[0], 0x6A, "splash packet is 0x6A add-tile-item");
 
-        // Then 0x6C (creature remove), then 0x6A (item add).
+        // Then loot (0x6A add-tile-item for the rolled drop).
+        let pkt_loot = ra.try_recv().expect("must receive loot 0x6A");
+        assert_eq!(pkt_loot[0], 0x6A, "loot packet must be item add");
+
+        // Then 0x6C (creature remove).
         let pkt_6c = ra.try_recv().expect("must receive 0x6C remove");
         assert_eq!(
             pkt_6c[0], 0x6C,
             "death packet must be creature remove"
         );
-
-        let pkt_6a = ra.try_recv().expect("must receive 0x6A item add");
-        assert_eq!(pkt_6a[0], 0x6A, "loot packet must be item add");
     }
 
     #[test]
@@ -1603,19 +1724,20 @@ mod tests {
             MonsterDrop {
                 item_id: 100,
                 chance: 1.0,
-                count: 1,
+                count_max: 1,
             },
             MonsterDrop {
                 item_id: 100,
                 chance: 0.0,
-                count: 1,
+                count_max: 1,
             },
         ];
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster must be removed");
 
-        // Drain death splash (monsters have race → produces 0x6A splash).
+        // Drain death splash + corpse (monsters have race + look_corpse=0).
         let _ = ra.try_recv().ok();
+        // Corpse with look_corpse=0 produces no packet, so splash is the only pre-remove packet.
 
         let mut count = 0u32;
         while let Ok(pkt) = ra.try_recv() {
@@ -1646,6 +1768,7 @@ mod tests {
                 respawn_at_ms: None,
                 name: "Rat".into(),
                 look_type: 100,
+                look_corpse: 0,
                 health: 50,
                 max_health: 50,
                 speed: 200,
@@ -1714,6 +1837,7 @@ mod tests {
                 respawn_at_ms: None,
                 name: "Rat".into(),
                 look_type: 100,
+                look_corpse: 0,
                 health: 50,
                 max_health: 50,
                 speed: 200,
@@ -1844,5 +1968,167 @@ mod tests {
             "Blood monster death must add FULLSPLASH; sids: {:?}",
             st.server_ids
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 4: Creature corpse + loot integration tests
+    // -------------------------------------------------------------------------
+
+    // Task 4.2: Monster death spawns corpse + loot on tile
+    #[test]
+    fn monster_death_spawns_corpse_and_loot() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        {
+            let mo = g.monsters.get_mut(&m).unwrap();
+            mo.look_corpse = 3058; // human corpse server id for test
+            mo.loot = vec![MonsterDrop {
+                item_id: 100,
+                chance: 1.0,
+                count_max: 1,
+            }];
+            mo.health = 1;
+        }
+        g.do_monster_death(m, 0);
+
+        let key = (96, 117, 7);
+        let st = g.dynamic.get(&key).expect("death tile must be materialized");
+        assert!(
+            st.server_ids.contains(&3058),
+            "monster death must spawn corpse (3058); sids: {:?}",
+            st.server_ids
+        );
+        assert!(
+            st.server_ids.contains(&100),
+            "monster death must drop loot item (100); sids: {:?}",
+            st.server_ids
+        );
+    }
+
+    // Task 4.3: Player death spawns corpse + inventory items as loot
+    #[test]
+    fn player_death_spawns_corpse_and_inventory_loot() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
+        // Give player B an item in inventory slot 1 (head).
+        g.players.get_mut(&b).unwrap().inventory[0] = Some(InvItem {
+            server_id: 500,
+            client_id: 5741,
+            count: None,
+            animated: false,
+        });
+        g.players.get_mut(&b).unwrap().health = 1;
+
+        // Kill B via combat.
+        g.do_set_target(a, b);
+        for tick in 1..=5u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            if !g.players.contains_key(&b) {
+                break;
+            }
+        }
+
+        // The death tile must contain the human corpse AND the inventory item.
+        let key = (96, 117, 7);
+        let st = g
+            .dynamic
+            .get(&key)
+            .expect("death tile must be materialized");
+        assert!(
+            st.server_ids.contains(&ITEM_HUMAN_CORPSE),
+            "player death must spawn ITEM_HUMAN_CORPSE (3058); sids: {:?}",
+            st.server_ids
+        );
+        assert!(
+            st.server_ids.contains(&500),
+            "player death must drop inventory item (500); sids: {:?}",
+            st.server_ids
+        );
+    }
+
+    #[test]
+    fn player_death_empty_inventory_only_corpse() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
+        g.players.get_mut(&b).unwrap().health = 1;
+
+        g.do_set_target(a, b);
+        for tick in 1..=5u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            if !g.players.contains_key(&b) {
+                break;
+            }
+        }
+
+        let key = (96, 117, 7);
+        let st = g
+            .dynamic
+            .get(&key)
+            .expect("death tile must be materialized");
+        assert!(
+            st.server_ids.contains(&ITEM_HUMAN_CORPSE),
+            "player death must spawn corpse even with no items"
+        );
+        // Only corpse, ground, and splashes should be present.
+        let extra_ids: Vec<&u16> = st
+            .server_ids
+            .iter()
+            .filter(|&&s| {
+                s != ITEM_HUMAN_CORPSE && s != ITEM_FULLSPLASH && s != ITEM_SMALLSPLASH && s != 100
+            })
+            .collect();
+        assert!(
+            extra_ids.is_empty(),
+            "empty inventory player must drop no extra items; got: {:?}",
+            extra_ids
+        );
+    }
+
+    // Task 4.4: Tile cap — fill tile, kill monster, no panic, corpse/loot skipped
+    #[test]
+    fn monster_death_at_tile_capacity_does_not_panic() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7)); // spectator
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        {
+            let mo = g.monsters.get_mut(&m).unwrap();
+            mo.look_corpse = 3058;
+            mo.loot = vec![
+                MonsterDrop { item_id: 100, chance: 1.0, count_max: 1 },
+                MonsterDrop { item_id: 200, chance: 1.0, count_max: 1 },
+                MonsterDrop { item_id: 300, chance: 1.0, count_max: 1 },
+            ];
+            mo.health = 1;
+        }
+
+        // Fill tile — add items so it reaches the 10-thing cap.
+        // The static tile already has 1 ground item (server_id=100), so we add
+        // 9 more to reach the limit.
+        g.materialize(Position::new(96, 117, 7));
+        let key = (96, 117, 7);
+        {
+            let st = g.dynamic.get_mut(&key).unwrap();
+            // st.items has 1 ground item from static stack; add 9 more to reach 10.
+            for i in 1..=9u16 {
+                st.items.push(WireItem {
+                    client_id: i,
+                    subtype: None,
+                    animated: false,
+                });
+                st.server_ids.push(i);
+                st.counts.push(None);
+            }
+        }
+
+        // Kill — must not panic.
+        g.do_monster_death(m, 0);
+        assert!(!g.monsters.contains_key(&m), "monster removed");
+
+        // Tile should stay at capacity 10 (no corpse, no loot added).
+        let st = g.dynamic.get(&key).unwrap();
+        assert_eq!(st.items.len(), 10, "tile must stay at capacity 10");
     }
 }

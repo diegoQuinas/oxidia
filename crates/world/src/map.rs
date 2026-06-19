@@ -100,6 +100,9 @@ pub struct ItemMeta {
     pub is_container: bool,
     /// Maximum items the container holds (0 for non-containers, 8+ for bags).
     pub container_capacity: u8,
+    /// True if this item is a splash or fluid container (wire form carries a u8
+    /// fluid-type byte in the subtype position, e.g. bucket, trough, potion).
+    pub is_fluid: bool,
 }
 
 impl ItemMeta {
@@ -1157,6 +1160,7 @@ impl StaticMap {
                     equip_slot: x.and_then(|a| EquipSlot::from_xml(&a.slot_type, &a.weapon_type)),
                     is_container: it.is_container(),
                     container_capacity: x.map(|a| a.container_size).unwrap_or(0),
+                    is_fluid: it.is_fluid_or_splash(),
                 },
             );
         }
@@ -1651,6 +1655,7 @@ mod tests {
             equip_slot: None,
             is_container: false,
             container_capacity: 0,
+            is_fluid: false,
         };
         bincode_round_trip(&meta);
     }

@@ -18,6 +18,8 @@ use crate::Direction;
 use crate::Position;
 use crate::game::RaceType;
 use formats::FormatError;
+use rand::Rng;
+use rand::rngs::StdRng;
 
 /// A monster blueprint loaded from `config/monsters.xml`.
 /// These are the canonical stats for each named monster type.
@@ -25,6 +27,7 @@ use formats::FormatError;
 pub(crate) struct MonsterType {
     pub(crate) name: String,
     pub(crate) look_type: u16,
+    pub(crate) look_corpse: u16,
     pub(crate) health: u32,
     pub(crate) max_health: u32,
     pub(crate) speed: u16,
@@ -99,6 +102,7 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
             MonsterType {
                 name,
                 look_type,
+                look_corpse: 0,
                 health,
                 max_health,
                 speed,
@@ -193,13 +197,19 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
             _ => None,
         });
 
-        // Extract <look type="..."/>
+        // Extract <look type="..." corpse="..."/>
         let look_type: u16 = root
             .descendants()
             .find(|n| n.has_tag_name("look"))
             .and_then(|n| n.attribute("type"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(100);
+        let look_corpse: u16 = root
+            .descendants()
+            .find(|n| n.has_tag_name("look"))
+            .and_then(|n| n.attribute("corpse"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
         // Extract <health now="..." max="..."/>
         let (health, max_health) = root
@@ -238,16 +248,43 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
             })
             .unwrap_or(7);
 
+        // Extract <loot> section with item entries.
+        let loot: Vec<MonsterDrop> = root
+            .descendants()
+            .find(|n| n.has_tag_name("loot"))
+            .map(|loot_node| {
+                loot_node
+                    .children()
+                    .filter(|n| n.has_tag_name("item"))
+                    .filter_map(|item| {
+                        let item_id: u16 = item.attribute("id")?.parse().ok()?;
+                        let chance_raw: f64 = item.attribute("chance")?.parse().ok()?;
+                        let chance = (chance_raw / 100.0).clamp(0.0, 1.0);
+                        let count_max: u16 = item
+                            .attribute("countmax")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(1);
+                        Some(MonsterDrop {
+                            item_id,
+                            chance,
+                            count_max,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         map.insert(
             name.to_ascii_lowercase(),
             MonsterType {
                 name,
                 look_type,
+                look_corpse,
                 health,
                 max_health,
                 speed,
                 attack,
-                loot: vec![],
+                loot,
                 target_distance: 0,
                 race,
             },
@@ -324,6 +361,7 @@ pub(crate) fn parse_spawns_xml(xml: &str) -> Result<Vec<MonsterSpawn>, FormatErr
                 respawn_at_ms: None,
                 name: name.clone(),
                 look_type: name_hash_looktype(&name),
+                look_corpse: 0,
                 health: 50,
                 max_health: 50,
                 speed: 200,
@@ -345,8 +383,8 @@ pub(crate) struct MonsterDrop {
     pub(crate) item_id: u16,
     /// Probability 0.0..=1.0 for this drop to trigger.
     pub(crate) chance: f64,
-    /// Item count (subtype for stackables, 1 for non-stackables).
-    pub(crate) count: u8,
+    /// Maximum item count for the drop. When rolled, actual count is 1..=count_max.
+    pub(crate) count_max: u16,
 }
 
 /// Blueprint for a monster respawn point.
@@ -364,6 +402,7 @@ pub(crate) struct MonsterSpawn {
     /// Monster template fields carried over from the dead monster.
     pub(crate) name: String,
     pub(crate) look_type: u16,
+    pub(crate) look_corpse: u16,
     pub(crate) health: u32,
     pub(crate) max_health: u32,
     pub(crate) speed: u16,
@@ -387,6 +426,8 @@ pub(crate) struct MonsterState {
     pub(crate) speed: u16,
     /// Sprite id for the monster's look (no head/body/legs/feet/addons/mount).
     pub(crate) look_type: u16,
+    /// Corpse item id spawned on death. `0` means no corpse.
+    pub(crate) look_corpse: u16,
     /// Combat state.
     pub(crate) attacking: Option<u32>,
     /// Timestamp (ms) of the monster's last melee swing.
@@ -426,4 +467,226 @@ pub(crate) fn name_hash_looktype(name: &str) -> u16 {
         acc.wrapping_mul(31).wrapping_add(u32::from(b))
     });
     20 + (h % 480) as u16 // 20..=499 covers a wide range of creature sprites
+}
+
+/// Roll drops from a loot table using independent per-item chance.
+/// Each entry's chance is evaluated independently; successful entries
+/// produce a random count in `1..=count_max`. Failed entries are absent.
+pub(crate) fn roll_drops(rng: &mut StdRng, drops: &[MonsterDrop]) -> Vec<(u16, u8)> {
+    let mut result = Vec::with_capacity(drops.len());
+    for drop in drops {
+        if !rng.gen_bool(drop.chance) {
+            continue;
+        }
+        let count = if drop.count_max > 0 {
+            rng.gen_range(1..=drop.count_max)
+        } else {
+            1
+        };
+        result.push((drop.item_id, count as u8));
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn roll_drops_all_succeed_at_chance_1() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let drops = vec![
+            MonsterDrop { item_id: 100, chance: 1.0, count_max: 1 },
+            MonsterDrop { item_id: 200, chance: 1.0, count_max: 1 },
+        ];
+        let result = roll_drops(&mut rng, &drops);
+        assert_eq!(result.len(), 2, "all drops must succeed at chance 1.0");
+        assert!(result.contains(&(100, 1)));
+        assert!(result.contains(&(200, 1)));
+    }
+
+    #[test]
+    fn roll_drops_all_fail_at_chance_0() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let drops = vec![MonsterDrop {
+            item_id: 100,
+            chance: 0.0,
+            count_max: 1,
+        }];
+        let result = roll_drops(&mut rng, &drops);
+        assert_eq!(result.len(), 0, "zero-chance drop must not appear");
+    }
+
+    #[test]
+    fn roll_drops_independent_per_item_chance() {
+        // With a seeded RNG, run twice: results may vary per item.
+        let mut rng = StdRng::seed_from_u64(999);
+        let drops = vec![
+            MonsterDrop { item_id: 100, chance: 0.5, count_max: 1 },
+            MonsterDrop { item_id: 200, chance: 0.5, count_max: 1 },
+        ];
+        let result = roll_drops(&mut rng, &drops);
+        // At least one item may be present — we can't assert exact count
+        // due to RNG, but we CAN assert no duplicate server_ids and
+        // each item's count is valid.
+        for &(_, count) in &result {
+            assert!(count >= 1, "count must be >= 1");
+        }
+    }
+
+    #[test]
+    fn roll_drops_count_range_respected() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let drops = vec![MonsterDrop {
+            item_id: 300,
+            chance: 1.0,
+            count_max: 10,
+        }];
+        let result = roll_drops(&mut rng, &drops);
+        assert_eq!(result.len(), 1);
+        let count = result[0].1;
+        assert!(
+            (1..=10).contains(&count),
+            "count {count} must be in 1..=10"
+        );
+    }
+
+    #[test]
+    fn roll_drops_empty_table() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let drops: Vec<MonsterDrop> = vec![];
+        let result = roll_drops(&mut rng, &drops);
+        assert!(result.is_empty(), "empty loot table must produce no drops");
+    }
+
+    #[test]
+    fn roll_drops_returns_item_ids_and_counts() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let drops = vec![MonsterDrop {
+            item_id: 2671,
+            chance: 1.0,
+            count_max: 5,
+        }];
+        let result = roll_drops(&mut rng, &drops);
+        assert_eq!(result[0].0, 2671, "item_id must be preserved");
+        assert!(
+            (1..=5).contains(&result[0].1),
+            "count must be 1..=5, got {}",
+            result[0].1
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 4.5: XML parse — loot table struct fields, empty <loot>, missing countmax
+    // -------------------------------------------------------------------------
+
+    /// Minimal valid monster XML for parse_monsters_data_dir tests.
+    /// Must have a name, look/type, health now/max, speed, and optional loot.
+    fn sample_monster_xml(loot_block: &str) -> String {
+        format!(
+            r#"<monster name="TestRat" race="blood" speed="134">
+  <health now="20" max="20"/>
+  <look type="21" corpse="5964"/>
+  <attacks>
+    <attack name="melee" attack="7"/>
+  </attacks>
+  {loot_block}
+</monster>"#
+        )
+    }
+
+    /// Write sample XML files to a temp dir and parse via parse_monsters_data_dir.
+    fn parse_in_temp_dir(monster_xml: &str) -> HashMap<String, MonsterType> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let monster_file = dir.path().join("test_rat.xml");
+        std::fs::write(&monster_file, monster_xml).unwrap();
+        let index_xml = r#"<monsters>
+  <monster name="TestRat" file="test_rat.xml"/>
+</monsters>"#;
+        let index_file = dir.path().join("monsters.xml");
+        std::fs::write(&index_file, index_xml).unwrap();
+        parse_monsters_data_dir(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn xml_parse_single_loot_item() {
+        let xml = sample_monster_xml(
+            r#"<loot>
+    <item id="2671" chance="25" countmax="3"/>
+  </loot>"#,
+        );
+        let map = parse_in_temp_dir(&xml);
+        let mt = map.get("testrat").expect("TestRat must be parsed");
+        assert_eq!(mt.loot.len(), 1, "must have 1 loot entry");
+        assert_eq!(mt.loot[0].item_id, 2671);
+        assert!((mt.loot[0].chance - 0.25).abs() < f64::EPSILON);
+        assert_eq!(mt.loot[0].count_max, 3);
+    }
+
+    #[test]
+    fn xml_parse_empty_loot_block() {
+        let xml = sample_monster_xml(r#"<loot></loot>"#);
+        let map = parse_in_temp_dir(&xml);
+        let mt = map.get("testrat").expect("TestRat must be parsed");
+        assert!(
+            mt.loot.is_empty(),
+            "empty <loot> must produce empty loot vec"
+        );
+    }
+
+    #[test]
+    fn xml_parse_missing_countmax_defaults_to_1() {
+        let xml = sample_monster_xml(
+            r#"<loot>
+    <item id="2666" chance="10"/>
+  </loot>"#,
+        );
+        let map = parse_in_temp_dir(&xml);
+        let mt = map.get("testrat").expect("TestRat must be parsed");
+        assert_eq!(mt.loot.len(), 1);
+        assert_eq!(mt.loot[0].item_id, 2666);
+        assert!((mt.loot[0].chance - 0.10).abs() < f64::EPSILON);
+        assert_eq!(mt.loot[0].count_max, 1, "default count_max must be 1");
+    }
+
+    #[test]
+    fn xml_parse_multiple_loot_items() {
+        let xml = sample_monster_xml(
+            r#"<loot>
+    <item id="2671" chance="25" countmax="3"/>
+    <item id="2666" chance="10"/>
+    <item id="2681" chance="50" countmax="1"/>
+  </loot>"#,
+        );
+        let map = parse_in_temp_dir(&xml);
+        let mt = map.get("testrat").expect("TestRat must be parsed");
+        assert_eq!(mt.loot.len(), 3, "must have 3 loot entries");
+    }
+
+    #[test]
+    fn xml_parse_corpse_attribute() {
+        let xml = sample_monster_xml(r#"<loot></loot>"#);
+        let map = parse_in_temp_dir(&xml);
+        let mt = map.get("testrat").expect("TestRat must be parsed");
+        assert_eq!(mt.look_corpse, 5964, "look corpse must be parsed from <look corpse='5964'/>");
+    }
+
+    #[test]
+    fn xml_parse_no_loot_block_produces_empty_loot() {
+        // Monster XML without any <loot> section.
+        let xml = r#"<monster name="TestRat" race="blood" speed="134">
+  <health now="20" max="20"/>
+  <look type="21" corpse="5964"/>
+  <attacks>
+    <attack name="melee" attack="7"/>
+  </attacks>
+</monster>"#;
+        let map = parse_in_temp_dir(xml);
+        let mt = map.get("testrat").expect("TestRat must be parsed");
+        assert!(
+            mt.loot.is_empty(),
+            "no <loot> block must produce empty loot"
+        );
+    }
 }

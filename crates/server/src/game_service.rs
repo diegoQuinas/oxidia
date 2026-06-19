@@ -162,6 +162,8 @@ pub fn build_enter_world_burst(
                 if let Some(m) = meta.item_meta(server_id) {
                     let subtype = if m.stackable {
                         Some(count.max(1))
+                    } else if m.is_fluid {
+                        Some(count) // fluid type from persistence
                     } else {
                         None
                     };
