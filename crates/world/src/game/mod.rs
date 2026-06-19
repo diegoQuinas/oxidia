@@ -1628,7 +1628,19 @@ impl Game {
                             continue;
                         }
                     }
+                    let pos_before = self.players.get(&id).map(|p| p.position);
                     self.do_move(id, direction);
+                    // If the move was blocked (position unchanged), stop silently.
+                    if self.players.get(&id).map(|p| p.position) == pos_before
+                        && pos_before.is_some()
+                    {
+                        if let Some(p) = self.players.get_mut(&id) {
+                            p.go_to_position = None;
+                            p.follow_target = None;
+                            p.list_walk_dir.clear();
+                            p.failed_repaths = None;
+                        }
+                    }
                 }
             }
         }
@@ -2715,6 +2727,76 @@ mod tests {
         assert!(
             p.list_walk_dir.is_empty(),
             "walk queue must be cleared when stepping into PZ"
+        );
+    }
+
+    #[test]
+    fn go_to_target_blocked_by_adjacent_creature_stops_silently() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (pid, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let _mid = add_monster(&mut g, Position::new(96, 117, 7));
+        while rx.try_recv().is_ok() {}
+
+        // Target is the free tile east of the creature.
+        g.do_go_to_position(pid, Position::new(97, 117, 7));
+        while rx.try_recv().is_ok() {}
+        assert!(
+            g.players.get(&pid).unwrap().go_to_position.is_some(),
+            "go_to_position must be set before tick"
+        );
+
+        // AI tick: do_move onto creature tile should be blocked.
+        g.on_monster_ai_tick(0, 1000);
+        while rx.try_recv().is_ok() {}
+
+        let p = g.players.get(&pid).unwrap();
+        assert_eq!(
+            p.position,
+            Position::new(95, 117, 7),
+            "player must not move onto creature tile"
+        );
+        assert!(
+            p.go_to_position.is_none(),
+            "go_to_position must be cleared on blocked creature step"
+        );
+        assert!(
+            p.list_walk_dir.is_empty(),
+            "walk queue must be cleared on blocked creature step"
+        );
+    }
+
+    #[test]
+    fn go_to_target_walks_as_far_as_possible_then_stops_at_creature() {
+        // wide_combat_map_with_pz: tiles x=90..116 at y=117 (90 is PZ).
+        // Player starts outside PZ at (91,117), creature at (95,117) blocks
+        // the path, target at (97,117) is past the creature.
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
+        let (pid, mut rx) = add_player(&mut g, Position::new(91, 117, 7));
+        let _mid = add_monster(&mut g, Position::new(95, 117, 7));
+        while rx.try_recv().is_ok() {}
+
+        g.do_go_to_position(pid, Position::new(97, 117, 7));
+        while rx.try_recv().is_ok() {}
+
+        // Walk all ticks — the walk stops when blocked by the creature.
+        for tick in 1..=10 {
+            g.on_monster_ai_tick(0, tick * 1000);
+            while rx.try_recv().is_ok() {}
+        }
+
+        let p = g.players.get(&pid).unwrap();
+        assert_eq!(
+            p.position,
+            Position::new(94, 117, 7),
+            "player should stop one tile west of creature"
+        );
+        assert!(
+            p.go_to_position.is_none(),
+            "go_to_position must be cleared"
+        );
+        assert!(
+            p.list_walk_dir.is_empty(),
+            "walk queue must be cleared"
         );
     }
 
