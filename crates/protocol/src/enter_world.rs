@@ -22,6 +22,10 @@ pub const OP_EXTENDED: u8 = 0x32;
 pub const INVENTORY_SLOTS: u8 = 11;
 /// `ICON_PIGEON = 1 << 14` (TFS const.h:343): the protection-zone "dove" badge.
 pub const ICON_PIGEON: u16 = 1 << 14;
+/// `ICON_SWORDS = 1 << 7` — green crossed swords (out-of-PZ combat).
+pub const ICON_SWORDS: u16 = 1 << 7;
+/// `ICON_REDSWORDS = 1 << 13` — red crossed swords (combat-locked, cannot logout).
+pub const ICON_REDSWORDS: u16 = 1 << 13;
 /// TFS `CONST_ME_TELEPORT = 11` (const.h); wire value = TFS enum − 1.
 pub const EFFECT_TELEPORT: u8 = 10;
 /// TFS `CONST_ME_DRAWBLOOD = 1` (const.h:12). TFS `sendMagicEffect` sends the
@@ -30,6 +34,10 @@ pub const EFFECT_TELEPORT: u8 = 10;
 /// (Note: `EFFECT_TELEPORT = 10` works live despite TFS `CONST_ME_TELEPORT = 11`;
 /// that anomaly is tracked separately and left as-is.)
 pub const EFFECT_DRAWBLOOD: u8 = 1;
+/// `CONST_ME_POFF = 3` — small puff of smoke (miss / blocked).
+pub const EFFECT_POFF: u8 = 3;
+/// `CONST_ME_BLOCKHIT = 4` — sparks (damage fully absorbed by defense).
+pub const EFFECT_BLOCKHIT: u8 = 4;
 
 /// Variable stats the client renders; the rest are M3 constants baked in.
 #[derive(Debug, Clone, Copy)]

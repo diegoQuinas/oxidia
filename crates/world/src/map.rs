@@ -103,6 +103,10 @@ pub struct ItemMeta {
     /// True if this item is a splash or fluid container (wire form carries a u8
     /// fluid-type byte in the subtype position, e.g. bucket, trough, potion).
     pub is_fluid: bool,
+    /// Light level emitted by this item (0 = no light).
+    pub light_level: u8,
+    /// Light color emitted by this item (0 = default white).
+    pub light_color: u8,
 }
 
 impl ItemMeta {
@@ -1161,6 +1165,8 @@ impl StaticMap {
                     is_container: it.is_container(),
                     container_capacity: x.map(|a| a.container_size).unwrap_or(0),
                     is_fluid: it.is_fluid_or_splash(),
+                    light_level: x.map(|a| a.light_level).unwrap_or(0),
+                    light_color: x.map(|a| a.light_color).unwrap_or(0),
                 },
             );
         }
@@ -1656,6 +1662,8 @@ mod tests {
             is_container: false,
             container_capacity: 0,
             is_fluid: false,
+            light_level: 0,
+            light_color: 0,
         };
         bincode_round_trip(&meta);
     }

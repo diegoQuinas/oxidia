@@ -242,6 +242,9 @@ mod tests {
                 list_walk_dir: VecDeque::new(),
                 last_walk_ms: 0,
                 conditions: Vec::new(),
+                target_distance: 1,
+                light_level: 0,
+                light_color: 0,
             },
         );
         // Looker is at the same tile; tile pre_creature_len is 1 (just the ground),

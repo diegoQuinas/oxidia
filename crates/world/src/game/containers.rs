@@ -21,6 +21,20 @@ fn matches_source(a: ContainerSource, b: ContainerSource) -> bool {
     }
 }
 
+/// Torch server-id pairs: (unlit, lit). In TFS, torches with `light=7` and
+/// `lightColor=206` emit a warm yellow glow when lit. The ignition is triggered
+/// by ctrl+click (use-item).
+const TORCH_PAIRS: &[(u16, u16)] = &[(2050, 2051), (2052, 2053), (2054, 2055)];
+
+/// Given any known torch server_id (lit or unlit), return the opposite.
+/// This enables toggling in both directions.
+fn torch_toggle_pair(sid: u16) -> Option<u16> {
+    TORCH_PAIRS
+        .iter()
+        .find(|&&(a, b)| a == sid || b == sid)
+        .map(|&(a, b)| if a == sid { b } else { a })
+}
+
 /// TFS `Position::areInRange<1,1,0>`: within one tile on x and y, same floor.
 fn in_close_range(a: Position, b: Position) -> bool {
     a.z == b.z
@@ -177,6 +191,229 @@ impl Game {
 
     /// Handle `0x82` use-item: if the item is a container, open it as a window.
     /// Other use cases (levers, runes, potions) are M11/Lua — silently ignored here.
+    /// Open a corpse container: allocate a cid slot, convert stored loot to
+    /// ContainerItems, push 0x6E open-container + 0x70 contents to the player.
+    fn open_corpse_container(
+        &mut self,
+        id: u32,
+        pos_x: u16,
+        pos_y: u16,
+        pos_z: u8,
+        _stackpos: u8,
+        server_id: u16,
+    ) {
+        let key = (pos_x, pos_y, pos_z);
+        let Some(raw_items) = self.corpse_contents.remove(&key) else {
+            return;
+        };
+        // Use the stored corpse server_id for name + capacity, not the clicked
+        // item's server_id (which may be a decorative stone or blood pool).
+        let corpse_sid = self.corpse_item_ids.get(&key).copied().unwrap_or(server_id);
+        let Some(meta) = self.meta.item_meta(corpse_sid) else {
+            return;
+        };
+        let items: Vec<ContainerItem> = raw_items
+            .iter()
+            .filter_map(|&(sid, count)| {
+                let im = self.meta.item_meta(sid)?;
+                Some(ContainerItem {
+                    server_id: sid,
+                    client_id: im.client_id,
+                    count: if im.stackable { Some(count) } else { None },
+                    animated: im.animated,
+                })
+            })
+            .collect();
+        let capacity = meta.container_capacity.max(1);
+        let source = ContainerSource::Ground(Position::new(pos_x, pos_y, pos_z));
+
+        // Find a free cid slot.
+        let p = match self.players.get(&id) {
+            Some(p) => p,
+            None => return,
+        };
+        let new_cid = match Self::next_free_cid(p) {
+            Some(c) => c,
+            None => return,
+        };
+        let oc = OpenContainer {
+            server_id: corpse_sid,
+            client_id: meta.client_id,
+            capacity,
+            name: meta.name.clone(),
+            items: items.clone(),
+            source,
+            is_open: true,
+        };
+        if let Some(p) = self.players.get_mut(&id) {
+            p.open_containers[new_cid as usize] = Some(oc);
+        }
+        // Push 0x6E (open-container) — already includes all items as initial
+        // contents. Do NOT send 0x70 per item or the client doubles them.
+        self.push_open_container(id, new_cid);
+    }
+
+    /// Lit torch server ids whose light values are not present in items.xml
+    /// but are hardcoded here (TFS reference: level=7, color=206).
+    const TORCH_LIT_IDS: &'static [u16] = &[2051, 2053, 2055];
+
+    /// Return the light (level, color) for an item, checking both ItemMeta
+    /// and known hardcoded light sources.
+    fn item_light(sid: u16) -> (u8, u8) {
+        if Self::TORCH_LIT_IDS.contains(&sid) {
+            return (7, 206);
+        }
+        (0, 0)
+    }
+
+    /// Recalculate the player's creature light from equipped items and broadcast
+    /// a 0x8D update when the light changed.
+    pub(super) fn recalc_creature_light(&mut self, id: u32) {
+        let light = {
+            let p = match self.players.get(&id) {
+                Some(p) => p,
+                None => return,
+            };
+            let mut max_level = 0u8;
+            let mut best_color = 0u8;
+            for slot in &p.inventory {
+                let Some(it) = slot else { continue };
+            let (ll, lc) = match self.meta.item_meta(it.server_id) {
+                Some(m) if m.light_level > 0 => (m.light_level, m.light_color),
+                _ => Self::item_light(it.server_id),
+            };
+            if ll > max_level {
+                    max_level = ll;
+                    best_color = lc;
+                }
+            }
+            (max_level, best_color)
+        };
+        if let Some(p) = self.players.get_mut(&id) {
+            p.light_level = light.0;
+            p.light_color = light.1;
+        }
+        self.broadcast_creature_light(id);
+    }
+
+    /// Toggle a torch between unlit and lit states. Handles the item in
+    /// inventory slots (hand slot 5/6 lights the creature). Returns `true`
+    /// when a torch was toggled (caller should skip Lua dispatch).
+    fn do_torch_toggle(
+        &mut self,
+        id: u32,
+        server_id: u16,
+        source: ContainerSource,
+        pos_x: u16,
+        pos_y: u16,
+        pos_z: u8,
+        stackpos: u8,
+    ) -> bool {
+        let target = match torch_toggle_pair(server_id) {
+            Some(t) => t,
+            None => return false,
+        };
+        // Copy meta fields before any mutable borrow.
+        let (new_cid, new_animated) = match self.meta.item_meta(target) {
+            Some(m) => (m.client_id, m.animated),
+            None => return false,
+        };
+        match source {
+            ContainerSource::Slot(slot) => {
+                let p = match self.players.get_mut(&id) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let idx = (slot - 1) as usize;
+                let Some(it) = &mut p.inventory[idx] else {
+                    return false;
+                };
+                it.server_id = target;
+                it.client_id = new_cid;
+                it.animated = new_animated;
+                self.push_inventory_slot(id, slot);
+                self.recalc_creature_light(id);
+                true
+            }
+            ContainerSource::Ground(_) => {
+                let pos = Position::new(pos_x, pos_y, pos_z);
+                if !self.materialize(pos) {
+                    return false;
+                }
+                let pre = self
+                    .dynamic
+                    .get(&(pos.x, pos.y, pos.z))
+                    .map(|st| st.pre_creature_len)
+                    .unwrap_or(0);
+                let creatures = self.creatures_on(pos).len();
+                let sp = stackpos as usize;
+                let idx = if sp < pre {
+                    sp
+                } else if sp < pre + creatures {
+                    return false;
+                } else {
+                    sp - creatures
+                };
+                {
+                    let st = match self.dynamic.get_mut(&(pos.x, pos.y, pos.z)) {
+                        Some(st) => st,
+                        None => return false,
+                    };
+                    if idx >= st.items.len() || st.server_ids.get(idx) != Some(&server_id) {
+                        return false;
+                    }
+                    st.items[idx].client_id = new_cid;
+                    st.items[idx].animated = new_animated;
+                    st.server_ids[idx] = target;
+                }
+                // Broadcast the tile update to spectators as an in-place
+                // update (0x6B), NOT an add (0x6A), so the client does not
+                // duplicate the item.
+                let (sp, wi) = {
+                    let st = self.dynamic.get(&(pos.x, pos.y, pos.z)).unwrap();
+                    let sp = self.item_wire_stackpos(pos, idx);
+                    (sp, st.items[idx])
+                };
+                self.broadcast_dest(pos, sp, wi, true);
+                true
+            }
+            ContainerSource::Nested {
+                parent_cid,
+                parent_slot,
+            } => {
+                let p = match self.players.get_mut(&id) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let oc = match p.open_containers[parent_cid as usize].as_mut() {
+                    Some(oc) => oc,
+                    None => return false,
+                };
+                let idx = parent_slot as usize;
+                let Some(item) = oc.items.get_mut(idx) else {
+                    return false;
+                };
+                if item.server_id != server_id {
+                    return false;
+                }
+                item.server_id = target;
+                item.client_id = new_cid;
+                item.animated = new_animated;
+                // Notify the player of the changed item in the container.
+                let wire = protocol::container::ContainerWireItem {
+                    client_id: new_cid,
+                    subtype: None,
+                    animated: new_animated,
+                };
+                self.push(
+                    id,
+                    protocol::container::add_container_item(parent_cid, idx as u16, &wire),
+                );
+                true
+            }
+        }
+    }
+
     pub(super) fn do_use_item(
         &mut self,
         id: u32,
@@ -191,6 +428,9 @@ impl Game {
         };
 
         // Resolve where the item is and its server_id.
+        // Pre-compute ground-only vars needed by the corpse check below.
+        let mut ground_pre = 0usize;
+        let mut ground_src_idx: Option<usize> = None;
         let (server_id, source) = if pos_x == 0xFFFF {
             // Inventory or container endpoint.
             if pos_y & 0x40 != 0 {
@@ -247,6 +487,8 @@ impl Game {
             } else {
                 sp - creatures_len
             };
+            ground_pre = pre;
+            ground_src_idx = Some(src_idx);
             let Some(sid) = self.merged_server_id(pos, src_idx) else {
                 return;
             };
@@ -256,7 +498,22 @@ impl Game {
         let Some(meta) = self.meta.item_meta(server_id) else {
             return;
         };
+        // Overlay items on a tile with corpse_contents open the corpse container.
+        // Items at src_idx < pre are ground/below-creature items — never corpses.
+        let corpse_key = (pos_x, pos_y, pos_z);
+        if pos_x != 0xFFFF
+            && ground_src_idx.is_some_and(|idx| idx >= ground_pre)
+            && self.corpse_contents.contains_key(&corpse_key)
+        {
+            return self.open_corpse_container(id, pos_x, pos_y, pos_z, stackpos, server_id);
+        }
         if !meta.is_container {
+            // Torch toggle: ctrl+click on an unlit torch toggles it to lit.
+            // This runs BEFORE the Lua dispatch so torches work even without
+            // a Lua action script registered.
+            if self.do_torch_toggle(id, server_id, source, pos_x, pos_y, pos_z, stackpos) {
+                return;
+            }
             // Non-container item: check the XML registry for a Lua script
             // binding and dispatch the onUse hook if one exists. This is the
             // extension point for script-driven item behavior (ladders,
@@ -341,8 +598,8 @@ impl Game {
                                 let stmt = self.next_statement_id;
                                 self.next_statement_id = self.next_statement_id.wrapping_add(1);
                                 const LEVEL: u16 = 1;
-                                let cap = |s: &[u8]| -> Vec<u8> { s[..s.len().min(255)].to_vec() };
-                                let body = cap(text.as_bytes());
+                                let body = protocol::chat::string_to_latin1(&text);
+                                let body = &body[..body.len().min(255)];
                                 let xyz = (pos.x, pos.y, pos.z);
                                 let pkt = protocol::chat::creature_say(
                                     stmt,
@@ -363,6 +620,17 @@ impl Game {
                                 for spec in self.spectators_in_range(pos, player_id, rx, ry) {
                                     self.push(spec, pkt.clone());
                                 }
+                            }
+                            super::lua::GameAction::SetCreatureLight {
+                                player_id,
+                                light_level,
+                                light_color,
+                            } => {
+                                if let Some(p) = self.players.get_mut(&player_id) {
+                                    p.light_level = light_level;
+                                    p.light_color = light_color;
+                                }
+                                self.broadcast_creature_light(player_id);
                             }
                         }
                     }
@@ -1079,6 +1347,7 @@ impl Game {
                 p.inventory[(inv_slot - 1) as usize] = None;
             }
             self.push_inventory_slot(id, inv_slot);
+            self.recalc_creature_light(id);
 
             let cnt = item.count;
             let ci = ContainerItem {
@@ -1138,6 +1407,7 @@ impl Game {
                 });
             }
             self.push_inventory_slot(id, inv_slot);
+            self.recalc_creature_light(id);
         }
     }
 }

@@ -326,6 +326,16 @@ pub(super) fn default_initial(outfit: Outfit) -> InitialState {
 /// Insert a monster at `pos` and return its id.
 #[allow(dead_code)]
 pub(super) fn add_monster(g: &mut Game, pos: Position) -> u32 {
+    add_monster_with_personality(g, pos, Personality::Neutral)
+}
+
+/// Insert a monster with a specific personality at `pos` and return its id.
+#[allow(dead_code)]
+pub(super) fn add_monster_with_personality(
+    g: &mut Game,
+    pos: Position,
+    personality: Personality,
+) -> u32 {
     let id = g.next_monster_id;
     g.next_monster_id += 1;
     g.monsters.insert(
@@ -348,6 +358,10 @@ pub(super) fn add_monster(g: &mut Game, pos: Position) -> u32 {
             follow_target: None,
             target_distance: 0,
             race: Some(RaceType::Blood),
+            personality,
+            aggro_range: DEFAULT_AGGRO_RANGE,
+            light_level: 0,
+            light_color: 0,
         },
     );
     id
@@ -379,6 +393,7 @@ pub(super) fn add_player(g: &mut Game, pos: Position) -> (u32, mpsc::Receiver<Ve
             prev_outfit: None,
             noclip: false,
             speed: 220,
+            target_distance: 1,
             inventory: [None; 10],
             open_containers: std::array::from_fn(|_| None),
             follow_target: None,
@@ -387,6 +402,8 @@ pub(super) fn add_player(g: &mut Game, pos: Position) -> (u32, mpsc::Receiver<Ve
             list_walk_dir: VecDeque::new(),
             last_walk_ms: 0,
             conditions: Vec::new(),
+            light_level: 0,
+            light_color: 0,
         },
     );
     (id, rx)

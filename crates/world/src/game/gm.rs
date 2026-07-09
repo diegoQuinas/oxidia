@@ -24,6 +24,8 @@ enum GmVerb {
     Ghost,
     Noclip,
     Speed,
+    Day,
+    Night,
 }
 
 impl GmVerb {
@@ -43,6 +45,8 @@ impl GmVerb {
         Self::Ghost,
         Self::Noclip,
         Self::Speed,
+        Self::Day,
+        Self::Night,
     ];
 
     /// Accepted command words (first is canonical; the rest are aliases).
@@ -62,6 +66,8 @@ impl GmVerb {
             Self::Ghost => &["ghost"],
             Self::Noclip => &["noclip"],
             Self::Speed => &["speed", "spd"],
+            Self::Day => &["day"],
+            Self::Night => &["night"],
         }
     }
 
@@ -82,6 +88,8 @@ impl GmVerb {
             Self::Ghost => "/ghost",
             Self::Noclip => "/noclip",
             Self::Speed => "/speed <value> | /speed \"player\" <value>",
+            Self::Day => "/day",
+            Self::Night => "/night",
         }
     }
 
@@ -102,6 +110,8 @@ impl GmVerb {
             Self::Ghost => "Toggle ghost mode: invisible to non-GMs, walk through everything.",
             Self::Noclip => "Toggle noclip mode: walk through everything, remains visible.",
             Self::Speed => "Set movement speed on yourself or another player (10-2500).",
+            Self::Day => "Set world light to day (bright).",
+            Self::Night => "Set world light to night (dark).",
         }
     }
 
@@ -196,6 +206,8 @@ impl Game {
             GmVerb::Ghost => self.gm_ghost(id),
             GmVerb::Noclip => self.gm_noclip(id),
             GmVerb::Speed => self.gm_speed(id, &args),
+            GmVerb::Day => self.gm_day(id),
+            GmVerb::Night => self.gm_night(id),
         }
     }
 
@@ -511,6 +523,10 @@ impl Game {
             follow_target: None,
             target_distance: template.map(|t| t.target_distance).unwrap_or(0),
             race: template.and_then(|t| t.race),
+            personality: template.map(|t| t.personality).unwrap_or(Personality::Neutral),
+            aggro_range: template.map(|t| t.aggro_range).unwrap_or(DEFAULT_AGGRO_RANGE),
+            light_level: 0,
+            light_color: 0,
         };
         self.monsters.insert(mid, monster);
         // Broadcast the new monster to every spectator (including the GM).
@@ -802,6 +818,24 @@ impl Game {
                 .unwrap_or_default()
         };
         self.push_status_message(id, format!("{who} speed set to {value}.").as_bytes());
+    }
+
+    /// `/day` — force day phase (light transitions gradually from 35 to 215).
+    fn gm_day(&mut self, id: u32) {
+        self.day_phase = DayPhase::Day;
+        self.phase_elapsed_ms = 0;
+        self.world_light_level = self.current_world_light_level();
+        self.broadcast_world_light();
+        self.push_status_message(id, b"World light set to day (dawn).");
+    }
+
+    /// `/night` — force night phase (light transitions gradually from 215 to 35).
+    fn gm_night(&mut self, id: u32) {
+        self.day_phase = DayPhase::Night;
+        self.phase_elapsed_ms = 0;
+        self.world_light_level = self.current_world_light_level();
+        self.broadcast_world_light();
+        self.push_status_message(id, b"World light set to night (dusk).");
     }
 }
 

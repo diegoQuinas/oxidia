@@ -117,6 +117,8 @@ pub fn build_enter_world_burst(
     center: Center,
     map_description: &[u8],
     meta: &WorldMeta,
+    world_light_level: u8,
+    world_light_color: u8,
 ) -> Vec<u8> {
     let snapshot_id = player.id;
     let health = player.health;
@@ -182,7 +184,7 @@ pub fn build_enter_world_burst(
     }
     burst.extend(enter_world::stats(&stats));
     burst.extend(enter_world::skills());
-    burst.extend(enter_world::world_light(215, 215));
+    burst.extend(enter_world::world_light(world_light_level, world_light_color));
     burst.extend(enter_world::creature_light(snapshot_id, 0, 0));
     burst.extend(enter_world::basic_data());
     // The PZ icon is set by the world actor on login — the network layer no
@@ -289,6 +291,8 @@ where
         center,
         &ack.map_description,
         world.meta.as_ref(),
+        ack.world_light_level,
+        ack.world_light_color,
     );
     send_encrypted(&mut stream, &keys, &burst).await?;
     tracing::info!(character = %name, id = snapshot.id, ?center, "player entered game");
@@ -1055,7 +1059,7 @@ mod tests {
             max_health: 150,
             inventory: &[],
         };
-        let burst = build_enter_world_burst(&player, center, &[], meta.as_ref());
+        let burst = build_enter_world_burst(&player, center, &[], meta.as_ref(), 215, 215);
         // The icons packet [0xA2, 0x00, 0x00] for no icon must be present.
         // No PZ icon since spatial data isn't in WorldMeta.
         assert!(

@@ -37,11 +37,21 @@ impl Game {
     /// - Attacker on a PZ tile → push `0xB4` and do NOT set target
     ///   (`combat.cpp:294-297`, TFS `playerSetAttackedCreature`).
     /// - Unknown target (player or monster) is silently ignored.
+    /// Push the combat-status icons (red swords) to `id` based on their
+    /// current combat state and tile. Red swords when attacking and not in PZ.
+    fn push_combat_icons(&mut self, id: u32) {
+        let in_combat = self.players.get(&id).and_then(|p| p.attacking).is_some();
+        let in_pz = self.players.get(&id).map(|p| self.chunks.is_protection_zone(p.position)).unwrap_or(false);
+        let mask = if in_combat && !in_pz { enter_world::ICON_REDSWORDS } else { 0 };
+        self.push(id, enter_world::icons(mask));
+    }
+
     pub(super) fn do_set_target(&mut self, id: u32, target_id: u32) {
         if target_id == 0 {
             if let Some(p) = self.players.get_mut(&id) {
                 p.attacking = None;
             }
+            self.push_combat_icons(id);
             return;
         }
         if target_id == id {
@@ -70,6 +80,7 @@ impl Game {
             // MELEE_ATTACK_INTERVAL_MS swings immediately.
             p.last_attack_ms = 0;
         }
+        self.push_combat_icons(id);
     }
 
     /// Apply `dmg` hit points of damage to `victim_id`, dealt by `attacker_id`.
@@ -91,6 +102,8 @@ impl Game {
             Some(p) => p.position,
             None => return,
         };
+        // Compute actual damage applied (clamped at remaining HP).
+        let applied = health_before.saturating_sub(new_health);
         // Push 0x8C health-bar to every spectator of the victim's tile,
         // INCLUDING the victim itself (it is also a spectator of its own tile).
         let pct = combat_packets::health_percent(new_health as i32, max_health as i32);
@@ -128,25 +141,23 @@ impl Game {
             })
         };
         self.push(victim_id, stats);
-        // Push a physical-hit magic effect on the victim's tile to all spectators.
-        // Physical-hit blood effect. TFS sends the effect byte directly, so the
-        // wire value is the enum value (CONST_ME_DRAWBLOOD = 1). See
-        // enter_world::EFFECT_DRAWBLOOD.
+        // Hit effect: blood on damage, puff on miss.
+        let hit_effect = if applied > 0 {
+            enter_world::EFFECT_DRAWBLOOD
+        } else {
+            enter_world::EFFECT_POFF
+        };
         let effect = enter_world::magic_effect(
             victim_pos.x,
             victim_pos.y,
             victim_pos.z,
-            enter_world::EFFECT_DRAWBLOOD,
+            hit_effect,
         );
         for sid in &spectators {
             self.push(*sid, effect.clone());
         }
-        // Floating damage number (0xB4 TextMessage). Use the damage actually
-        // applied (clamped at the victim's remaining HP), not the raw roll, so
-        // an overkill shows the real hit. A 0 value renders nothing client-side,
-        // so skip the packet entirely. The mode byte is routed per recipient:
-        // the attacker sees "dealt", the victim "received", bystanders "others".
-        let applied = health_before.saturating_sub(new_health);
+        // Floating damage number (0xB4 TextMessage). A 0 value renders nothing
+        // client-side, so skip the packet entirely.
         if applied > 0 {
             let victim_name = self
                 .creature_name(victim_id)
@@ -377,19 +388,23 @@ impl Game {
             self.push(*sid, health_bar.clone());
         }
 
-        // Physical-hit blood effect to all player spectators.
+        // Compute actual damage applied.
+        let applied = health_before.saturating_sub(new_health);
+        // Hit effect: blood on damage, puff on miss.
+        let hit_effect = if applied > 0 {
+            enter_world::EFFECT_DRAWBLOOD
+        } else {
+            enter_world::EFFECT_POFF
+        };
         let effect = enter_world::magic_effect(
             victim_pos.x,
             victim_pos.y,
             victim_pos.z,
-            enter_world::EFFECT_DRAWBLOOD,
+            hit_effect,
         );
         for sid in &player_spectators {
             self.push(*sid, effect.clone());
         }
-
-        // Floating damage number.
-        let applied = health_before.saturating_sub(new_health);
         if applied > 0 {
             let monster_name = self
                 .creature_name(victim_id)
@@ -457,24 +472,18 @@ impl Game {
     /// from the monster registry, and spawn loot on the death tile. If the
     /// monster had a spawn entry, schedule a respawn.
     fn do_monster_death(&mut self, victim_id: u32, now_ms: u64) {
+        tracing::debug!(victim_id, "do_monster_death called");
         let (spawn_id, death_pos, loot, race, look_corpse) = match self.monsters.get(&victim_id) {
             Some(m) => (m.spawn_id, m.position, m.loot.clone(), m.race, m.look_corpse),
-            None => return,
+            None => {
+                tracing::warn!(victim_id, "do_monster_death called for already-dead monster");
+                return;
+            }
         };
 
-        // On-death splash from monster's race.
-        if let Some(fluid) = race.and_then(RaceType::fluid_subtype) {
-            self.spawn_splash(death_pos, ITEM_FULLSPLASH, fluid);
-        }
-
-        // Spawn corpse on the death tile (before creature removal so the overlay
-        // stack order is: splash → corpse → (creatures) → loot).
-        // No exclude_id — monsters don't have push buffers.
-        self.spawn_corpse(death_pos, look_corpse, None);
-
-        // Pre-roll drops and place them on the death tile.
-        let rolled = roll_drops(&mut self.rng, &loot);
-        self.spawn_loot(death_pos, &rolled, None);
+        // 1. Clear fights, remove creature from world FIRST (frees a slot on tile),
+        //    broadcast remove, then spawn items (splash, corpse, loot).
+        //    Order matters: the creature must be gone so tile-capacity checks pass.
 
         // Clear all player fights targeting the monster.
         let all_players: Vec<u32> = self.players.keys().copied().collect();
@@ -495,7 +504,7 @@ impl Game {
             }
         }
 
-        // Remove from the death tile for all player spectators.
+        // Remove creature from the death tile (spectators).
         for spec in self.spectators(death_pos, u32::MAX) {
             self.push(spec, walk::remove_creature_by_id(victim_id));
             if let Some(s) = self.players.get_mut(&spec) {
@@ -503,10 +512,18 @@ impl Game {
             }
         }
 
-        // Drop the monster.
+        // Drop the monster (frees one tile slot for splash/corpse).
         self.monsters.remove(&victim_id);
 
-        // Schedule a respawn if this monster belonged to a spawn point.
+        // 2. On-death splash + corpse + loot (tile now has room).
+        if let Some(fluid) = race.and_then(RaceType::fluid_subtype) {
+            self.spawn_splash(death_pos, ITEM_FULLSPLASH, fluid);
+        }
+        self.spawn_corpse(death_pos, look_corpse, None);
+        let rolled = roll_drops(&mut self.rng, &loot);
+        self.spawn_loot(death_pos, &rolled, None);
+
+        // 3. Schedule respawn.
         if let Some(sid) = spawn_id {
             if let Some(spawn) = self.spawns.get_mut(&sid) {
                 spawn.respawn_at_ms = Some(now_ms + spawn.respawn_interval_ms);
@@ -520,107 +537,62 @@ impl Game {
     /// Silently returns if the tile is at capacity (≥10 things).
     fn spawn_splash(&mut self, pos: Position, item_id: u16, fluid: u8) {
         if !self.materialize(pos) {
+            tracing::warn!(?pos, "spawn_splash: materialize failed");
             return;
         }
-        {
-            let st = match self.dynamic.get(&(pos.x, pos.y, pos.z)) {
-                Some(st) => st,
-                None => return,
-            };
-            if st.items.len() >= 10 {
-                return; // tile cap
-            }
-        }
+        // No tile cap check — TFS uses FLAG_NOLIMIT for death items (splash,
+        // corpse). The client renders the top 10 things regardless.
         let wi = WireItem {
             client_id: item_id,
             subtype: Some(fluid),
             animated: false,
         };
-        let dest_creatures = self.creatures_on(pos).len();
-        {
+        let front = {
             let st = self.dynamic.get_mut(&(pos.x, pos.y, pos.z)).unwrap();
             let front = st.pre_creature_len;
             st.items.insert(front, wi);
             st.server_ids.insert(front, item_id);
             st.counts.insert(front, Some(fluid));
-        }
-        let front = self
-            .dynamic
-            .get(&(pos.x, pos.y, pos.z))
-            .map(|st| st.pre_creature_len)
-            .unwrap_or(0);
-        let sp = (front + dest_creatures).min(9) as u8;
+            front
+        };
+        // Splash goes at `front` (below creatures, above ground).
+        let sp = front.min(9) as u8;
         self.broadcast_dest(pos, sp, wi, false);
+        self.schedule_decay(pos, sp, SPLASH_DECAY_MS);
     }
 
-    /// Spawn already-rolled items on the ground at `pos`.
+    /// Store items inside the corpse at `pos` instead of dropping on the ground.
     /// `loot` is `[(server_id, count)]` — pre-rolled by `roll_drops` or
-    /// `collect_player_loot`. Tile cap (10 things) checked per item.
-    ///
-    /// When `exclude_id` is `Some`, the broadcast uses non-reaping `try_send`
-    /// and excludes that creature — required during player death to avoid
-    /// reaping the dying player (who may have a full push buffer).
-    fn spawn_loot(&mut self, pos: Position, loot: &[(u16, u8)], exclude_id: Option<u32>) {
-        if !self.materialize(pos) {
-            return;
-        }
-        let mut stack_len = self
-            .dynamic
-            .get(&(pos.x, pos.y, pos.z))
-            .map(|st| st.items.len())
-            .unwrap_or(0);
-
+    /// `collect_player_loot`. The contents are read when a player opens the
+    /// corpse via 0x82 use-item.
+    fn spawn_loot(&mut self, pos: Position, loot: &[(u16, u8)], _exclude_id: Option<u32>) {
+        let key = (pos.x, pos.y, pos.z);
+        let contents = self.corpse_contents.entry(key).or_default();
+        let before = contents.len();
         for &(item_id, count) in loot {
-            if stack_len >= 10 {
+            if contents.len() >= 20 {
                 break;
             }
-
-            let Some(meta) = self.meta.item_meta(item_id) else {
-                continue;
-            };
-            let subtype = if meta.stackable {
-                Some(count)
-            } else if meta.is_fluid {
-                Some(count) // fluid type from loot definition
-            } else {
-                None
-            };
-            let wi = WireItem {
-                client_id: meta.client_id,
-                subtype,
-                animated: meta.animated,
-            };
-
-            let dest_creatures = self.creatures_on(pos).len();
-            {
-                let st = self.dynamic.get_mut(&(pos.x, pos.y, pos.z)).unwrap();
-                let front = st.pre_creature_len;
-                st.items.insert(front, wi);
-                st.server_ids.insert(front, item_id);
-                st.counts.insert(front, subtype);
-            }
-            let front = self
-                .dynamic
-                .get(&(pos.x, pos.y, pos.z))
-                .map(|st| st.pre_creature_len)
-                .unwrap_or(0);
-            let sp = (front + dest_creatures).min(9) as u8;
-            match exclude_id {
-                Some(victim) => {
-                    let pkt = tile_item::add_tile_item((pos.x, pos.y, pos.z), sp, &wi);
-                    for spec in self.spectators(pos, victim) {
-                        if let Some(p) = self.players.get(&spec) {
-                            let _ = p.push_tx.try_send(pkt.clone());
-                        }
-                    }
-                }
-                None => self.broadcast_dest(pos, sp, wi, false),
-            }
-            stack_len += 1;
+            contents.push((item_id, count));
+        }
+        tracing::info!(
+            pos = ?(pos.x, pos.y, pos.z),
+            before, added = loot.len(),
+            after = contents.len(),
+            loot = ?loot,
+            "spawn_loot called"
+        );
+        if before > 0 {
+            tracing::warn!(
+                pos = ?(pos.x, pos.y, pos.z),
+                before, after = contents.len(),
+                "spawn_loot: corpse_contents already had items — APPENDING"
+            );
         }
     }
 
-    /// Spawn a corpse item at `pos` via overlay (same pattern as `spawn_splash`).
+    /// Spawn a corpse item at `pos` via overlay. Inserts AFTER existing
+    /// pre-creature items (so the corpse renders on top of any splash/blood).
     /// Silently skips if `corpse_id == 0`, tile is at capacity, or the item id
     /// is unknown to the item catalog.
     ///
@@ -632,39 +604,42 @@ impl Game {
             return;
         }
         if !self.materialize(pos) {
+            tracing::warn!(?pos, corpse_id, "spawn_corpse: materialize failed");
             return;
         }
         {
-            let st = match self.dynamic.get(&(pos.x, pos.y, pos.z)) {
+            let _st = match self.dynamic.get(&(pos.x, pos.y, pos.z)) {
                 Some(st) => st,
-                None => return,
+                None => {
+                    tracing::warn!(?pos, corpse_id, "spawn_corpse: no dynamic tile");
+                    return;
+                }
             };
-            if st.items.len() >= 10 {
-                return; // tile cap
-            }
         }
         let Some(meta) = self.meta.item_meta(corpse_id) else {
-            return; // unknown corpse id — skip
+            tracing::warn!(?pos, corpse_id, "spawn_corpse: unknown corpse id (not in item registry)");
+            return;
         };
         let wi = WireItem {
             client_id: meta.client_id,
             subtype: None,
             animated: meta.animated,
         };
-        let dest_creatures = self.creatures_on(pos).len();
-        {
+        // Insert AFTER existing pre-creature items (splash, etc.) so the corpse
+        // renders on top of blood pools.
+        let idx = {
             let st = self.dynamic.get_mut(&(pos.x, pos.y, pos.z)).unwrap();
-            let front = st.pre_creature_len;
-            st.items.insert(front, wi);
-            st.server_ids.insert(front, corpse_id);
-            st.counts.insert(front, None);
-        }
-        let front = self
-            .dynamic
-            .get(&(pos.x, pos.y, pos.z))
-            .map(|st| st.pre_creature_len)
-            .unwrap_or(0);
-        let sp = (front + dest_creatures).min(9) as u8;
+            let idx = st.items.len(); // after all existing items
+            st.items.insert(idx, wi);
+            st.server_ids.insert(idx, corpse_id);
+            st.counts.insert(idx, None);
+            idx
+        };
+        // Mark this tile as having a corpse (persists across container open).
+        self.corpse_tiles.insert((pos.x, pos.y, pos.z));
+        self.corpse_item_ids.insert((pos.x, pos.y, pos.z), corpse_id);
+        // Corpse sits above splashes (higher stackpos = renders on top).
+        let sp = idx.min(9) as u8;
         match exclude_id {
             Some(victim) => {
                 let pkt = tile_item::add_tile_item((pos.x, pos.y, pos.z), sp, &wi);
@@ -676,6 +651,12 @@ impl Game {
             }
             None => self.broadcast_dest(pos, sp, wi, false),
         }
+        let decay_ms = if corpse_id == ITEM_HUMAN_CORPSE {
+            CORPSE_DECAY_MS
+        } else {
+            MONSTER_CORPSE_DECAY_MS
+        };
+        self.schedule_decay(pos, sp, decay_ms);
     }
 
     /// Global combat tick. Iterates all players with an active target and, for
@@ -704,6 +685,66 @@ impl Game {
 
         // --- Respawn overdue spawn points (M12.5) ---
         self.process_respawns(now_ms);
+
+        // --- Decay expired overlay items ---
+        self.process_decay(now_ms);
+    }
+
+    /// Schedule an overlay item for removal after `delay_ms`.
+    fn schedule_decay(&mut self, pos: Position, stackpos: u8, delay_ms: u64) {
+        let ts = self.now_ms.saturating_add(delay_ms);
+        self.decay_queue.push(DecayEntry {
+            remove_at_ms: ts,
+            pos: (pos.x, pos.y, pos.z),
+            stackpos,
+        });
+    }
+
+    /// Remove all overlay items whose decay timer has elapsed. Broadcasts 0x6B
+    /// remove-tile-item to spectators. Cleans up corpse_contents for corpses.
+    fn process_decay(&mut self, now_ms: u64) {
+        let mut i = 0;
+        while i < self.decay_queue.len() {
+            if now_ms < self.decay_queue[i].remove_at_ms {
+                i += 1;
+                continue;
+            }
+            let entry = self.decay_queue.swap_remove(i);
+            let (x, y, z) = entry.pos;
+            let sp = entry.stackpos;
+
+            // Remove from overlay at the correct index.
+            let pre = self
+                .dynamic
+                .get(&(x, y, z))
+                .map(|st| st.pre_creature_len)
+                .unwrap_or(0);
+            let creatures_on = self.creatures_on(Position::new(x, y, z)).len();
+            let idx = if usize::from(sp) < pre {
+                usize::from(sp)
+            } else {
+                usize::from(sp).saturating_sub(creatures_on)
+            };
+            if let Some(st) = self.dynamic.get_mut(&(x, y, z)) {
+                if idx < st.items.len() {
+                    st.items.remove(idx);
+                    st.server_ids.remove(idx);
+                    st.counts.remove(idx);
+                }
+            }
+
+            // Broadcast 0x6C remove to spectators (positional form works for items).
+            let pos = Position::new(x, y, z);
+            let remove_pkt = tile_creature::remove_tile_thing((x, y, z), sp);
+            for sid in self.spectators(pos, u32::MAX) {
+                self.push(sid, remove_pkt.clone());
+            }
+
+            // Clean up corpse data for this corpse.
+            self.corpse_contents.remove(&(x, y, z));
+            self.corpse_tiles.remove(&(x, y, z));
+            self.corpse_item_ids.remove(&(x, y, z));
+        }
     }
 
     /// Check all spawn points for overdue respawns and create the monster.
@@ -742,6 +783,10 @@ impl Game {
                 follow_target: None,
                 target_distance: spawn.target_distance,
                 race: spawn.race,
+                personality: spawn.personality,
+                aggro_range: spawn.aggro_range,
+                light_level: 0,
+                light_color: 0,
             };
             self.monsters.insert(mid, monster);
             // Broadcast the resawned monster.
@@ -761,7 +806,9 @@ impl Game {
         }
     }
 
-    /// Process a player's melee attack against `target_id`.
+    /// Process a player's attack against `target_id`.
+    /// Supports both melee (range 1) and ranged (range > 1) based on
+    /// the player's `target_distance` field. Ranged attacks require LOS.
     fn process_player_attack(&mut self, attacker_id: u32, target_id: u32, now_ms: u64) {
         let target_pos = match self.creature_position(target_id) {
             Some(pos) => pos,
@@ -772,10 +819,11 @@ impl Game {
                 return;
             }
         };
-        let (attacker_pos, last_attack, fist_skill) = match self.players.get(&attacker_id) {
-            Some(p) => (p.position, p.last_attack_ms, p.fist_skill),
-            None => return,
-        };
+        let (attacker_pos, last_attack, fist_skill, target_distance) =
+            match self.players.get(&attacker_id) {
+                Some(p) => (p.position, p.last_attack_ms, p.fist_skill, p.target_distance),
+                None => return,
+            };
         let target_is_player = self.players.contains_key(&target_id);
         if self.chunks.is_protection_zone(attacker_pos)
             || (target_is_player && self.chunks.is_protection_zone(target_pos))
@@ -793,12 +841,41 @@ impl Game {
         }
         let dx = (i32::from(attacker_pos.x) - i32::from(target_pos.x)).abs();
         let dy = (i32::from(attacker_pos.y) - i32::from(target_pos.y)).abs();
-        if dx > 1 || dy > 1 {
+        let range = target_distance.max(1);
+        if dx.max(dy) > RANGED_MAX_DISTANCE.min(range) {
+            return;
+        }
+        // Ranged attacks need clear sight (no projectile-blocking tiles between).
+        // Uses is_sight_clear with same_floor=true so only the direct line matters,
+        // not the floor-above fallback that can_throw_object_to depends on.
+        let ranged = range > 1 || dx.max(dy) > 1;
+        if ranged && !self.chunks.is_sight_clear(attacker_pos, target_pos, true) {
             return;
         }
         let dmg = combat::fist_damage(&mut self.rng, 1, fist_skill);
         if let Some(p) = self.players.get_mut(&attacker_id) {
             p.last_attack_ms = now_ms;
+            p.target_distance = target_distance; // preserve — future weapons may change it
+        }
+        // Projectile effect for ranged attacks.
+        if ranged {
+            let effect = enter_world::magic_effect(
+                target_pos.x,
+                target_pos.y,
+                target_pos.z,
+                enter_world::EFFECT_DRAWBLOOD,
+            );
+            let viewers: Vec<u32> = self
+                .players
+                .iter()
+                .filter(|&(&sid, ref sp)| {
+                    Self::can_see(sp.position, target_pos) || sid == attacker_id || sid == target_id
+                })
+                .map(|(&sid, _)| sid)
+                .collect();
+            for sid in viewers {
+                self.push(sid, effect.clone());
+            }
         }
         if target_is_player {
             self.apply_damage(attacker_id, target_id, dmg);
@@ -807,7 +884,9 @@ impl Game {
         }
     }
 
-    /// Process a monster's melee attack against `target_id` (player or monster).
+    /// Process a monster's attack against `target_id`.
+    /// Uses `target_distance` from MonsterState — when > 1 the monster attacks
+    /// at range, requiring line of sight.
     fn process_monster_attack(&mut self, attacker_id: u32, target_id: u32, now_ms: u64) {
         let target_pos = match self.creature_position(target_id) {
             Some(pos) => pos,
@@ -819,10 +898,11 @@ impl Game {
             }
         };
         let target_is_player = self.players.contains_key(&target_id);
-        let (attacker_pos, last_attack, attack) = match self.monsters.get(&attacker_id) {
-            Some(m) => (m.position, m.last_attack_ms, m.attack),
-            None => return,
-        };
+        let (attacker_pos, last_attack, attack, target_distance) =
+            match self.monsters.get(&attacker_id) {
+                Some(m) => (m.position, m.last_attack_ms, m.attack, m.target_distance),
+                None => return,
+            };
         // PZ check: attacker in PZ always clears; target PZ only matters for players.
         if self.chunks.is_protection_zone(attacker_pos)
             || (target_is_player && self.chunks.is_protection_zone(target_pos))
@@ -840,12 +920,38 @@ impl Game {
         }
         let dx = (i32::from(attacker_pos.x) - i32::from(target_pos.x)).abs();
         let dy = (i32::from(attacker_pos.y) - i32::from(target_pos.y)).abs();
-        if dx > 1 || dy > 1 {
+        let range = target_distance.max(1);
+        if dx.max(dy) > RANGED_MAX_DISTANCE.min(range) {
+            return;
+        }
+        // Ranged attacks need line of sight.
+        let ranged = range > 1 || dx.max(dy) > 1;
+        if ranged && !self.chunks.can_throw_object_to(attacker_pos, target_pos) {
             return;
         }
         let dmg: i32 = self.rng.gen_range(0..=attack).into();
         if let Some(m) = self.monsters.get_mut(&attacker_id) {
             m.last_attack_ms = now_ms;
+        }
+        // Projectile effect for ranged attacks.
+        if ranged {
+            let effect = enter_world::magic_effect(
+                target_pos.x,
+                target_pos.y,
+                target_pos.z,
+                enter_world::EFFECT_DRAWBLOOD,
+            );
+            let viewers: Vec<u32> = self
+                .players
+                .iter()
+                .filter(|&(&sid, ref sp)| {
+                    Self::can_see(sp.position, target_pos) || sid == target_id
+                })
+                .map(|(&sid, _)| sid)
+                .collect();
+            for sid in viewers {
+                self.push(sid, effect.clone());
+            }
         }
         if target_is_player {
             self.apply_damage(attacker_id, target_id, dmg);
@@ -1245,6 +1351,8 @@ mod tests {
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, m);
+        // Drain the combat-icons packet pushed by do_set_target.
+        let _ = ra.try_recv().ok();
         let hp_before = g.monsters[&m].health;
         g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
         let hp_after = g.monsters[&m].health;
@@ -1319,6 +1427,7 @@ mod tests {
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(97, 117, 7)); // 2 tiles east
         g.do_set_target(a, m);
+        let _ = ra.try_recv().ok(); // drain combat-icons packet
         g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
         assert!(
             ra.try_recv().is_err(),
@@ -1332,6 +1441,7 @@ mod tests {
         let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, m);
+        let _ = ra.try_recv().ok(); // drain combat-icons packet
         g.on_combat_tick(1000); // < 2000ms interval
         assert!(
             ra.try_recv().is_err(),
@@ -1673,9 +1783,10 @@ mod tests {
         // loot is empty by default
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster must be removed");
-        // Drain death splash (monsters have race → produce 0x6A splash).
-        let _ = ra.try_recv().ok();
-        // No loot 0x6A packets beyond the splash.
+        // Drain creature remove (0x6C) + splash (0x6A).
+        let _ = ra.try_recv().ok(); // 0x6C
+        let _ = ra.try_recv().ok(); // 0x6A splash
+        // No loot 0x6A packets beyond these.
         while let Ok(pkt) = ra.try_recv() {
             assert_ne!(
                 pkt[0], 0x6A,
@@ -1697,21 +1808,22 @@ mod tests {
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster must be removed");
 
-        // Drain death splash (monsters have race → produce 0x6A splash).
-        // With the new flow: splash → corpse (look_corpse=0 → none) → loot 0x6A → remove 0x6C
+        // First packet is 0x6C creature remove (creature removed before items).
+        let remove = ra.try_recv().expect("must receive 0x6C creature remove");
+        assert_eq!(remove[0], 0x6C, "first packet is creature remove (0x6C)");
+
+        // Then death splash (monsters have race → produce 0x6A splash).
         let splash = ra.try_recv().expect("must receive splash 0x6A");
         assert_eq!(splash[0], 0x6A, "splash packet is 0x6A add-tile-item");
 
-        // Then loot (0x6A add-tile-item for the rolled drop).
-        let pkt_loot = ra.try_recv().expect("must receive loot 0x6A");
-        assert_eq!(pkt_loot[0], 0x6A, "loot packet must be item add");
-
-        // Then 0x6C (creature remove).
-        let pkt_6c = ra.try_recv().expect("must receive 0x6C remove");
-        assert_eq!(
-            pkt_6c[0], 0x6C,
-            "death packet must be creature remove"
-        );
+        // Loot is now stored in corpse_contents, not on the ground.
+        // Verify the loot went into the corpse.
+        let contents = g.corpse_contents.get(&(96, 117, 7));
+        assert!(contents.is_some(), "loot must be stored in corpse_contents");
+        assert!(!contents.unwrap().is_empty(), "corpse must contain loot");
+        // The loot should include item 100 (rolled from the hardcoded loot).
+        let has_item = contents.unwrap().iter().any(|&(sid, _)| sid == 100);
+        assert!(has_item, "corpse must contain the rolled loot item");
     }
 
     #[test]
@@ -1735,20 +1847,16 @@ mod tests {
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster must be removed");
 
-        // Drain death splash + corpse (monsters have race + look_corpse=0).
+        // Drain death splash.
         let _ = ra.try_recv().ok();
-        // Corpse with look_corpse=0 produces no packet, so splash is the only pre-remove packet.
 
-        let mut count = 0u32;
-        while let Ok(pkt) = ra.try_recv() {
-            if pkt[0] == 0x6A {
-                count += 1;
-            }
-        }
-        assert_eq!(
-            count, 1,
-            "only the 1.0-chance drop must produce a 0x6A packet"
-        );
+        // Loot is now in corpse_contents, not on the ground.
+        // Verify only the 1.0-chance drop is stored (item_id=100).
+        let contents = g.corpse_contents.get(&(96, 117, 7));
+        assert!(contents.is_some(), "loot must be in corpse_contents");
+        let items = contents.unwrap();
+        assert_eq!(items.len(), 1, "only 1 item should pass the 1.0 chance roll");
+        assert_eq!(items[0].0, 100, "the item must be server_id 100");
     }
 
     // -------------------------------------------------------------------------
@@ -1776,6 +1884,8 @@ mod tests {
                 loot: vec![],
                 target_distance: 0,
                 race: None,
+                personality: Personality::Aggressive,
+                aggro_range: DEFAULT_AGGRO_RANGE,
             },
         );
         let m = add_monster(&mut g, Position::new(96, 117, 7));
@@ -1845,6 +1955,8 @@ mod tests {
                 loot: vec![],
                 target_distance: 0,
                 race: None,
+                personality: Personality::Aggressive,
+                aggro_range: DEFAULT_AGGRO_RANGE,
             },
         );
         let m = add_monster(&mut g, Position::new(96, 117, 7));
@@ -1974,7 +2086,7 @@ mod tests {
     // Phase 4: Creature corpse + loot integration tests
     // -------------------------------------------------------------------------
 
-    // Task 4.2: Monster death spawns corpse + loot on tile
+    // Task 4.2: Monster death spawns corpse + stores loot in corpse
     #[test]
     fn monster_death_spawns_corpse_and_loot() {
         let mut g = Game::from_static_map_arc(combat_map(false));
@@ -1982,7 +2094,7 @@ mod tests {
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         {
             let mo = g.monsters.get_mut(&m).unwrap();
-            mo.look_corpse = 3058; // human corpse server id for test
+            mo.look_corpse = 3058;
             mo.loot = vec![MonsterDrop {
                 item_id: 100,
                 chance: 1.0,
@@ -1999,11 +2111,48 @@ mod tests {
             "monster death must spawn corpse (3058); sids: {:?}",
             st.server_ids
         );
-        assert!(
-            st.server_ids.contains(&100),
-            "monster death must drop loot item (100); sids: {:?}",
-            st.server_ids
+        // Loot is stored in corpse_contents, not on the overlay.
+        let contents = g.corpse_contents.get(&key);
+        assert!(contents.is_some(), "loot must be in corpse_contents");
+        assert_eq!(
+            contents.unwrap().len(),
+            1,
+            "exactly 1 loot item must be stored; got: {:?}",
+            contents.unwrap()
         );
+    }
+
+    // Regression: loot must not be duplicated in corpse_contents
+    #[test]
+    fn monster_loot_not_duplicated_in_corpse() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        {
+            let mo = g.monsters.get_mut(&m).unwrap();
+            mo.health = 1;
+            // Three drops with distinct ids to count easily.
+            mo.loot = vec![
+                MonsterDrop { item_id: 10, chance: 1.0, count_max: 1 },
+                MonsterDrop { item_id: 20, chance: 1.0, count_max: 1 },
+                MonsterDrop { item_id: 30, chance: 1.0, count_max: 1 },
+            ];
+        }
+        g.do_monster_death(m, 0);
+
+        let key = (96, 117, 7);
+        let contents = g.corpse_contents.get(&key)
+            .expect("loot must be stored");
+        assert_eq!(
+            contents.len(),
+            3,
+            "3 drops must produce exactly 3 items; got {:?}",
+            contents
+        );
+
+        // Also check that do_monster_death was called exactly once:
+        // monster should be gone.
+        assert!(!g.monsters.contains_key(&m), "monster must be removed");
     }
 
     // Task 4.3: Player death spawns corpse + inventory items as loot
@@ -2030,7 +2179,7 @@ mod tests {
             }
         }
 
-        // The death tile must contain the human corpse AND the inventory item.
+        // The death tile must contain the human corpse.
         let key = (96, 117, 7);
         let st = g
             .dynamic
@@ -2041,10 +2190,12 @@ mod tests {
             "player death must spawn ITEM_HUMAN_CORPSE (3058); sids: {:?}",
             st.server_ids
         );
+        // Inventory items are now stored inside the corpse, not on the ground.
+        let contents = g.corpse_contents.get(&key);
+        assert!(contents.is_some(), "loot must be in corpse_contents");
         assert!(
-            st.server_ids.contains(&500),
-            "player death must drop inventory item (500); sids: {:?}",
-            st.server_ids
+            contents.unwrap().iter().any(|&(sid, _)| sid == 500),
+            "player death must store inventory item (500) in corpse"
         );
     }
 
@@ -2123,12 +2274,113 @@ mod tests {
             }
         }
 
-        // Kill — must not panic.
+        // Kill — must not panic. TFS uses FLAG_NOLIMIT for death items
+        // (splash, corpse, loot) so they bypass the tile cap.
         g.do_monster_death(m, 0);
         assert!(!g.monsters.contains_key(&m), "monster removed");
 
-        // Tile should stay at capacity 10 (no corpse, no loot added).
+        // Tile now has ground + 9 fillers + splash + corpse = 12 items.
         let st = g.dynamic.get(&key).unwrap();
-        assert_eq!(st.items.len(), 10, "tile must stay at capacity 10");
+        assert!(
+            st.items.len() >= 12,
+            "death items bypass tile cap; got {} items",
+            st.items.len()
+        );
+    }
+
+    #[test]
+    fn corpse_tile_set_on_spawn_and_cleared_on_decay() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().look_corpse = 3058;
+        g.monsters.get_mut(&m).unwrap().health = 1;
+        g.do_monster_death(m, 0);
+
+        let key = (96, 117, 7);
+        assert!(
+            g.corpse_tiles.contains(&key),
+            "corpse_tiles must contain death tile after do_monster_death"
+        );
+        assert!(
+            g.corpse_item_ids.contains_key(&key),
+            "corpse_item_ids must contain death tile after do_monster_death"
+        );
+        assert_eq!(
+            g.corpse_item_ids.get(&key),
+            Some(&3058),
+            "corpse_item_ids must store the corpse server_id"
+        );
+
+        // Process decay with now_ms past CORPSE_DECAY_MS (120s).
+        g.on_combat_tick(CORPSE_DECAY_MS + 1);
+        assert!(
+            !g.corpse_tiles.contains(&key),
+            "corpse_tiles must be cleared after decay"
+        );
+        assert!(
+            !g.corpse_item_ids.contains_key(&key),
+            "corpse_item_ids must be cleared after decay"
+        );
+    }
+
+    #[test]
+    fn spawn_loot_does_not_add_to_overlay() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().look_corpse = 3058;
+        // Use a loot server_id that is NOT the ground item (100).
+        // 500 is a test loot item in the combat_map fixture.
+        g.monsters.get_mut(&m).unwrap().loot = vec![
+            MonsterDrop { item_id: 500, chance: 1.0, count_max: 1 },
+        ];
+        g.monsters.get_mut(&m).unwrap().health = 1;
+        g.do_monster_death(m, 0);
+
+        let key = (96, 117, 7);
+        // Loot is in corpse_contents, not on the overlay.
+        assert!(
+            g.corpse_contents.contains_key(&key),
+            "loot must be in corpse_contents"
+        );
+        // The overlay should NOT have the loot item (500).
+        if let Some(st) = g.dynamic.get(&key) {
+            assert!(
+                !st.server_ids.contains(&500),
+                "loot server_id (500) must NOT be in overlay items"
+            );
+        }
+    }
+
+    #[test]
+    fn corpse_splash_stack_order_blood_below_corpse() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().race = Some(RaceType::Blood);
+        g.monsters.get_mut(&m).unwrap().look_corpse = 3058;
+        g.monsters.get_mut(&m).unwrap().health = 1;
+        g.do_monster_death(m, 0);
+
+        // After death: ground(st) + splash(2886) + corpse(3058) in that order.
+        // Splash was inserted first, corpse after. The corpse must have a
+        // higher index (renders on top).
+        let key = (96, 117, 7);
+        let st = g.dynamic.get(&key).expect("tile must be materialized");
+        let splash_idx = st.server_ids.iter().position(|&id| id == ITEM_FULLSPLASH);
+        let corpse_idx = st.server_ids.iter().position(|&id| id == 3058);
+        assert!(
+            splash_idx.is_some(),
+            "blood splash must be in overlay"
+        );
+        assert!(
+            corpse_idx.is_some(),
+            "corpse must be in overlay"
+        );
+        assert!(
+            corpse_idx.unwrap() > splash_idx.unwrap(),
+            "corpse must render above blood splash (higher index)"
+        );
     }
 }

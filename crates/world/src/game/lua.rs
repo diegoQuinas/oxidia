@@ -37,6 +37,11 @@ pub(crate) enum GameAction {
         message_type: u8,
         text: String,
     },
+    SetCreatureLight {
+        player_id: u32,
+        light_level: u8,
+        light_color: u8,
+    },
 }
 
 /// Arguments dispatched to a Lua callback, passed as a Lua table.
@@ -244,6 +249,24 @@ impl LuaRuntime {
         lua.globals()
             .set("do_send_text_message", do_send_text_message)
             .expect("set do_send_text_message global must not fail");
+
+        let light_actions = Arc::clone(&actions);
+        let do_set_creature_light = lua
+            .create_function(move |_, (player_id, light_level, light_color): (u32, u8, u8)| {
+                light_actions
+                    .lock()
+                    .unwrap()
+                    .push(GameAction::SetCreatureLight {
+                        player_id,
+                        light_level,
+                        light_color,
+                    });
+                Ok(())
+            })
+            .expect("create_function for do_set_creature_light must not fail");
+        lua.globals()
+            .set("do_set_creature_light", do_set_creature_light)
+            .expect("set do_set_creature_light global must not fail");
     }
 
     /// Drain all queued actions since the last call. Called by the game actor

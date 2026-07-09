@@ -7,12 +7,13 @@
 //! walk move/appear/remove, turn, logout remove).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use protocol::chat::SpeakType;
 use protocol::combat_packets;
@@ -30,8 +31,9 @@ use self::condition::ConditionRegeneration;
 use self::lua::LuaRuntime;
 #[allow(unused_imports)]
 pub(super) use self::monster::{
-    MonsterDrop, MonsterSpawn, MonsterState, MonsterType, name_hash_looktype,
+    MonsterDrop, MonsterSpawn, MonsterState, MonsterType, Personality, name_hash_looktype,
     parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml, roll_drops,
+    COWARD_FLEE_THRESHOLD, DEFAULT_AGGRO_RANGE,
 };
 use self::xml_registry::XmlRegistry;
 
@@ -66,6 +68,19 @@ const COMBAT_TICK_MS: u64 = 250;
 /// How often one bucket of the monster AI fires (10 buckets × 100ms = 1s cycle).
 const MONSTER_AI_TICK_MS: u64 = 100;
 
+/// Decay time for blood/fluid splashes (ms).
+const SPLASH_DECAY_MS: u64 = 30_000;
+/// Decay time for player corpses (ms).
+const CORPSE_DECAY_MS: u64 = 120_000;
+/// Decay time for monster corpses (ms).
+const MONSTER_CORPSE_DECAY_MS: u64 = 60_000;
+
+/// Probability per AI tick that an idle monster starts wandering (0.0..1.0).
+/// At ~1 tick/s per monster, 25% means ~1 wander start every 4 seconds.
+const WANDER_CHANCE: f64 = 0.25;
+/// Number of random steps enqueued when a monster starts wandering.
+const WANDER_STEPS: usize = 3;
+
 /// How often the regeneration tick fires. Matches TFS
 /// `Condition::executeConditions` interval (1s).
 const REGENERATION_TICK_MS: u64 = 1000;
@@ -74,10 +89,28 @@ const REGENERATION_TICK_MS: u64 = 1000;
 /// Used for PZ-rejection ("You may not attack…").
 const MSG_STATUS_SMALL: u8 = 21;
 
+/// Maximum ranged attack distance (Chebyshev). Matches client viewport x-range.
+const RANGED_MAX_DISTANCE: i32 = 8;
 /// Minimum step interval in ms (200ms = 5 steps/s ceiling).
 const MIN_STEP_MS: u64 = 200;
 /// Maximum step interval in ms (2000ms = 0.5 steps/s floor).
 const MAX_STEP_MS: u64 = 2000;
+
+/// Derive a cardinal/ordinal direction from a delta vector.
+/// Used by coward flee to determine which way to run.
+fn direction_from_delta(dx: i32, dy: i32) -> Direction {
+    match (dx.signum(), dy.signum()) {
+        (1, 0) => Direction::East,
+        (-1, 0) => Direction::West,
+        (0, 1) => Direction::South,
+        (0, -1) => Direction::North,
+        (1, 1) => Direction::SouthEast,
+        (1, -1) => Direction::NorthEast,
+        (-1, 1) => Direction::SouthWest,
+        (-1, -1) => Direction::NorthWest,
+        _ => Direction::South,
+    }
+}
 
 /// Compute the step interval in milliseconds for a given creature speed.
 /// Matches the TFS inverse relationship: higher speed → shorter step time.
@@ -96,6 +129,14 @@ const MSG_CONSOLE_BLUE: u8 = 4;
 /// Ghost sprite looktype used when GM `/ghost` mode is active.
 /// Verify against client `.dat` if visual mismatch occurs.
 const GHOST_LOOKTYPE: u16 = 48;
+
+/// One entry in the decay queue. Items are removed from the overlay when
+/// `remove_at_ms` elapses. `stackpos` is the item's position in the stack.
+struct DecayEntry {
+    remove_at_ms: u64,
+    pos: (u16, u16, u8),
+    stackpos: u8,
+}
 
 /// Creature race determining splash fluid type on combat hit/death.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +163,12 @@ impl RaceType {
             _ => None,              // no splash
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DayPhase {
+    Day,
+    Night,
 }
 
 /// Client sprite id for the small (on-hit) splash item.
@@ -167,6 +214,10 @@ pub struct LoginAck {
     /// ground by others. The server layer splices these bytes verbatim into the
     /// burst instead of re-encoding from the pristine `StaticMap`.
     pub map_description: Vec<u8>,
+    /// Current world light level at login time.
+    pub world_light_level: u8,
+    /// Current world light color at login time.
+    pub world_light_color: u8,
 }
 
 /// Initial state supplied to `Game::login`. When a `PlayerSave` exists for the
@@ -312,6 +363,8 @@ struct PlayerState {
     /// Movement speed override. Default 220 on login. Runtime-only — not
     /// persisted; reset on login/logout.
     speed: u16,
+    /// Combat attack range (1 = melee, N = ranged). Default 1.
+    target_distance: i32,
     /// Equipment slots 1..=10, indexed 0..=9. `None` = empty slot.
     inventory: [Option<InvItem>; 10],
     /// Open container windows, indexed by cid (0..=15). `None` = window not open.
@@ -335,6 +388,11 @@ struct PlayerState {
     /// Active timed conditions (regeneration, etc.). Extended when the
     /// player eats more food; ticked by `RegenerationTick`.
     conditions: Vec<ConditionRegeneration>,
+    /// Light level emitted by this creature (0 = none). Updated when
+    /// equipping/unequipping light sources (torches, etc.).
+    light_level: u8,
+    /// Light color emitted by this creature.
+    light_color: u8,
 }
 
 struct Game {
@@ -373,10 +431,33 @@ struct Game {
     /// (CombatTick, RegenerationTick, etc.). Used by time-sensitive operations
     /// like food regeneration and condition management.
     now_ms: u64,
+    /// Items stored inside corpses on the ground: pos → items.
+    /// Populated by spawn_loot, read when a player opens a corpse (0x82).
+    corpse_contents: HashMap<(u16, u16, u8), Vec<(u16, u8)>>,
+    /// Decay queue for overlay items (splashes, corpses, fire fields).
+    decay_queue: Vec<DecayEntry>,
+    /// Set of tile positions that currently have a corpse (persists even after
+    /// corpse_contents is cleared on open). Prevents corpse dragging.
+    corpse_tiles: HashSet<(u16, u16, u8)>,
+    /// Server ID of the corpse item on each tile, so open_corpse_container
+    /// can show the correct name and capacity regardless of what the player
+    /// clicked on.
+    corpse_item_ids: HashMap<(u16, u16, u8), u16>,
+    /// Current day/night phase.
+    day_phase: DayPhase,
+    /// Milliseconds elapsed in the current phase.
+    phase_elapsed_ms: u64,
+    /// Day duration in ms (from config).
+    day_duration_ms: u64,
+    /// Night duration in ms (from config).
+    night_duration_ms: u64,
+    /// Current world light level broadcast to all players.
+    world_light_level: u8,
+    /// Current world light color broadcast to all players.
+    world_light_color: u8,
 }
 
 /// Configuration for the game actor passed from [`spawn`].
-#[derive(Default)]
 pub struct GameConfig {
     /// Directory containing `.lua` scripts for the Lua runtime.
     /// `None` disables scripting at runtime.
@@ -391,6 +472,32 @@ pub struct GameConfig {
     /// When set, these files are parsed and merged into `monster_types`,
     /// providing race attributes and overrides for the flat config entries.
     pub monsters_data_dir: Option<PathBuf>,
+    /// Duration of the day phase in seconds.
+    pub day_duration_seconds: u64,
+    /// Duration of the night phase in seconds.
+    pub night_duration_seconds: u64,
+}
+
+const fn default_day_seconds() -> u64 {
+    900
+}
+
+const fn default_night_seconds() -> u64 {
+    900
+}
+
+impl Default for GameConfig {
+    fn default() -> Self {
+        Self {
+            lua_scripts_dir: None,
+            actions_xml: String::new(),
+            monsters_xml: String::new(),
+            spawns_xml: String::new(),
+            monsters_data_dir: None,
+            day_duration_seconds: default_day_seconds(),
+            night_duration_seconds: default_night_seconds(),
+        }
+    }
 }
 
 impl Game {
@@ -412,6 +519,16 @@ impl Game {
             registry: XmlRegistry::default(),
             monster_types: HashMap::new(),
             now_ms: 0,
+            corpse_contents: HashMap::new(),
+            decay_queue: Vec::new(),
+            corpse_tiles: HashSet::new(),
+            corpse_item_ids: HashMap::new(),
+            day_phase: DayPhase::Day,
+            phase_elapsed_ms: 0,
+            day_duration_ms: 900_000, // 15 min default
+            night_duration_ms: 900_000,
+            world_light_level: 35, // start of day → closest to night
+            world_light_color: 215,
         }
     }
 
@@ -452,6 +569,16 @@ impl Game {
             registry: XmlRegistry::default(),
             monster_types: HashMap::new(),
             now_ms: 0,
+            corpse_contents: HashMap::new(),
+            decay_queue: Vec::new(),
+            corpse_tiles: HashSet::new(),
+            corpse_item_ids: HashMap::new(),
+            day_phase: DayPhase::Day,
+            phase_elapsed_ms: 0,
+            day_duration_ms: 900_000,
+            night_duration_ms: 900_000,
+            world_light_level: 35,
+            world_light_color: 215,
         }
     }
 
@@ -484,6 +611,8 @@ impl Game {
                     loot: t.loot.clone(),
                     target_distance: t.target_distance,
                     race: t.race,
+                    personality: t.personality,
+                    aggro_range: t.aggro_range,
                 };
                 self.spawns.insert(sid, spawn_entry);
 
@@ -508,6 +637,10 @@ impl Game {
                     follow_target: None,
                     target_distance: t.target_distance,
                     race: t.race,
+                    personality: t.personality,
+                    aggro_range: t.aggro_range,
+                    light_level: 0,
+                    light_color: 0,
                 };
                 self.monsters.insert(mid, monster);
             } else {
@@ -538,6 +671,10 @@ impl Game {
                     follow_target: None,
                     target_distance: 0,
                     race: Some(RaceType::Blood),
+                    personality: Personality::Aggressive,
+                    aggro_range: DEFAULT_AGGRO_RANGE,
+                    light_level: 0,
+                    light_color: 0,
                 };
                 self.monsters.insert(mid, monster);
             }
@@ -673,14 +810,15 @@ impl Game {
         } else {
             0
         };
+        let ll = self.creature_light(target);
         let view = CreatureView {
             id: target,
             name: name.as_bytes(),
             health_percent: hp,
             direction: dir.to_byte(),
             outfit,
-            light_level: 0,
-            light_color: 0,
+            light_level: ll.0,
+            light_color: ll.1,
             speed: spd,
             creature_type: ctype,
             walkthrough,
@@ -754,6 +892,15 @@ impl Game {
             .unwrap_or(0)
     }
 
+    /// Light level and color for any creature. Players return their current
+    /// light from inventory; monsters always return (0, 0).
+    fn creature_light(&self, id: u32) -> (u8, u8) {
+        if let Some(p) = self.players.get(&id) {
+            return (p.light_level, p.light_color);
+        }
+        self.monsters.get(&id).map(|m| (m.light_level, m.light_color)).unwrap_or((0, 0))
+    }
+
     /// Walk speed for any creature.
     fn creature_speed(&self, id: u32) -> u16 {
         if let Some(p) = self.players.get(&id) {
@@ -778,6 +925,24 @@ impl Game {
         self.players.contains_key(&id) || self.monsters.contains_key(&id)
     }
 
+    /// Find the nearest player within `range` tiles of `pos` (same floor).
+    /// Returns `None` if no player is within range.
+    fn nearest_player_in_range(&self, pos: Position, range: i32) -> Option<u32> {
+        self.players
+            .iter()
+            .filter(|(_, p)| {
+                p.position.z == pos.z
+                    && (i32::from(p.position.x) - i32::from(pos.x)).abs() <= range
+                    && (i32::from(p.position.y) - i32::from(pos.y)).abs() <= range
+            })
+            .min_by_key(|(_, p)| {
+                let dx = i32::from(p.position.x) - i32::from(pos.x);
+                let dy = i32::from(p.position.y) - i32::from(pos.y);
+                dx.abs() + dy.abs()
+            })
+            .map(|(&id, _)| id)
+    }
+
     /// Ids of monsters whose position is visible from `viewer`.
     fn monsters_visible_from(&self, viewer: Position) -> Vec<u32> {
         self.monsters
@@ -795,6 +960,82 @@ impl Game {
             .filter(|(_, m)| m.position == pos)
             .map(|(&id, _)| id)
             .collect()
+    }
+
+    /// Interpolated world light level for the current phase progress.
+    /// Day: goes from 35 → 215 (dawn to noon) over `day_duration_ms`.
+    /// Night: goes from 215 → 35 (dusk to midnight) over `night_duration_ms`.
+    pub(super) fn current_world_light_level(&self) -> u8 {
+        let threshold = match self.day_phase {
+            DayPhase::Day => self.day_duration_ms,
+            DayPhase::Night => self.night_duration_ms,
+        };
+        if threshold == 0 {
+            return match self.day_phase {
+                DayPhase::Day => 215,
+                DayPhase::Night => 35,
+            };
+        }
+        let progress = (self.phase_elapsed_ms as f64 / threshold as f64).min(1.0);
+        match self.day_phase {
+            DayPhase::Day => (35.0 + 180.0 * progress).round() as u8,
+            DayPhase::Night => (215.0 - 180.0 * progress).round() as u8,
+        }
+    }
+
+    /// Broadcast the current world light (0x82) to every online player.
+    fn broadcast_world_light(&mut self) {
+        let pkt = enter_world::world_light(self.world_light_level, self.world_light_color);
+        let ids: Vec<u32> = self.players.keys().copied().collect();
+        for id in ids {
+            self.push(id, pkt.clone());
+        }
+    }
+
+    /// Broadcast a creature light update (0x8D) for `creature_id` to all spectators.
+    pub(super) fn broadcast_creature_light(&mut self, creature_id: u32) {
+        let (level, color) = self.creature_light(creature_id);
+        let pkt = enter_world::creature_light(creature_id, level, color);
+        let Some(pos) = self.creature_position(creature_id) else {
+            return;
+        };
+        // Push to the creature itself if it's a player.
+        if self.players.contains_key(&creature_id) {
+            self.push(creature_id, pkt.clone());
+        }
+        for spec in self.spectators(pos, creature_id) {
+            self.push(spec, pkt.clone());
+        }
+    }
+
+    /// Flip the day/night phase and reset the elapsed counter.
+    /// The light level transitions gradually via `on_day_night_tick`.
+    fn flip_phase(&mut self) {
+        self.phase_elapsed_ms = 0;
+        self.day_phase = match self.day_phase {
+            DayPhase::Day => DayPhase::Night,
+            DayPhase::Night => DayPhase::Day,
+        };
+        tracing::info!(phase = ?self.day_phase, "world light phase changed");
+    }
+
+    /// Advance the day/night clock by `elapsed_ms`. Flips the phase when the
+    /// current phase duration is exceeded, and broadcasts a world light update
+    /// only when the interpolated level actually changes.
+    fn on_day_night_tick(&mut self, elapsed_ms: u64) {
+        let threshold = match self.day_phase {
+            DayPhase::Day => self.day_duration_ms,
+            DayPhase::Night => self.night_duration_ms,
+        };
+        self.phase_elapsed_ms += elapsed_ms;
+        if threshold > 0 && self.phase_elapsed_ms >= threshold {
+            self.flip_phase();
+        }
+        let new_level = self.current_world_light_level();
+        if new_level != self.world_light_level {
+            self.world_light_level = new_level;
+            self.broadcast_world_light();
+        }
     }
 
     /// Best-effort push to a session. On a full/closed channel the player is
@@ -887,6 +1128,7 @@ impl Game {
             Command::UpArrow { id, cid } => self.do_up_arrow(id, cid),
             Command::Gm { id, text } => self.do_gm_command(id, text),
             Command::ReloadLua => self.do_reload_lua(),
+            Command::DayNightTick { elapsed_ms } => self.on_day_night_tick(elapsed_ms),
             Command::SweepChunks => {
                 let mut required: HashSet<ChunkId> = HashSet::new();
                 for p in self.players.values() {
@@ -1167,14 +1409,17 @@ impl Game {
     /// not-PZ, not-already-there), then compute an initial A* path and fill
     /// `list_walk_dir`.
     pub(super) fn do_go_to_position(&mut self, id: u32, target: Position) {
-        let (pos, in_pz) = match self.players.get(&id) {
-            Some(p) => (p.position, self.chunks.is_protection_zone(p.position)),
+        let pos = match self.players.get(&id) {
+            Some(p) => p.position,
             None => return,
         };
-        // Check PZ: cannot start auto-walk from or into PZ.
-        if in_pz || self.chunks.is_protection_zone(target) {
-            self.push_cannot_move(id, "You cannot walk there.");
-            return;
+        // Can always walk within PZ. Entering PZ is only blocked if in combat.
+        if self.chunks.is_protection_zone(target) {
+            let in_combat = self.players.get(&id).and_then(|p| p.attacking).is_some();
+            if in_combat {
+                self.push_cannot_move(id, "You may not enter a protection zone while in combat.");
+                return;
+            }
         }
         if pos.z != target.z {
             self.push_cannot_move(id, "You cannot walk to a different floor.");
@@ -1279,6 +1524,67 @@ impl Game {
             .collect();
 
         for id in monster_ids {
+            // --- Personality: coward flee ---
+            let is_coward = self
+                .monsters
+                .get(&id)
+                .map(|m| m.personality == Personality::Coward)
+                .unwrap_or(false);
+            if is_coward {
+                let (health, max_health, mpos) = match self.monsters.get(&id) {
+                    Some(m) => (m.health, m.max_health, m.position),
+                    None => continue,
+                };
+                if health * 4 < max_health * COWARD_FLEE_THRESHOLD {
+                    if let Some(m) = self.monsters.get_mut(&id) {
+                        m.attacking = None;
+                        m.follow_target = None;
+                    }
+                    // Find nearest player and flee away from them
+                    let nearest = self.nearest_player_in_range(mpos, 20);
+                    if let Some(nid) = nearest {
+                        if let Some(npos) = self.players.get(&nid).map(|p| p.position) {
+                            let dx = i32::from(mpos.x) - i32::from(npos.x);
+                            let dy = i32::from(mpos.y) - i32::from(npos.y);
+                            if dx != 0 || dy != 0 {
+                                let dir = direction_from_delta(dx, dy);
+                                if let Some(m) = self.monsters.get_mut(&id) {
+                                    m.list_walk_dir.clear();
+                                    m.list_walk_dir.push_back(dir);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- Personality: aggressive aggro ---
+            let is_aggressive = self
+                .monsters
+                .get(&id)
+                .map(|m| m.personality == Personality::Aggressive)
+                .unwrap_or(false);
+            if is_aggressive {
+                let has_target = self
+                    .monsters
+                    .get(&id)
+                    .map(|m| m.attacking.is_some())
+                    .unwrap_or(false);
+                if !has_target {
+                    let (mpos, arange) = match self.monsters.get(&id) {
+                        Some(m) => (m.position, m.aggro_range),
+                        None => continue,
+                    };
+                    if let Some(pid) = self.nearest_player_in_range(mpos, arange) {
+                        if let Some(m) = self.monsters.get_mut(&id) {
+                            m.attacking = Some(pid);
+                            m.follow_target = Some(pid);
+                            m.last_attack_ms = 0;
+                        }
+                    }
+                }
+            }
+
             // --- Path refresh ---
             let (follow_target, needs_refresh, terp, target_distance) = {
                 let m = match self.monsters.get(&id) {
@@ -1343,6 +1649,28 @@ impl Game {
                 if !path.is_empty() {
                     if let Some(m) = self.monsters.get_mut(&id) {
                         m.list_walk_dir = path;
+                    }
+                }
+            }
+
+            // --- Random wandering for idle monsters ---
+            if follow_target.is_none() {
+                let m = match self.monsters.get(&id) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                if m.list_walk_dir.is_empty() && self.rng.gen_bool(WANDER_CHANCE) {
+                    if let Some(m) = self.monsters.get_mut(&id) {
+                        for _ in 0..WANDER_STEPS {
+                            let d = self.rng.gen_range(0..4);
+                            let dir = match d {
+                                0 => Direction::North,
+                                1 => Direction::East,
+                                2 => Direction::South,
+                                _ => Direction::West,
+                            };
+                            m.list_walk_dir.push_back(dir);
+                        }
                     }
                 }
             }
@@ -1829,6 +2157,11 @@ enum Command {
     ReloadLua,
     /// Periodic sweep: evict chunks that are no longer needed.
     SweepChunks,
+    /// Day/night cycle tick: advances the phase clock and flips when elapsed
+    /// time exceeds the current phase duration.
+    DayNightTick {
+        elapsed_ms: u64,
+    },
 }
 
 /// Cloneable handle to the running world.
@@ -2124,9 +2457,28 @@ pub fn spawn(
         }
     });
 
+    // Day/night tick: fires every 5s, advancing the phase clock.
+    let dn_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+        iv.tick().await;
+        loop {
+            iv.tick().await;
+            if dn_tx
+                .send(Command::DayNightTick { elapsed_ms: 5000 })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
     tokio::spawn(async move {
         let mut game = Game::new(chunks, meta);
         game.save_tx = Some(save_tx);
+        game.day_duration_ms = config.day_duration_seconds.max(1) * 1000;
+        game.night_duration_ms = config.night_duration_seconds.max(1) * 1000;
         // Pin chunks containing spawn and town temple positions so they are never
         // evicted by the sweep. These are always needed for player login.
         {
@@ -3188,5 +3540,183 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // Monster personality tests (aggressive, neutral, coward)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn xml_parse_personality_aggressive() {
+        let xml = r#"<monsters>
+            <monster name="Demon" looktype="35" health="200" max_health="200" speed="300" attack="25" personality="aggressive" aggrorange="7"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let demon = map.get("demon").expect("Demon must be parsed");
+        assert_eq!(demon.personality, Personality::Aggressive);
+        assert_eq!(demon.aggro_range, 7);
+    }
+
+    #[test]
+    fn xml_parse_personality_coward() {
+        let xml = r#"<monsters>
+            <monster name="Rabbit" looktype="22" health="15" max_health="15" speed="180" attack="1" personality="coward"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let rabbit = map.get("rabbit").expect("Rabbit must be parsed");
+        assert_eq!(rabbit.personality, Personality::Coward);
+    }
+
+    #[test]
+    fn xml_parse_personality_defaults_to_aggressive() {
+        let xml = r#"<monsters>
+            <monster name="Rat" looktype="100" health="50" max_health="50" speed="200" attack="7"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let rat = map.get("rat").expect("Rat must be parsed");
+        assert_eq!(rat.personality, Personality::Aggressive);
+    }
+
+    #[test]
+    fn xml_parse_personality_neutral_explicit() {
+        let xml = r#"<monsters>
+            <monster name="Rabbit" looktype="22" health="15" max_health="15" speed="180" attack="1" personality="neutral"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let rabbit = map.get("rabbit").expect("Rabbit must be parsed");
+        assert_eq!(rabbit.personality, Personality::Neutral);
+    }
+
+    #[test]
+    fn aggressive_monster_aggros_nearest_player_in_range() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Aggressive);
+
+        // Monster id 0x4000_0000 % 10 = 4
+        g.on_monster_ai_tick(4, 1000);
+
+        let monster = g.monsters.get(&m).unwrap();
+        assert!(
+            monster.attacking.is_some(),
+            "aggressive monster should acquire a target"
+        );
+        assert!(
+            monster.follow_target.is_some(),
+            "aggressive monster should set follow_target"
+        );
+    }
+
+    #[test]
+    fn aggressive_monster_does_not_aggro_out_of_range() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_player, _rx) = add_player(&mut g, Position::new(100, 117, 7)); // 5 tiles from monster at 95
+        let m = add_monster_with_personality(&mut g, Position::new(95, 117, 7), Personality::Aggressive);
+        g.monsters.get_mut(&m).unwrap().aggro_range = 3; // only 3 tiles
+
+        // Monster id 0x4000_0000 % 10 = 4
+        g.on_monster_ai_tick(4, 1000);
+
+        let monster = g.monsters.get(&m).unwrap();
+        assert!(
+            monster.attacking.is_none(),
+            "player out of aggro range should not trigger aggro"
+        );
+    }
+
+    #[test]
+    fn neutral_monster_does_not_aggro_on_sight() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Neutral);
+
+        // Monster id 0x4000_0000 % 10 = 4
+        g.on_monster_ai_tick(4, 1000);
+
+        let monster = g.monsters.get(&m).unwrap();
+        assert!(
+            monster.attacking.is_none(),
+            "neutral monster must not aggro on sight"
+        );
+    }
+
+    #[test]
+    fn coward_monster_flees_when_hp_low() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Coward);
+
+        let start_pos = Position::new(96, 117, 7);
+        assert_eq!(g.monsters.get(&m).unwrap().position, start_pos);
+
+        // Set HP very low
+        g.monsters.get_mut(&m).unwrap().health = 5; // 5 < 50/4 = 12 → flee
+
+        // Also give it a target so we can verify it clears on flee
+        g.monsters.get_mut(&m).unwrap().attacking = Some(0x1000_0000);
+        g.monsters.get_mut(&m).unwrap().follow_target = Some(0x1000_0000);
+
+        // Monster id 0x4000_0000 % 10 = 4
+        g.on_monster_ai_tick(4, 1000);
+
+        let monster = g.monsters.get(&m).unwrap();
+        assert!(
+            monster.attacking.is_none(),
+            "coward must clear attacking on flee"
+        );
+        assert!(
+            monster.follow_target.is_none(),
+            "coward must clear follow_target on flee"
+        );
+        // The flee direction was consumed by the AI tick step. The monster
+        // should have moved away from the nearest player (east, toward (97,117)).
+        assert!(
+            monster.position != start_pos,
+            "coward must move away from player on flee"
+        );
+    }
+
+    #[test]
+    fn coward_monster_does_not_flee_at_high_hp() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Coward);
+
+        // Full HP — should not flee
+        g.monsters.get_mut(&m).unwrap().attacking = Some(0x1000_0000);
+
+        // Monster id 0x4000_0000 % 10 = 4
+        g.on_monster_ai_tick(4, 1000);
+
+        let monster = g.monsters.get(&m).unwrap();
+        assert!(
+            monster.attacking.is_some(),
+            "coward at full HP must not flee"
+        );
+    }
+
+    #[test]
+    fn idle_monster_eventually_wanders() {
+        let map = walk_map();
+        let (chunks, meta) = Arc::try_unwrap(map).unwrap().into_chunks_and_meta();
+        let mut g = Game::new_seeded(chunks, Arc::new(meta), 42);
+        let (_player, _rx) = add_player(&mut g, Position::new(100, 100, 7));
+        let m = add_monster_with_personality(&mut g, Position::new(95, 117, 7), Personality::Neutral);
+        let start = g.monsters.get(&m).unwrap().position;
+
+        // Run up to 20 AI ticks. With seeded RNG 42 and WANDER_CHANCE=0.25,
+        // the monster should wander within a handful of ticks.
+        let mut wandered = false;
+        for tick in 1..=20 {
+            g.on_monster_ai_tick(4, tick * 100);
+            if g.monsters.get(&m).map(|m| m.position) != Some(start) {
+                wandered = true;
+                break;
+            }
+        }
+        assert!(
+            wandered,
+            "idle monster must wander after several AI ticks with seeded RNG"
+        );
     }
 }

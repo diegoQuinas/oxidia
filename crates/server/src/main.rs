@@ -123,6 +123,8 @@ async fn main() -> Result<()> {
         monsters_xml,
         spawns_xml,
         monsters_data_dir,
+        day_duration_seconds: cfg.light.day_duration_seconds,
+        night_duration_seconds: cfg.light.night_duration_seconds,
     };
     let (world_handle, mut save_rx) = world::game::spawn(chunks, meta.clone(), game_cfg);
     info!(spawn = ?world_handle.meta.spawn(), "world loaded");

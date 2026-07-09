@@ -80,6 +80,10 @@ pub struct ItemXmlAttrs {
     pub weapon_type: String,
     /// Container capacity (`<attribute key="containersize">`). 0 if not a container.
     pub container_size: u8,
+    /// Light level emitted by this item (0 = no light).
+    pub light_level: u8,
+    /// Light color emitted by this item (0 = default).
+    pub light_color: u8,
 }
 
 impl Default for ItemXmlAttrs {
@@ -95,6 +99,8 @@ impl Default for ItemXmlAttrs {
             slot_type: String::new(),
             weapon_type: String::new(),
             container_size: 0,
+            light_level: 0,
+            light_color: 0,
         }
     }
 }
@@ -164,6 +170,10 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
                 attrs.weapon_type = value.to_ascii_lowercase();
             } else if key.eq_ignore_ascii_case("containersize") {
                 attrs.container_size = value.parse::<u8>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("light") {
+                attrs.light_level = value.parse::<u8>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("lightColor") {
+                attrs.light_color = value.parse::<u8>().unwrap_or(0);
             }
         }
         for id in ids {
@@ -193,6 +203,12 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
             }
             if attrs.container_size != 0 {
                 entry.container_size = attrs.container_size;
+            }
+            if attrs.light_level != 0 {
+                entry.light_level = attrs.light_level;
+            }
+            if attrs.light_color != 0 {
+                entry.light_color = attrs.light_color;
             }
         }
     }

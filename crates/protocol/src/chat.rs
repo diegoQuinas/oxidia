@@ -37,6 +37,18 @@ impl SpeakType {
     }
 }
 
+/// Convert Latin-1 bytes to a UTF-8 Rust String.
+/// Latin-1 maps bytes 0x00-0xFF directly to Unicode codepoints U+0000-U+00FF.
+fn latin1_to_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Convert a UTF-8 Rust string to Latin-1 bytes for the Tibia wire protocol.
+/// Characters outside U+0000-U+00FF are replaced with `?`.
+pub fn string_to_latin1(s: &str) -> Vec<u8> {
+    s.chars().map(|c| if c as u32 <= 0xFF { c as u8 } else { b'?' }).collect()
+}
+
 /// Parse the body of an inbound `0x96` (the bytes AFTER the opcode). Returns the
 /// speak type + message for say/whisper/yell. Returns `None` for an unsupported
 /// speak type (private/channel), a malformed/short body, or an empty message.
@@ -47,7 +59,8 @@ pub fn parse_say(body: &[u8]) -> Option<(SpeakType, String)> {
     if text.is_empty() {
         return None;
     }
-    Some((speak_type, String::from_utf8_lossy(text).into_owned()))
+    // Tibia wire format is Latin-1, not UTF-8.
+    Some((speak_type, latin1_to_string(text)))
 }
 
 /// Build a `0xAA` creature-say (position form):

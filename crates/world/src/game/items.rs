@@ -25,7 +25,7 @@ impl Game {
     /// The wire stackpos for the item at overlay/static index `idx` on `pos`,
     /// accounting for creatures inserted between the pre-creature items and the
     /// down items. Capped at 9 like the client stack.
-    fn item_wire_stackpos(&self, pos: Position, idx: usize) -> u8 {
+    pub(super) fn item_wire_stackpos(&self, pos: Position, idx: usize) -> u8 {
         let pre = self
             .dynamic
             .get(&(pos.x, pos.y, pos.z))
@@ -206,6 +206,10 @@ impl Game {
         let Some(meta) = self.meta.item_meta(src_sid) else {
             return;
         };
+        // Corpses cannot be moved — corpse_tiles persists even after opening.
+        if src_idx >= pre && self.corpse_tiles.contains(&(from.x, from.y, from.z)) {
+            return;
+        }
         let stackable = meta.stackable;
         if !meta.moveable {
             self.push_cannot_move(id, "You cannot move this object.");
@@ -380,6 +384,7 @@ impl Game {
                     });
                 }
                 self.push_inventory_slot(id, slot);
+                self.recalc_creature_light(id);
                 // A container picked up from the ground keeps its contents: follow
                 // its open window from the ground tile to the inventory slot.
                 self.rekey_container_source(
@@ -431,6 +436,7 @@ impl Game {
                     p.inventory[(slot - 1) as usize] = None;
                 }
                 self.push_inventory_slot(id, slot);
+                self.recalc_creature_light(id);
 
                 let dest_creatures = self.creatures_on(to).len();
                 let Some((merged, added)) = self.add_to_ground_front(
@@ -508,6 +514,7 @@ impl Game {
                 }
                 self.push_inventory_slot(id, src);
                 self.push_inventory_slot(id, dst);
+                self.recalc_creature_light(id);
             }
             (None, None) => {}
         }

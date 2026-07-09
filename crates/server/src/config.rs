@@ -13,6 +13,8 @@ pub struct Config {
     pub network: NetworkConfig,
     pub database: DatabaseConfig,
     pub log: LogConfig,
+    #[serde(default)]
+    pub light: LightConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +53,33 @@ pub struct DatabaseConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
     pub filter: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct LightConfig {
+    /// Duration of the day phase in seconds (default: 15 min).
+    #[serde(default = "default_day_seconds")]
+    pub day_duration_seconds: u64,
+    /// Duration of the night phase in seconds (default: 15 min).
+    #[serde(default = "default_night_seconds")]
+    pub night_duration_seconds: u64,
+}
+
+const fn default_day_seconds() -> u64 {
+    900
+}
+
+const fn default_night_seconds() -> u64 {
+    900
+}
+
+impl Default for LightConfig {
+    fn default() -> Self {
+        Self {
+            day_duration_seconds: default_day_seconds(),
+            night_duration_seconds: default_night_seconds(),
+        }
+    }
 }
 
 impl Config {
@@ -101,6 +130,10 @@ mod tests {
 
         [log]
         filter = "info"
+
+        [light]
+        day_duration_seconds = 900
+        night_duration_seconds = 900
     "#;
 
     #[test]

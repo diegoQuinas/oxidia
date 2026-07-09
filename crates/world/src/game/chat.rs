@@ -16,15 +16,14 @@ impl Game {
         self.next_statement_id = self.next_statement_id.wrapping_add(1);
         const LEVEL: u16 = 1; // real speaker level arrives with M14 progression
 
-        // Cap to the TFS 255-byte message limit. Operate on raw bytes (the wire
-        // is Latin-1) so a multi-byte boundary can never panic a String::truncate.
-        let cap = |s: &[u8]| -> Vec<u8> { s[..s.len().min(255)].to_vec() };
+        // Convert to Latin-1 for the wire, capped at 255 bytes.
         let xyz = (pos.x, pos.y, pos.z);
 
         match speak_type {
             SpeakType::Say => {
-                let body = cap(text.as_bytes());
-                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &body);
+                let body = chat::string_to_latin1(&text);
+                let body = &body[..body.len().min(255)];
+                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, body);
                 self.push(id, pkt.clone());
                 // Chat is same-floor (TFS getSpectators multifloor=false); the
                 // band-aware `spectators` is for presence, not talk.
@@ -33,18 +32,21 @@ impl Game {
                 }
             }
             SpeakType::Yell => {
-                let body = cap(text.to_uppercase().as_bytes());
-                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &body);
+                let uppered = text.to_uppercase();
+                let body = chat::string_to_latin1(&uppered);
+                let body = &body[..body.len().min(255)];
+                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, body);
                 self.push(id, pkt.clone());
                 for spec in self.spectators_in_range(pos, id, 18, 14) {
                     self.push(spec, pkt.clone());
                 }
             }
             SpeakType::Whisper => {
-                let full = cap(text.as_bytes());
+                let full = chat::string_to_latin1(&text);
+                let full = &full[..full.len().min(255)];
                 self.push(
                     id,
-                    chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &full),
+                    chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, full),
                 );
                 for spec in self.spectators_in_range(pos, id, 8, 6) {
                     let Some(spos) = self.players.get(&spec).map(|p| p.position) else {
@@ -52,7 +54,7 @@ impl Game {
                     };
                     let adjacent = (i32::from(spos.x) - i32::from(pos.x)).abs() <= 1
                         && (i32::from(spos.y) - i32::from(pos.y)).abs() <= 1;
-                    let heard: &[u8] = if adjacent { &full } else { b"pspsps" };
+                    let heard: &[u8] = if adjacent { full } else { b"pspsps" };
                     self.push(
                         spec,
                         chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, heard),
@@ -60,16 +62,18 @@ impl Game {
                 }
             }
             SpeakType::MonsterSay => {
-                let body = cap(text.as_bytes());
-                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &body);
+                let body = chat::string_to_latin1(&text);
+                let body = &body[..body.len().min(255)];
+                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, body);
                 self.push(id, pkt.clone());
                 for spec in self.spectators_in_range(pos, id, 8, 6) {
                     self.push(spec, pkt.clone());
                 }
             }
             SpeakType::MonsterYell => {
-                let body = cap(text.as_bytes());
-                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, &body);
+                let body = chat::string_to_latin1(&text);
+                let body = &body[..body.len().min(255)];
+                let pkt = chat::creature_say(stmt, name.as_bytes(), LEVEL, speak_type, xyz, body);
                 self.push(id, pkt.clone());
                 for spec in self.spectators_in_range(pos, id, 18, 14) {
                     self.push(spec, pkt.clone());

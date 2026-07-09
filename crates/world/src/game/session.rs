@@ -82,6 +82,9 @@ impl Game {
                 list_walk_dir: VecDeque::new(),
                 last_walk_ms: 0,
                 conditions: Vec::new(),
+                target_distance: 1,
+                light_level: 0,
+                light_color: 0,
             },
         );
 
@@ -157,14 +160,20 @@ impl Game {
             .map(|p| p.name.clone())
             .unwrap_or_default();
         let mut placed = others.clone();
+        let hp_pct = if initial.max_health > 0 {
+            ((initial.health * 100) / initial.max_health).min(100) as u8
+        } else {
+            100
+        };
+        let ll = self.creature_light(id);
         let self_view = CreatureView {
             id,
             name: self_name.as_bytes(),
-            health_percent: 100,
+            health_percent: hp_pct,
             direction: direction.to_byte(),
             outfit,
-            light_level: 0,
-            light_color: 0,
+            light_level: ll.0,
+            light_color: ll.1,
             speed: 220,
             creature_type: protocol::creature::CREATURETYPE_PLAYER,
             walkthrough: 0, // ghost is always false at login
@@ -199,6 +208,8 @@ impl Game {
             },
             others,
             map_description,
+            world_light_level: self.world_light_level,
+            world_light_color: self.world_light_color,
         }
     }
 
@@ -710,6 +721,9 @@ mod tests {
                 list_walk_dir: VecDeque::new(),
                 last_walk_ms: 0,
                 conditions: Vec::new(),
+                target_distance: 1,
+                light_level: 0,
+                light_color: 0,
             },
         );
 
@@ -766,6 +780,9 @@ mod tests {
                 list_walk_dir: VecDeque::new(),
                 last_walk_ms: 0,
                 conditions: Vec::new(),
+                target_distance: 1,
+                light_level: 0,
+                light_color: 0,
             },
         );
 
@@ -802,6 +819,9 @@ mod tests {
                 list_walk_dir: VecDeque::new(),
                 last_walk_ms: 0,
                 conditions: Vec::new(),
+                target_distance: 1,
+                light_level: 0,
+                light_color: 0,
             },
         );
 
@@ -877,6 +897,9 @@ mod tests {
                 list_walk_dir: VecDeque::new(),
                 last_walk_ms: 0,
                 conditions: Vec::new(),
+                target_distance: 1,
+                light_level: 0,
+                light_color: 0,
             },
         );
 
@@ -930,6 +953,9 @@ mod tests {
                 list_walk_dir: VecDeque::new(),
                 last_walk_ms: 0,
                 conditions: Vec::new(),
+                target_distance: 1,
+                light_level: 0,
+                light_color: 0,
             },
         );
 
@@ -1208,6 +1234,9 @@ mod tests {
                 list_walk_dir: VecDeque::new(),
                 last_walk_ms: 0,
                 conditions: Vec::new(),
+                target_distance: 1,
+                light_level: 0,
+                light_color: 0,
             },
         );
 

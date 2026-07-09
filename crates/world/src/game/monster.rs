@@ -21,6 +21,32 @@ use formats::FormatError;
 use rand::Rng;
 use rand::rngs::StdRng;
 
+/// Monster personality determines aggro and behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Personality {
+    /// Attacks players on sight within aggro range.
+    Aggressive,
+    /// Only attacks back when hit (current default).
+    Neutral,
+    /// Flees when HP drops below threshold.
+    Coward,
+}
+
+impl Personality {
+    fn from_xml(s: Option<&str>) -> Self {
+        match s {
+            Some("neutral") => Personality::Neutral,
+            Some("coward") => Personality::Coward,
+            _ => Personality::Aggressive, // Tibia default: most creatures attack on sight
+        }
+    }
+}
+
+/// Default aggro range in tiles for aggressive monsters.
+pub(crate) const DEFAULT_AGGRO_RANGE: i32 = 5;
+/// Fraction of max_health (as numerator of 4) below which cowards flee.
+pub(crate) const COWARD_FLEE_THRESHOLD: u32 = 1; // flee when HP < max_health / 4
+
 /// A monster blueprint loaded from `config/monsters.xml`.
 /// These are the canonical stats for each named monster type.
 #[derive(Debug, Clone)]
@@ -37,6 +63,10 @@ pub(crate) struct MonsterType {
     pub(crate) target_distance: i32,
     /// Creature race for splash fluid on hit/death. `None` = no splash.
     pub(crate) race: Option<RaceType>,
+    /// Monster personality.
+    pub(crate) personality: Personality,
+    /// Aggro range in tiles.
+    pub(crate) aggro_range: i32,
 }
 
 /// Parse `<monsters>` XML and return a name-indexed map.
@@ -83,6 +113,11 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
             .attribute("attack")
             .and_then(|s| s.parse().ok())
             .unwrap_or(7);
+        let look_corpse: u16 = node
+            .attribute("lookcorpse")
+            .or_else(|| node.attribute("look_corpse"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let race = node.attribute("race").and_then(|s| match s {
             "blood" => Some(RaceType::Blood),
             "venom" => Some(RaceType::Venom),
@@ -97,12 +132,18 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
             "diamond" => Some(RaceType::Diamond),
             _ => None,
         }).or(Some(RaceType::Blood));
+        let personality = Personality::from_xml(node.attribute("personality"));
+        let aggro_range = node
+            .attribute("aggro_range")
+            .or_else(|| node.attribute("aggrorange"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_AGGRO_RANGE);
         map.insert(
             name.to_ascii_lowercase(),
             MonsterType {
                 name,
                 look_type,
-                look_corpse: 0,
+                look_corpse,
                 health,
                 max_health,
                 speed,
@@ -110,6 +151,8 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
                 loot: vec![],
                 target_distance: 0,
                 race,
+                personality,
+                aggro_range,
             },
         );
     }
@@ -274,6 +317,11 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
             })
             .unwrap_or_default();
 
+        let personality = Personality::from_xml(root.attribute("personality"));
+        let aggro_range = root
+            .attribute("aggrorange")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_AGGRO_RANGE);
         map.insert(
             name.to_ascii_lowercase(),
             MonsterType {
@@ -287,6 +335,8 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
                 loot,
                 target_distance: 0,
                 race,
+                personality,
+                aggro_range,
             },
         );
     }
@@ -369,6 +419,8 @@ pub(crate) fn parse_spawns_xml(xml: &str) -> Result<Vec<MonsterSpawn>, FormatErr
                 loot: vec![],
                 target_distance: 0,
                 race: Some(RaceType::Blood),
+                personality: Personality::Neutral,
+                aggro_range: DEFAULT_AGGRO_RANGE,
             });
         }
     }
@@ -412,6 +464,10 @@ pub(crate) struct MonsterSpawn {
     pub(crate) target_distance: i32,
     /// Creature race for splash fluid on hit/death. `None` = no splash.
     pub(crate) race: Option<RaceType>,
+    /// Monster personality.
+    pub(crate) personality: Personality,
+    /// Aggro range in tiles.
+    pub(crate) aggro_range: i32,
 }
 
 /// Runtime state for a single monster.
@@ -448,6 +504,14 @@ pub(crate) struct MonsterState {
     pub(crate) target_distance: i32,
     /// Creature race for splash fluid on hit/death. `None` = no splash.
     pub(crate) race: Option<RaceType>,
+    /// Monster personality.
+    pub(crate) personality: Personality,
+    /// Aggro range in tiles.
+    pub(crate) aggro_range: i32,
+    /// Light level emitted by this creature (0 = none).
+    pub(crate) light_level: u8,
+    /// Light color emitted by this creature.
+    pub(crate) light_color: u8,
 }
 
 impl MonsterState {
