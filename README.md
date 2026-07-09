@@ -49,10 +49,11 @@ Then point OTClient Redemption at `127.0.0.1:7171` and log in with `test` / `tes
 ## Current status
 
 - **✅ pre-alpha #1 complete** (M0–M8: walk, multiplayer, chat, PvP melee, persistence)
-- **✅ pre-alpha #2 complete** — M9–M12 shipped: ground items + move, inventory & containers, Lua scripting (mlua, hot-reload), creatures & monsters (1446 types, spawns, AI, loot, respawn)
-- **🧰 GM commands** — `/item`, `/goto`, `/teleport`, `/ghost`, `/noclip`, `/changesex`, `/help`, `/reload lua`
+- **✅ pre-alpha #2 complete** (M9–M13): ground items + move, inventory & containers, Lua scripting (mlua, hot-reload), creatures & monsters (1446 types, spawns, AI, loot, respawn), loot & corpses with decay
+- **✅ pre-alpha #3 shipped**: monster personalities (aggressive/neutral/coward), day/night cycle with configurable duration & interpolated world light, creature light system (inventory-based + `do_set_creature_light` Lua binding), ranged combat (Bresenham LOS), idle monster wandering
+- **🧰 GM commands** — `/help`, `/item` `/i`, `/goto`, `/temple`, `/teleport`, `/teleportto`, `/bring`, `/monster` `/m`, `/ghost`, `/noclip`, `/speed` `/spd`, `/changesex`, `/setlooktype`, `/reload`, `/day`, `/night`
 - **🚶 Auto-walk** — `0x64` GoTo click-to-move wire
-- **✅ ~540 tests**, `#![forbid(unsafe_code)]` in every crate, clippy-clean
+- **✅ 545 tests**, `#![forbid(unsafe_code)]` in every crate, clippy-clean
 
 ## Roadmap
 
@@ -79,7 +80,7 @@ embedded Lua (mlua)** for mutable content. Full plan in
 | M11 | Lua runtime (mlua): hot-reloadable `onUse` hooks, teleport.lua, `/reload` | ✅ |
 | **Phase D — PvE → pre-alpha #2** | | |
 | M12 | Creatures & monsters: 1446 types, spawns, AI, A* pathfinding, loot, respawn | ✅ |
-| M13 | Loot & corpses | ⬜ |
+| M13 | Loot & corpses | ✅ |
 | M14 | Skills, XP, levels, vocations | ⬜ |
 | M15 | Spells, runes, conditions | ⬜ |
 | **Phase E — Social & Economy** | | |
