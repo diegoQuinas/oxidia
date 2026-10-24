@@ -113,6 +113,14 @@ impl Game {
     /// Build the "You see …" text for a creature. Ports `player.cpp:85`
     /// (faithful subset: name, level, vocation; no party/mana/IP).
     fn describe_creature(&self, looker_id: u32, target_id: u32, gm: bool) -> Option<String> {
+        if let Some(npc) = self.npcs.get(&target_id) {
+            let mut s = format!("You see {}.", npc.name);
+            if gm {
+                let p = npc.position;
+                s.push_str(&format!("\nPosition: {}, {}, {}", p.x, p.y, p.z));
+            }
+            return Some(s);
+        }
         let target = self.players.get(&target_id)?;
         let is_self = looker_id == target_id;
         let mut s = String::from("You see ");

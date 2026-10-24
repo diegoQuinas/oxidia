@@ -165,6 +165,7 @@ impl Game {
                 mover.known.remove(&oid);
             }
         }
+        self.forget_npcs_left_view(id, from, to);
 
         // Mover's own view: full 0x64 carrying every in-range creature plus self.
         // Build creatures (introduce = &mut self) BEFORE borrowing self.merged().
@@ -204,6 +205,7 @@ impl Game {
                 bytes,
             });
         }
+        wire_creatures.extend(self.placed_npcs_from(id, to));
         let mut pkt = walk::remove_creature_by_id(id);
         {
             let merged = self.merged();
@@ -464,7 +466,8 @@ impl Game {
                     .is_some_and(|m| !Self::can_see(to, m.position))
             })
             .collect();
-        let left_view_len = left_view.len() + left_monsters.len();
+        let left_npcs = self.forget_npcs_left_view(id, from, to);
+        let left_view_len = left_view.len() + left_monsters.len() + left_npcs;
         for oid in left_view {
             if let Some(mover) = self.players.get_mut(&id) {
                 mover.known.remove(&oid);
@@ -505,6 +508,7 @@ impl Game {
                 }
             }
         }
+        wire_creatures.extend(self.placed_npcs_from(id, to));
         let others_count = wire_creatures.len();
 
         // Floor changes whose header is a bare remove (the surface->underground

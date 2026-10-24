@@ -126,6 +126,9 @@ impl Game {
                 );
             }
         }
+        // NPCs standing in the login viewport. Same path as monsters: they are
+        // spliced into the enter-world map description, not pushed as a later add.
+        others.extend(self.placed_npcs_from(id, position));
         // M12.1: introduce monsters visible from the login position.
         for mid in self.monsters_visible_from(position) {
             if let Some(bytes) = self.introduce(id, mid) {

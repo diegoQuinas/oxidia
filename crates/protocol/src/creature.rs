@@ -7,6 +7,9 @@ use crate::message::MessageWriter;
 
 pub const CREATURETYPE_PLAYER: u8 = 0;
 pub const CREATURETYPE_MONSTER: u8 = 1;
+/// TFS `CREATURETYPE_NPC`. The client uses this for the NPC name color and to
+/// hide the health bar. Dialogue and the shop window are a later milestone.
+pub const CREATURETYPE_NPC: u8 = 2;
 pub const MARK_UNMARKED: u8 = 0xFF;
 
 /// A creature look. `look_type == 0` means a non-creature look (an item id).

@@ -35,6 +35,7 @@ pub(super) use self::monster::{
     Personality, parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml,
     roll_drops,
 };
+use self::npc::{NPC_ID_BASE, NpcState, npc_outfit, parse_npc_spawns_xml};
 use self::xml_registry::XmlRegistry;
 
 mod chat;
@@ -47,6 +48,7 @@ mod look;
 mod lua;
 mod monster;
 mod movement;
+mod npc;
 mod session;
 #[cfg(test)]
 mod test_support;
@@ -396,9 +398,14 @@ struct Game {
     dynamic: std::collections::HashMap<(u16, u16, u8), crate::map::TileStack>,
     players: HashMap<u32, PlayerState>,
     monsters: HashMap<u32, MonsterState>,
+    /// Stationary NPCs from `<npc>` rows in the spawn file. Not combatants.
+    npcs: HashMap<u32, NpcState>,
     next_id: u32,
     #[allow(dead_code)]
     next_monster_id: u32,
+    /// Next id in the `0x8000_0000` NPC range.
+    #[allow(dead_code)]
+    next_npc_id: u32,
     /// Auto-incrementing id for spawn entries.
     #[allow(dead_code)]
     next_spawn_id: u32,
@@ -499,8 +506,10 @@ impl Game {
             dynamic: std::collections::HashMap::new(),
             players: HashMap::new(),
             monsters: HashMap::new(),
+            npcs: HashMap::new(),
             next_id: 0x1000_0000,
             next_monster_id: 0x4000_0000,
+            next_npc_id: NPC_ID_BASE,
             next_spawn_id: 1,
             spawns: HashMap::new(),
             next_statement_id: 1,
@@ -549,8 +558,10 @@ impl Game {
             dynamic: std::collections::HashMap::new(),
             players: HashMap::new(),
             monsters: HashMap::new(),
+            npcs: HashMap::new(),
             next_id: 0x1000_0000,
             next_monster_id: 0x4000_0000,
+            next_npc_id: NPC_ID_BASE,
             next_spawn_id: 1,
             spawns: HashMap::new(),
             next_statement_id: 1,
@@ -645,6 +656,37 @@ impl Game {
             self.monsters.insert(mid, monster);
         }
         tracing::info!(count = %self.spawns.len(), monsters = %self.monsters.len(), skipped, "spawns loaded");
+    }
+
+    /// Place every `<npc>` in the spawn file. They are not monster spawns: no
+    /// respawn timer, no AI. A parse failure leaves the town empty rather than
+    /// aborting monster loading.
+    fn load_npcs(&mut self, xml: &str) {
+        if xml.is_empty() {
+            return;
+        }
+        let entries = match parse_npc_spawns_xml(xml) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(%e, "failed to parse npc spawns — no NPCs placed");
+                return;
+            }
+        };
+        for place in entries {
+            let id = self.next_npc_id;
+            self.next_npc_id = self.next_npc_id.wrapping_add(1);
+            let outfit = npc_outfit(&place.name);
+            self.npcs.insert(
+                id,
+                NpcState {
+                    name: place.name,
+                    position: place.position,
+                    direction: place.direction,
+                    outfit,
+                },
+            );
+        }
+        tracing::info!(npcs = %self.npcs.len(), "npcs placed");
     }
 
     /// A merged read view (overlay + static) for the map encoder.
@@ -812,10 +854,13 @@ impl Game {
     // M12.1 — Creature-agnostic helpers (players + monsters)
     // -----------------------------------------------------------------
 
-    /// Look up any creature's name, checking players first then monsters.
+    /// Look up any creature's name, checking players, then NPCs, then monsters.
     fn creature_name(&self, id: u32) -> Option<&str> {
         if let Some(p) = self.players.get(&id) {
             return Some(&p.name);
+        }
+        if let Some(n) = self.npcs.get(&id) {
+            return Some(&n.name);
         }
         self.monsters.get(&id).map(|m| m.name.as_str())
     }
@@ -824,6 +869,9 @@ impl Game {
     fn creature_outfit(&self, id: u32) -> Option<Outfit> {
         if let Some(p) = self.players.get(&id) {
             return Some(p.outfit);
+        }
+        if let Some(n) = self.npcs.get(&id) {
+            return Some(n.outfit);
         }
         self.monsters.get(&id).map(|m| Outfit {
             look_type: m.look_type,
@@ -841,6 +889,9 @@ impl Game {
         if let Some(p) = self.players.get(&id) {
             return Some(p.direction);
         }
+        if let Some(n) = self.npcs.get(&id) {
+            return Some(n.direction);
+        }
         self.monsters.get(&id).map(|m| m.direction)
     }
 
@@ -848,6 +899,9 @@ impl Game {
     fn creature_position(&self, id: u32) -> Option<Position> {
         if let Some(p) = self.players.get(&id) {
             return Some(p.position);
+        }
+        if let Some(n) = self.npcs.get(&id) {
+            return Some(n.position);
         }
         self.monsters.get(&id).map(|m| m.position)
     }
@@ -859,6 +913,9 @@ impl Game {
                 return 0;
             }
             return ((p.health * 100) / p.max_health).min(100) as u8;
+        }
+        if self.npcs.contains_key(&id) {
+            return 100;
         }
         self.monsters
             .get(&id)
@@ -886,10 +943,13 @@ impl Game {
         self.monsters.get(&id).map(|m| m.speed).unwrap_or(200)
     }
 
-    /// Wire creature type byte (player=0, monster=1).
+    /// Wire creature type byte (player=0, monster=1, npc=2).
     fn creature_type_byte(&self, id: u32) -> u8 {
         if self.players.contains_key(&id) {
             return creature::CREATURETYPE_PLAYER;
+        }
+        if self.npcs.contains_key(&id) {
+            return creature::CREATURETYPE_NPC;
         }
         if self.monsters.contains_key(&id) {
             return creature::CREATURETYPE_MONSTER;
@@ -897,7 +957,8 @@ impl Game {
         creature::CREATURETYPE_PLAYER
     }
 
-    /// Does any creature (player or monster) exist with this id?
+    /// Does a combatant (player or monster) exist with this id?
+    /// NPCs are visible but not attackable, so they are deliberately excluded.
     fn creature_exists(&self, id: u32) -> bool {
         self.players.contains_key(&id) || self.monsters.contains_key(&id)
     }
@@ -982,6 +1043,59 @@ impl Game {
             .filter(|(_, m)| Self::can_see(viewer, m.position))
             .map(|(&id, _)| id)
             .collect()
+    }
+
+    /// Ids of NPCs whose position is visible from `viewer`.
+    fn npcs_visible_from(&self, viewer: Position) -> Vec<u32> {
+        self.npcs
+            .iter()
+            .filter(|(_, n)| Self::can_see(viewer, n.position))
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Drop NPCs that scrolled out of `viewer`'s viewport from the known-set.
+    /// Returns how many were forgotten. Same reason as the monster prune in
+    /// `do_move`: a later return must be the full `0x61` form.
+    fn forget_npcs_left_view(&mut self, viewer: u32, from: Position, to: Position) -> usize {
+        let left: Vec<u32> = self
+            .npcs_visible_from(from)
+            .into_iter()
+            .filter(|&nid| {
+                self.npcs
+                    .get(&nid)
+                    .is_some_and(|n| !Self::can_see(to, n.position))
+            })
+            .collect();
+        let n = left.len();
+        if let Some(p) = self.players.get_mut(&viewer) {
+            for nid in left {
+                p.known.remove(&nid);
+            }
+        }
+        n
+    }
+
+    /// Introduce every NPC visible from `at` into `viewer`'s known-set and
+    /// return the placed-creature records for a map description.
+    fn placed_npcs_from(&mut self, viewer: u32, at: Position) -> Vec<PlacedCreature> {
+        let ids = self.npcs_visible_from(at);
+        let mut out = Vec::with_capacity(ids.len());
+        for nid in ids {
+            let Some(pos) = self.npcs.get(&nid).map(|n| n.position) else {
+                continue;
+            };
+            let Some(bytes) = self.introduce(viewer, nid) else {
+                continue;
+            };
+            out.push(PlacedCreature {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+                bytes,
+            });
+        }
+        out
     }
 
     /// Ids of monsters standing on `pos`.
@@ -1191,6 +1305,10 @@ impl Game {
                 .monsters
                 .iter()
                 .any(|(&mid, m)| mid != exclude && m.position == pos)
+            || self
+                .npcs
+                .iter()
+                .any(|(&nid, n)| nid != exclude && n.position == pos)
     }
 
     /// The wire stackpos a creature with id `exclude` occupies on `pos`, placed
@@ -1211,6 +1329,11 @@ impl Game {
                 .monsters
                 .iter()
                 .filter(|(id, m)| **id != exclude && m.position == pos)
+                .count()
+            + self
+                .npcs
+                .iter()
+                .filter(|(id, n)| **id != exclude && n.position == pos)
                 .count();
         (usize::from(base) + others).min(10) as u8
     }
@@ -1264,14 +1387,20 @@ impl Game {
         origin
     }
 
-    /// Ids of creatures (players + monsters) standing on `pos`, in deterministic
-    /// id order.
+    /// Ids of creatures (players + NPCs + monsters) standing on `pos`, in
+    /// deterministic id order.
     fn creatures_on(&self, pos: Position) -> Vec<u32> {
         let mut ids: Vec<u32> = self
             .players
             .iter()
             .filter(|(_, p)| p.position == pos)
             .map(|(&pid, _)| pid)
+            .chain(
+                self.npcs
+                    .iter()
+                    .filter(|(_, n)| n.position == pos)
+                    .map(|(&nid, _)| nid),
+            )
             .chain(
                 self.monsters
                     .iter()
@@ -2564,6 +2693,7 @@ pub fn spawn(
 
         game.monster_types = monster_types;
         game.load_spawns(&config.spawns_xml, 0);
+        game.load_npcs(&config.spawns_xml);
         while let Some(cmd) = rx.recv().await {
             if let Command::Shutdown { ack } = cmd {
                 game.save_all();
