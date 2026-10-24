@@ -309,11 +309,9 @@ name = "formats"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "byteorder",
  "roxmltree",
  "serde",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -958,7 +956,6 @@ name = "protocol"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "bytes",
  "num-bigint-dig",
  "serde",
  "thiserror",

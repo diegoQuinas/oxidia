@@ -14,6 +14,7 @@ use persistence::Store;
 use protocol::rsa::RsaPrivateKey;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use world::map::StaticMap;
 
 use config::Config;
@@ -243,12 +244,26 @@ fn resolve_filter(default_filter: &str) -> EnvFilter {
 }
 
 /// Initialise `tracing`. `RUST_LOG` takes precedence over the config filter.
+/// A copy is appended to `/tmp/opencode/oxidia-debug.log` so a live session can
+/// be tailed without the watchexec terminal.
 fn init_tracing(default_filter: &str) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| resolve_filter(default_filter));
+    let log_path = "/tmp/opencode/oxidia-debug.log";
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .unwrap_or_else(|err| {
+            eprintln!("cannot open {log_path} ({err}); logging to stderr only");
+            // Fall back to a sink that discards, so `.and` still type-checks.
+            // Opening /dev/null is the least surprising discard.
+            std::fs::File::create("/dev/null").expect("open /dev/null")
+        });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr.and(std::sync::Mutex::new(file)))
         .init();
 }
 

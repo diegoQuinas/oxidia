@@ -299,14 +299,14 @@ impl Game {
     /// Toggle a torch between unlit and lit states. Handles the item in
     /// inventory slots (hand slot 5/6 lights the creature). Returns `true`
     /// when a torch was toggled (caller should skip Lua dispatch).
+    ///
+    /// Ground toggles use the position stored in `source` and `stackpos` to
+    /// find the item on the tile. Other sources ignore `stackpos`.
     fn do_torch_toggle(
         &mut self,
         id: u32,
         server_id: u16,
         source: ContainerSource,
-        pos_x: u16,
-        pos_y: u16,
-        pos_z: u8,
         stackpos: u8,
     ) -> bool {
         let target = match torch_toggle_pair(server_id) {
@@ -335,8 +335,7 @@ impl Game {
                 self.recalc_creature_light(id);
                 true
             }
-            ContainerSource::Ground(_) => {
-                let pos = Position::new(pos_x, pos_y, pos_z);
+            ContainerSource::Ground(pos) => {
                 if !self.materialize(pos) {
                     return false;
                 }
@@ -511,7 +510,7 @@ impl Game {
             // Torch toggle: ctrl+click on an unlit torch toggles it to lit.
             // This runs BEFORE the Lua dispatch so torches work even without
             // a Lua action script registered.
-            if self.do_torch_toggle(id, server_id, source, pos_x, pos_y, pos_z, stackpos) {
+            if self.do_torch_toggle(id, server_id, source, stackpos) {
                 return;
             }
             // Non-container item: check the XML registry for a Lua script
@@ -607,7 +606,7 @@ impl Game {
                                     LEVEL,
                                     speak_type,
                                     xyz,
-                                    &body,
+                                    body,
                                 );
                                 self.push(player_id, pkt.clone());
                                 // Range depends on speak type: yell types reach 18x14,
@@ -1287,10 +1286,12 @@ impl Game {
             let Some((dest_merged, dest_added)) = self.add_to_ground_front(
                 to_pos,
                 item.server_id,
-                item.client_id,
                 moved,
-                item.count,
-                item.animated,
+                WireItem {
+                    client_id: item.client_id,
+                    subtype: item.count,
+                    animated: item.animated,
+                },
                 meta_stackable,
             ) else {
                 return;
@@ -1816,10 +1817,18 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// Create a unique temp directory for a Lua integration test.
+    ///
+    /// nextest runs each test in its own process, so a process-local counter
+    /// alone restarts at 0. Tests that share a label (`setup_feed_game` always
+    /// uses `"feed_flow"`) would then delete and overwrite one script directory
+    /// and load each other's `food.lua`.
     fn lua_test_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
         let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("oxidia-containers-{label}-{seq}"));
+        let dir = std::env::temp_dir().join(format!(
+            "oxidia-containers-{label}-{}-{seq}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2797,5 +2806,191 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // Torch toggle — inventory lights the creature, ground updates in place
+    // -------------------------------------------------------------------------
+
+    fn insert_torch_catalog(g: &mut Game) {
+        let meta = std::sync::Arc::get_mut(&mut g.meta).expect("test meta arc is unique");
+        meta.item_meta.insert(
+            2050,
+            crate::map::ItemMeta {
+                name: "torch".into(),
+                client_id: 2920,
+                moveable: true,
+                pickupable: true,
+                ..crate::map::ItemMeta::default()
+            },
+        );
+        meta.item_meta.insert(
+            2051,
+            crate::map::ItemMeta {
+                name: "lit torch".into(),
+                client_id: 2921,
+                moveable: true,
+                pickupable: true,
+                light_level: 7,
+                light_color: 206,
+                ..crate::map::ItemMeta::default()
+            },
+        );
+    }
+
+    fn creature_light_packet(pkts: &[Vec<u8>], id: u32, level: u8, color: u8) -> bool {
+        let id_bytes = id.to_le_bytes();
+        pkts.iter().any(|p| {
+            p.len() >= 7
+                && p[0] == protocol::enter_world::OP_CREATURE_LIGHT
+                && p[1..5] == id_bytes
+                && p[5] == level
+                && p[6] == color
+        })
+    }
+
+    #[test]
+    fn inventory_torch_lights_creature_and_extinguish_clears_it() {
+        let mut g = Game::from_static_map_arc(move_map());
+        insert_torch_catalog(&mut g);
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        // Hand slot 6 (inventory index 5).
+        g.players.get_mut(&player).unwrap().inventory[5] = Some(InvItem {
+            server_id: 2050,
+            client_id: 2920,
+            count: None,
+            animated: false,
+        });
+        drain(&mut rx);
+
+        g.do_use_item(player, 0xFFFF, 6, 0, 0, 0);
+        assert_eq!(
+            g.players[&player].inventory[5].as_ref().unwrap().server_id,
+            2051,
+            "using an unlit torch must light it"
+        );
+        assert_eq!(g.players[&player].light_level, 7);
+        assert_eq!(g.players[&player].light_color, 206);
+        let pkts = drain(&mut rx);
+        assert!(
+            creature_light_packet(&pkts, player, 7, 206),
+            "lighting a held torch must broadcast 0x8D; pkts: {:?}",
+            pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
+
+        g.do_use_item(player, 0xFFFF, 6, 0, 0, 0);
+        assert_eq!(
+            g.players[&player].inventory[5].as_ref().unwrap().server_id,
+            2050,
+            "using a lit torch must extinguish it"
+        );
+        assert_eq!(g.players[&player].light_level, 0);
+        assert_eq!(g.players[&player].light_color, 0);
+        let pkts = drain(&mut rx);
+        assert!(
+            creature_light_packet(&pkts, player, 0, 0),
+            "extinguishing must broadcast a dark 0x8D"
+        );
+    }
+
+    #[test]
+    fn ground_torch_toggles_in_place_without_lighting_player() {
+        // Ground use must edit the item at the source tile's stackpos and
+        // broadcast 0x6B (update), not 0x6A (add) — an add duplicates the torch.
+        let mut g = Game::from_static_map_arc(move_map());
+        insert_torch_catalog(&mut g);
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        let pos = Position::new(101, 100, 7);
+        g.add_to_ground_front(
+            pos,
+            2050,
+            1,
+            protocol::map_description::WireItem {
+                client_id: 2920,
+                subtype: None,
+                animated: false,
+            },
+            false,
+        )
+        .expect("unlit torch placed on the adjacent tile");
+        let idx = g
+            .dynamic
+            .get(&(pos.x, pos.y, pos.z))
+            .unwrap()
+            .server_ids
+            .iter()
+            .position(|sid| *sid == 2050)
+            .expect("torch on tile");
+        let stackpos = g.item_wire_stackpos(pos, idx);
+        let before_len = g.dynamic.get(&(pos.x, pos.y, pos.z)).unwrap().items.len();
+        drain(&mut rx);
+
+        g.do_use_item(player, pos.x, pos.y, pos.z, stackpos, 0);
+
+        let st = g.dynamic.get(&(pos.x, pos.y, pos.z)).unwrap();
+        assert_eq!(st.items.len(), before_len, "toggle must not add a second item");
+        assert!(
+            st.server_ids.contains(&2051),
+            "ground torch must light, ids: {:?}",
+            st.server_ids
+        );
+        assert!(
+            !st.server_ids.contains(&2050),
+            "unlit torch must be replaced"
+        );
+        assert_eq!(
+            g.players[&player].light_level, 0,
+            "a torch on the ground must not light the player"
+        );
+        let pkts = drain(&mut rx);
+        assert!(
+            pkts.iter().any(|p| p.first() == Some(&0x6B)),
+            "ground toggle must broadcast 0x6B update; pkts: {:?}",
+            pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
+        assert!(
+            !pkts.iter().any(|p| p.first() == Some(&0x6A)),
+            "ground toggle must not add a duplicate item"
+        );
+    }
+
+    #[test]
+    fn nested_torch_toggles_without_lighting_player() {
+        let mut g = Game::from_static_map_arc(move_map());
+        insert_torch_catalog(&mut g);
+        let (player, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.players.get_mut(&player).unwrap().open_containers[0] = Some(OpenContainer {
+            server_id: 600,
+            client_id: 1988,
+            capacity: 20,
+            name: "backpack".into(),
+            items: vec![ContainerItem {
+                server_id: 2050,
+                client_id: 2920,
+                count: None,
+                animated: false,
+            }],
+            source: ContainerSource::Slot(3),
+            is_open: true,
+        });
+        drain(&mut rx);
+
+        // Container endpoint: pos_y = 0x40 | cid, pos_z = slot index.
+        g.do_use_item(player, 0xFFFF, 0x40, 0, 0, 0);
+
+        let item = &g.players[&player].open_containers[0].as_ref().unwrap().items[0];
+        assert_eq!(item.server_id, 2051, "torch inside a bag must light");
+        assert_eq!(item.client_id, 2921);
+        assert_eq!(
+            g.players[&player].light_level, 0,
+            "a torch in a bag is not equipped"
+        );
+        let pkts = drain(&mut rx);
+        assert!(
+            pkts.iter()
+                .any(|p| p.first() == Some(&protocol::container::OP_ADD_CONTAINER_ITEM)),
+            "bag toggle must push 0x70; pkts: {:?}",
+            pkts.iter().map(|p| p.first().copied()).collect::<Vec<_>>()
+        );
     }
 }

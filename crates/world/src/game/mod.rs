@@ -31,9 +31,9 @@ use self::condition::ConditionRegeneration;
 use self::lua::LuaRuntime;
 #[allow(unused_imports)]
 pub(super) use self::monster::{
-    MonsterDrop, MonsterSpawn, MonsterState, MonsterType, Personality, name_hash_looktype,
-    parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml, roll_drops,
-    COWARD_FLEE_THRESHOLD, DEFAULT_AGGRO_RANGE,
+    DEFAULT_AGGRO_RANGE, FLEE_SIGHT_RANGE, MonsterDrop, MonsterSpawn, MonsterState, MonsterType,
+    Personality, parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml,
+    roll_drops,
 };
 use self::xml_registry::XmlRegistry;
 
@@ -96,20 +96,11 @@ const MIN_STEP_MS: u64 = 200;
 /// Maximum step interval in ms (2000ms = 0.5 steps/s floor).
 const MAX_STEP_MS: u64 = 2000;
 
-/// Derive a cardinal/ordinal direction from a delta vector.
-/// Used by coward flee to determine which way to run.
-fn direction_from_delta(dx: i32, dy: i32) -> Direction {
-    match (dx.signum(), dy.signum()) {
-        (1, 0) => Direction::East,
-        (-1, 0) => Direction::West,
-        (0, 1) => Direction::South,
-        (0, -1) => Direction::North,
-        (1, 1) => Direction::SouthEast,
-        (1, -1) => Direction::NorthEast,
-        (-1, 1) => Direction::SouthWest,
-        (-1, -1) => Direction::NorthWest,
-        _ => Direction::South,
-    }
+/// Chebyshev distance on the same floor. Callers must already have matched `z`.
+fn chebyshev(a: Position, b: Position) -> i32 {
+    (i32::from(a.x) - i32::from(b.x))
+        .abs()
+        .max((i32::from(a.y) - i32::from(b.y)).abs())
 }
 
 /// Compute the step interval in milliseconds for a given creature speed.
@@ -591,95 +582,69 @@ impl Game {
                 return;
             }
         };
-        let mut warned_types = HashSet::new();
+        let mut skipped = 0u32;
         for spawn in entries {
             // Case-insensitive lookup in monster type registry.
-            if let Some(t) = self.monster_types.get(&spawn.name.to_ascii_lowercase()) {
-                let sid = self.next_spawn_id;
-                self.next_spawn_id += 1;
-                let spawn_entry = MonsterSpawn {
-                    position: spawn.position,
-                    respawn_interval_ms: spawn.respawn_interval_ms,
-                    respawn_at_ms: None,
-                    name: t.name.clone(),
-                    look_type: t.look_type,
-                    look_corpse: t.look_corpse,
-                    health: t.health,
-                    max_health: t.max_health,
-                    speed: t.speed,
-                    attack: t.attack,
-                    loot: t.loot.clone(),
-                    target_distance: t.target_distance,
-                    race: t.race,
-                    personality: t.personality,
-                    aggro_range: t.aggro_range,
-                };
-                self.spawns.insert(sid, spawn_entry);
+            // Names absent from the datapack are real-map leftovers (Dawnfly,
+            // werebear, and similar). Skip them — do not invent a creature.
+            let Some(t) = self.monster_types.get(&spawn.name.to_ascii_lowercase()) else {
+                skipped += 1;
+                continue;
+            };
+            let sid = self.next_spawn_id;
+            self.next_spawn_id += 1;
+            let spawn_entry = MonsterSpawn {
+                position: spawn.position,
+                respawn_interval_ms: spawn.respawn_interval_ms,
+                respawn_at_ms: None,
+                name: t.name.clone(),
+                look_type: t.look_type,
+                look_corpse: t.look_corpse,
+                health: t.health,
+                max_health: t.max_health,
+                speed: t.speed,
+                attack: t.attack,
+                loot: t.loot.clone(),
+                target_distance: t.target_distance,
+                race: t.race,
+                personality: t.personality,
+                aggro_range: t.aggro_range,
+                hostile: t.hostile,
+                run_on_health: t.run_on_health,
+            };
+            self.spawns.insert(sid, spawn_entry);
 
-                // Create the initial monster immediately.
-                let mid = self.next_monster_id;
-                self.next_monster_id += 1;
-                let monster = MonsterState {
-                    name: t.name.clone(),
-                    position: spawn.position,
-                    direction: Direction::South,
-                    health: t.health,
-                    max_health: t.max_health,
-                    speed: t.speed,
-                    look_type: t.look_type,
-                    look_corpse: t.look_corpse,
-                    attacking: None,
-                    last_attack_ms: 0,
-                    attack: t.attack,
-                    loot: t.loot.clone(),
-                    spawn_id: Some(sid),
-                    list_walk_dir: VecDeque::new(),
-                    follow_target: None,
-                    target_distance: t.target_distance,
-                    race: t.race,
-                    personality: t.personality,
-                    aggro_range: t.aggro_range,
-                    light_level: 0,
-                    light_color: 0,
-                };
-                self.monsters.insert(mid, monster);
-            } else {
-                // No type registered → log warning once per type, spawn with defaults.
-                if warned_types.insert(spawn.name.to_ascii_lowercase()) {
-                    tracing::warn!(name = %spawn.name, "unknown monster type — spawning with hardcoded defaults");
-                }
-                let sid = self.next_spawn_id;
-                self.next_spawn_id += 1;
-                self.spawns.insert(sid, spawn.clone());
-                let mid = self.next_monster_id;
-                self.next_monster_id += 1;
-                let monster = MonsterState {
-                    name: spawn.name.clone(),
-                    position: spawn.position,
-                    direction: Direction::South,
-                    health: 50,
-                    max_health: 50,
-                    speed: 200,
-                    look_type: name_hash_looktype(&spawn.name),
-                    look_corpse: spawn.look_corpse,
-                    attacking: None,
-                    last_attack_ms: 0,
-                    attack: 7,
-                    loot: vec![],
-                    spawn_id: Some(sid),
-                    list_walk_dir: VecDeque::new(),
-                    follow_target: None,
-                    target_distance: 0,
-                    race: Some(RaceType::Blood),
-                    personality: Personality::Aggressive,
-                    aggro_range: DEFAULT_AGGRO_RANGE,
-                    light_level: 0,
-                    light_color: 0,
-                };
-                self.monsters.insert(mid, monster);
-            }
+            // Create the initial monster immediately.
+            let mid = self.next_monster_id;
+            self.next_monster_id += 1;
+            let monster = MonsterState {
+                name: t.name.clone(),
+                position: spawn.position,
+                direction: Direction::South,
+                health: t.health,
+                max_health: t.max_health,
+                speed: t.speed,
+                look_type: t.look_type,
+                look_corpse: t.look_corpse,
+                attacking: None,
+                last_attack_ms: 0,
+                attack: t.attack,
+                loot: t.loot.clone(),
+                spawn_id: Some(sid),
+                list_walk_dir: VecDeque::new(),
+                follow_target: None,
+                target_distance: t.target_distance,
+                race: t.race,
+                personality: t.personality,
+                aggro_range: t.aggro_range,
+                hostile: t.hostile,
+                run_on_health: t.run_on_health,
+                light_level: 0,
+                light_color: 0,
+            };
+            self.monsters.insert(mid, monster);
         }
-        tracing::info!(count = %self.spawns.len(), monsters = %self.monsters.len(), "spawns loaded");
+        tracing::info!(count = %self.spawns.len(), monsters = %self.monsters.len(), skipped, "spawns loaded");
     }
 
     /// A merged read view (overlay + static) for the map encoder.
@@ -800,7 +765,16 @@ impl Game {
         // Only players have a known-set; monsters are never viewers.
         let known = {
             let v = self.players.get_mut(&viewer)?;
-            !v.known.insert(target)
+            // Self must stay unknown. Login and teleport rebuild the local
+            // player with the full 0x61 form; marking self known makes the next
+            // 0x64 emit 0x62, the client fails to reattach localPlayer, and
+            // walks snap back until a relog (which starts with an empty set).
+            if viewer == target {
+                v.known.remove(&target);
+                false
+            } else {
+                !v.known.insert(target)
+            }
         };
         let hp = self.creature_health_percent(target);
         let spd = self.creature_speed(target);
@@ -898,7 +872,10 @@ impl Game {
         if let Some(p) = self.players.get(&id) {
             return (p.light_level, p.light_color);
         }
-        self.monsters.get(&id).map(|m| (m.light_level, m.light_color)).unwrap_or((0, 0))
+        self.monsters
+            .get(&id)
+            .map(|m| (m.light_level, m.light_color))
+            .unwrap_or((0, 0))
     }
 
     /// Walk speed for any creature.
@@ -941,6 +918,61 @@ impl Game {
                 dx.abs() + dy.abs()
             })
             .map(|(&id, _)| id)
+    }
+
+    /// Can this monster take one step onto `to`? Same checks as `do_move_monster`:
+    /// walkable, not occupied, no floor-change (monsters don't use stairs).
+    fn monster_can_step(&self, id: u32, to: Position) -> bool {
+        self.chunks.is_walkable(to)
+            && !self.tile_occupied(to, id)
+            && self
+                .chunks
+                .floor_change_at(to.x as i32, to.y as i32, to.z as i32)
+                .is_empty()
+    }
+
+    /// One step that increases distance from `threat`. Prefers the step most
+    /// aligned with the away-vector so a rabbit east of the player runs east,
+    /// not diagonally into a wall. `None` when every away-tile is blocked.
+    fn flee_step(&self, id: u32, from: Position, threat: Position) -> Option<Direction> {
+        const DIRS: [Direction; 8] = [
+            Direction::North,
+            Direction::East,
+            Direction::South,
+            Direction::West,
+            Direction::NorthEast,
+            Direction::NorthWest,
+            Direction::SouthEast,
+            Direction::SouthWest,
+        ];
+        let cur = chebyshev(from, threat);
+        let away_x = i32::from(from.x) - i32::from(threat.x);
+        let away_y = i32::from(from.y) - i32::from(threat.y);
+        let mut best: Option<(i32, i32, Direction)> = None;
+        for dir in DIRS {
+            let (dx, dy) = dir.delta();
+            let Some(to) = from.offset(dx, dy) else {
+                continue;
+            };
+            if !self.monster_can_step(id, to) {
+                continue;
+            }
+            let dist = chebyshev(to, threat);
+            if dist <= cur {
+                continue;
+            }
+            let align = dx * away_x.signum() + dy * away_y.signum();
+            let better = match best {
+                None => true,
+                Some((best_dist, best_align, _)) => {
+                    dist > best_dist || (dist == best_dist && align > best_align)
+                }
+            };
+            if better {
+                best = Some((dist, align, dir));
+            }
+        }
+        best.map(|(_, _, dir)| dir)
     }
 
     /// Ids of monsters whose position is visible from `viewer`.
@@ -1135,7 +1167,11 @@ impl Game {
                     required.extend(crate::map::chunks_around(p.position));
                 }
                 for m in self.monsters.values() {
-                    required.extend(crate::map::chunks_around(m.position));
+                    // Same-floor neighborhood only. The player viewport stack
+                    // (floors 0..=8 × 3×3) applied to every monster made the
+                    // 5s sweep allocate and insert millions of ids and froze
+                    // the actor.
+                    required.extend(crate::map::chunk_neighbors(m.position));
                 }
                 self.chunks.sweep(&required);
             }
@@ -1524,34 +1560,32 @@ impl Game {
             .collect();
 
         for id in monster_ids {
-            // --- Personality: coward flee ---
-            let is_coward = self
+            // --- Flee (TFS `isFleeing` / `runonhealth`, plus legacy cowards) ---
+            // Wildlife with `runonhealth == max health` (rabbit, deer, sheep)
+            // is always fleeing: drop the fight and step away from the nearest
+            // player in sight. No player nearby → fall through and wander.
+            let fleeing = self
                 .monsters
                 .get(&id)
-                .map(|m| m.personality == Personality::Coward)
+                .map(|m| m.is_fleeing())
                 .unwrap_or(false);
-            if is_coward {
-                let (health, max_health, mpos) = match self.monsters.get(&id) {
-                    Some(m) => (m.health, m.max_health, m.position),
+            let mut suppress_wander = false;
+            if fleeing {
+                if let Some(m) = self.monsters.get_mut(&id) {
+                    m.attacking = None;
+                    m.follow_target = None;
+                }
+                let mpos = match self.monsters.get(&id) {
+                    Some(m) => m.position,
                     None => continue,
                 };
-                if health * 4 < max_health * COWARD_FLEE_THRESHOLD {
-                    if let Some(m) = self.monsters.get_mut(&id) {
-                        m.attacking = None;
-                        m.follow_target = None;
-                    }
-                    // Find nearest player and flee away from them
-                    let nearest = self.nearest_player_in_range(mpos, 20);
-                    if let Some(nid) = nearest {
-                        if let Some(npos) = self.players.get(&nid).map(|p| p.position) {
-                            let dx = i32::from(mpos.x) - i32::from(npos.x);
-                            let dy = i32::from(mpos.y) - i32::from(npos.y);
-                            if dx != 0 || dy != 0 {
-                                let dir = direction_from_delta(dx, dy);
-                                if let Some(m) = self.monsters.get_mut(&id) {
-                                    m.list_walk_dir.clear();
-                                    m.list_walk_dir.push_back(dir);
-                                }
+                if let Some(nid) = self.nearest_player_in_range(mpos, FLEE_SIGHT_RANGE) {
+                    suppress_wander = true;
+                    if let Some(npos) = self.players.get(&nid).map(|p| p.position) {
+                        if let Some(dir) = self.flee_step(id, mpos, npos) {
+                            if let Some(m) = self.monsters.get_mut(&id) {
+                                m.list_walk_dir.clear();
+                                m.list_walk_dir.push_back(dir);
                             }
                         }
                     }
@@ -1559,28 +1593,29 @@ impl Game {
             }
 
             // --- Personality: aggressive aggro ---
-            let is_aggressive = self
+            // Non-hostile creatures (TFS `hostile="0"`) never acquire a target.
+            // Fleeing creatures run instead of closing in, even if hostile
+            // (a rat below `runonhealth`, a silver rabbit at full HP).
+            let should_aggro = self
                 .monsters
                 .get(&id)
-                .map(|m| m.personality == Personality::Aggressive)
+                .map(|m| {
+                    m.hostile
+                        && m.personality == Personality::Aggressive
+                        && !m.is_fleeing()
+                        && m.attacking.is_none()
+                })
                 .unwrap_or(false);
-            if is_aggressive {
-                let has_target = self
-                    .monsters
-                    .get(&id)
-                    .map(|m| m.attacking.is_some())
-                    .unwrap_or(false);
-                if !has_target {
-                    let (mpos, arange) = match self.monsters.get(&id) {
-                        Some(m) => (m.position, m.aggro_range),
-                        None => continue,
-                    };
-                    if let Some(pid) = self.nearest_player_in_range(mpos, arange) {
-                        if let Some(m) = self.monsters.get_mut(&id) {
-                            m.attacking = Some(pid);
-                            m.follow_target = Some(pid);
-                            m.last_attack_ms = 0;
-                        }
+            if should_aggro {
+                let (mpos, arange) = match self.monsters.get(&id) {
+                    Some(m) => (m.position, m.aggro_range),
+                    None => continue,
+                };
+                if let Some(pid) = self.nearest_player_in_range(mpos, arange) {
+                    if let Some(m) = self.monsters.get_mut(&id) {
+                        m.attacking = Some(pid);
+                        m.follow_target = Some(pid);
+                        m.last_attack_ms = 0;
                     }
                 }
             }
@@ -1654,7 +1689,9 @@ impl Game {
             }
 
             // --- Random wandering for idle monsters ---
-            if follow_target.is_none() {
+            // Suppressed while a player is close enough that a fleeing creature
+            // should be running, so a blocked step doesn't wander back into them.
+            if !suppress_wander && follow_target.is_none() {
                 let m = match self.monsters.get(&id) {
                     Some(m) => m,
                     None => continue,
@@ -2645,6 +2682,24 @@ mod tests {
     }
 
     #[test]
+    fn introduce_self_stays_unknown_so_teleport_can_rebuild() {
+        let mut g = Game::from_static_map_arc(walk_map());
+        let (id, _r) = add_player(&mut g, Position::new(100, 100, 7));
+        let first = g.introduce(id, id).unwrap();
+        let second = g.introduce(id, id).unwrap();
+        assert_eq!(u16::from_le_bytes([first[0], first[1]]), 0x0061);
+        assert_eq!(
+            u16::from_le_bytes([second[0], second[1]]),
+            0x0061,
+            "self must stay full-form; a short form desyncs the next teleport"
+        );
+        assert!(
+            !g.players.get(&id).unwrap().known.contains(&id),
+            "self must not enter the known-set"
+        );
+    }
+
+    #[test]
     fn underground_spectator_sees_within_two_floors() {
         // viewer underground at z=9; targets at z=6 (out, >2) and z=11 (in, =2).
         assert!(
@@ -3142,14 +3197,8 @@ mod tests {
             Position::new(94, 117, 7),
             "player should stop one tile west of creature"
         );
-        assert!(
-            p.go_to_position.is_none(),
-            "go_to_position must be cleared"
-        );
-        assert!(
-            p.list_walk_dir.is_empty(),
-            "walk queue must be cleared"
-        );
+        assert!(p.go_to_position.is_none(), "go_to_position must be cleared");
+        assert!(p.list_walk_dir.is_empty(), "walk queue must be cleared");
     }
 
     // -------------------------------------------------------------------------
@@ -3262,11 +3311,11 @@ mod tests {
     #[test]
     fn chunks_around_produces_27_ids_for_center_position() {
         let ids = crate::map::chunks_around(Position::new(1000, 1000, 7));
-        // 3×3 grid × 3 floors = 27 chunk ids
+        // 3×3 grid × floors 0..=8 (overground stack + stair slack)
         assert_eq!(
             ids.len(),
-            27,
-            "chunks_around must return exactly 27 chunk ids"
+            9 * 9,
+            "chunks_around at z=7 must cover the full overground viewport"
         );
     }
 
@@ -3568,6 +3617,18 @@ mod tests {
     }
 
     #[test]
+    fn xml_parse_hostile_flag_makes_wildlife_neutral() {
+        let xml = r#"<monsters>
+            <monster name="Rabbit" looktype="74" health="15" max_health="15" speed="180" attack="0" hostile="0" runonhealth="15"/>
+        </monsters>"#;
+        let map = parse_monsters_xml(xml).unwrap();
+        let rabbit = map.get("rabbit").expect("Rabbit must be parsed");
+        assert!(!rabbit.hostile);
+        assert_eq!(rabbit.run_on_health, 15);
+        assert_eq!(rabbit.personality, Personality::Neutral);
+    }
+
+    #[test]
     fn xml_parse_personality_defaults_to_aggressive() {
         let xml = r#"<monsters>
             <monster name="Rat" looktype="100" health="50" max_health="50" speed="200" attack="7"/>
@@ -3591,7 +3652,11 @@ mod tests {
     fn aggressive_monster_aggros_nearest_player_in_range() {
         let mut g = Game::from_static_map_arc(combat_map(false));
         let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
-        let m = add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Aggressive);
+        let m = add_monster_with_personality(
+            &mut g,
+            Position::new(96, 117, 7),
+            Personality::Aggressive,
+        );
 
         // Monster id 0x4000_0000 % 10 = 4
         g.on_monster_ai_tick(4, 1000);
@@ -3611,7 +3676,11 @@ mod tests {
     fn aggressive_monster_does_not_aggro_out_of_range() {
         let mut g = Game::from_static_map_arc(combat_map(false));
         let (_player, _rx) = add_player(&mut g, Position::new(100, 117, 7)); // 5 tiles from monster at 95
-        let m = add_monster_with_personality(&mut g, Position::new(95, 117, 7), Personality::Aggressive);
+        let m = add_monster_with_personality(
+            &mut g,
+            Position::new(95, 117, 7),
+            Personality::Aggressive,
+        );
         g.monsters.get_mut(&m).unwrap().aggro_range = 3; // only 3 tiles
 
         // Monster id 0x4000_0000 % 10 = 4
@@ -3628,7 +3697,8 @@ mod tests {
     fn neutral_monster_does_not_aggro_on_sight() {
         let mut g = Game::from_static_map_arc(combat_map(false));
         let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
-        let m = add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Neutral);
+        let m =
+            add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Neutral);
 
         // Monster id 0x4000_0000 % 10 = 4
         g.on_monster_ai_tick(4, 1000);
@@ -3644,7 +3714,8 @@ mod tests {
     fn coward_monster_flees_when_hp_low() {
         let mut g = Game::from_static_map_arc(combat_map(false));
         let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
-        let m = add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Coward);
+        let m =
+            add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Coward);
 
         let start_pos = Position::new(96, 117, 7);
         assert_eq!(g.monsters.get(&m).unwrap().position, start_pos);
@@ -3680,7 +3751,8 @@ mod tests {
     fn coward_monster_does_not_flee_at_high_hp() {
         let mut g = Game::from_static_map_arc(combat_map(false));
         let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
-        let m = add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Coward);
+        let m =
+            add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Coward);
 
         // Full HP — should not flee
         g.monsters.get_mut(&m).unwrap().attacking = Some(0x1000_0000);
@@ -3701,7 +3773,8 @@ mod tests {
         let (chunks, meta) = Arc::try_unwrap(map).unwrap().into_chunks_and_meta();
         let mut g = Game::new_seeded(chunks, Arc::new(meta), 42);
         let (_player, _rx) = add_player(&mut g, Position::new(100, 100, 7));
-        let m = add_monster_with_personality(&mut g, Position::new(95, 117, 7), Personality::Neutral);
+        let m =
+            add_monster_with_personality(&mut g, Position::new(95, 117, 7), Personality::Neutral);
         let start = g.monsters.get(&m).unwrap().position;
 
         // Run up to 20 AI ticks. With seeded RNG 42 and WANDER_CHANCE=0.25,
@@ -3717,6 +3790,150 @@ mod tests {
         assert!(
             wandered,
             "idle monster must wander after several AI ticks with seeded RNG"
+        );
+    }
+
+    #[test]
+    fn wildlife_does_not_aggro_and_runs_from_player() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let m =
+            add_monster_with_personality(&mut g, Position::new(96, 117, 7), Personality::Neutral);
+        {
+            let rabbit = g.monsters.get_mut(&m).unwrap();
+            rabbit.hostile = false;
+            rabbit.run_on_health = rabbit.max_health;
+            rabbit.attack = 0;
+        }
+        let start = g.monsters.get(&m).unwrap().position;
+
+        // Monster id 0x4000_0000 % 10 = 4
+        g.on_monster_ai_tick(4, 1000);
+
+        let rabbit = g.monsters.get(&m).unwrap();
+        assert!(rabbit.attacking.is_none(), "rabbit must not attack");
+        assert!(rabbit.follow_target.is_none(), "rabbit must not chase");
+        let start_dist = chebyshev(start, Position::new(95, 117, 7));
+        let now_dist = chebyshev(rabbit.position, Position::new(95, 117, 7));
+        assert!(
+            now_dist > start_dist,
+            "rabbit must step away from the player (start {start:?}, now {:?})",
+            rabbit.position
+        );
+    }
+
+    #[test]
+    fn wildlife_wanders_when_player_is_far() {
+        let map = walk_map();
+        let (chunks, meta) = Arc::try_unwrap(map).unwrap().into_chunks_and_meta();
+        let mut g = Game::new_seeded(chunks, Arc::new(meta), 42);
+        // Far enough that FLEE_SIGHT_RANGE (8) does not see the player.
+        let (_player, _rx) = add_player(&mut g, Position::new(100, 100, 7));
+        let m =
+            add_monster_with_personality(&mut g, Position::new(95, 117, 7), Personality::Neutral);
+        g.monsters.get_mut(&m).unwrap().hostile = false;
+        g.monsters.get_mut(&m).unwrap().run_on_health = 50;
+        let start = g.monsters.get(&m).unwrap().position;
+
+        let mut wandered = false;
+        for tick in 1..=20 {
+            g.on_monster_ai_tick(4, tick * 100);
+            let rabbit = g.monsters.get(&m).unwrap();
+            assert!(rabbit.attacking.is_none(), "far rabbit must not aggro");
+            if rabbit.position != start {
+                wandered = true;
+                break;
+            }
+        }
+        assert!(wandered, "wildlife with no player in sight must wander");
+    }
+
+    #[test]
+    fn run_on_health_flees_only_at_or_below_threshold() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster_with_personality(
+            &mut g,
+            Position::new(96, 117, 7),
+            Personality::Aggressive,
+        );
+        g.monsters.get_mut(&m).unwrap().run_on_health = 5;
+
+        g.on_monster_ai_tick(4, 1000);
+        assert!(
+            g.monsters.get(&m).unwrap().attacking.is_some(),
+            "rat above runonhealth must still aggro"
+        );
+
+        g.monsters.get_mut(&m).unwrap().health = 5;
+        let before = g.monsters.get(&m).unwrap().position;
+        g.on_monster_ai_tick(4, 2000);
+        let rat = g.monsters.get(&m).unwrap();
+        assert!(
+            rat.attacking.is_none(),
+            "rat at runonhealth must drop the fight"
+        );
+        assert!(
+            chebyshev(rat.position, Position::new(95, 117, 7))
+                > chebyshev(before, Position::new(95, 117, 7)),
+            "rat at runonhealth must run away"
+        );
+    }
+
+    #[test]
+    fn unknown_spawn_name_is_skipped() {
+        // Real-map leftovers (Dawnfly, werebear) are not in the datapack.
+        // Inventing a default creature put them on the wrong floor and made
+        // them attack. They must not be placed at all.
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        g.load_spawns(
+            r#"<spawns>
+                <spawn centerx="96" centery="117" centerz="7" radius="1">
+                  <monster name="Dawnfly" x="0" y="0" z="7" spawntime="60"/>
+                </spawn>
+              </spawns>"#,
+            0,
+        );
+        assert!(g.monsters.is_empty(), "unknown names must not spawn");
+        assert!(g.spawns.is_empty(), "unknown names must not register a spawn");
+    }
+
+    #[test]
+    fn wildlife_spawn_loads_flags_and_runs() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        g.monster_types = parse_monsters_xml(
+            r#"<monsters>
+                <monster name="Rabbit" looktype="74" health="15" max_health="15" speed="180" attack="0" hostile="0" runonhealth="15"/>
+              </monsters>"#,
+        )
+        .unwrap();
+        g.load_spawns(
+            r#"<spawns>
+                <spawn centerx="96" centery="117" centerz="7" radius="1">
+                  <monster name="Rabbit" x="0" y="0" z="7" spawntime="60"/>
+                </spawn>
+              </spawns>"#,
+            0,
+        );
+        let (id, rabbit) = g.monsters.iter().next().expect("rabbit placed");
+        let id = *id;
+        assert_eq!(rabbit.position, Position::new(96, 117, 7));
+        assert!(!rabbit.hostile);
+        assert_eq!(rabbit.run_on_health, 15);
+        assert_eq!(rabbit.attack, 0);
+        assert_eq!(rabbit.personality, Personality::Neutral);
+
+        let (_player, _rx) = add_player(&mut g, Position::new(95, 117, 7));
+        let start = g.monsters[&id].position;
+        // First monster id is 0x4000_0000, bucket 4.
+        g.on_monster_ai_tick(4, 1000);
+        let rabbit = &g.monsters[&id];
+        assert!(rabbit.attacking.is_none(), "loaded rabbit must not aggro");
+        assert!(rabbit.follow_target.is_none(), "loaded rabbit must not chase");
+        assert!(
+            chebyshev(rabbit.position, Position::new(95, 117, 7))
+                > chebyshev(start, Position::new(95, 117, 7)),
+            "loaded rabbit must run from the player"
         );
     }
 }

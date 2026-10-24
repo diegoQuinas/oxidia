@@ -160,11 +160,10 @@ impl Game {
             .map(|p| p.name.clone())
             .unwrap_or_default();
         let mut placed = others.clone();
-        let hp_pct = if initial.max_health > 0 {
-            ((initial.health * 100) / initial.max_health).min(100) as u8
-        } else {
-            100
-        };
+        let hp_pct = (initial.health * 100)
+            .checked_div(initial.max_health)
+            .unwrap_or(100)
+            .min(100) as u8;
         let ll = self.creature_light(id);
         let self_view = CreatureView {
             id,
@@ -477,7 +476,17 @@ mod tests {
         );
 
         // Drop a non-stackable item on the ground next to spawn.
-        let _ = g.add_to_ground_front(drop_pos, 999, DROP_CID, 1, None, false, false);
+        let _ = g.add_to_ground_front(
+            drop_pos,
+            999,
+            1,
+            WireItem {
+                client_id: DROP_CID,
+                subtype: None,
+                animated: false,
+            },
+            false,
+        );
 
         // A fresh login near the same spot must now carry the dropped item.
         let (tx1, _rx1) = mpsc::channel(super::super::PUSH_CAPACITY);

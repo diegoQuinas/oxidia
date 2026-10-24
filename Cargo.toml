@@ -6,7 +6,6 @@ members = ["crates/*"]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-authors = ["tito"]
 
 [workspace.dependencies]
 # Internal crates
@@ -23,7 +22,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 bytes = "1"
-byteorder = "1"
 roxmltree = "0.20"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

@@ -360,6 +360,8 @@ pub(super) fn add_monster_with_personality(
             race: Some(RaceType::Blood),
             personality,
             aggro_range: DEFAULT_AGGRO_RANGE,
+            hostile: true,
+            run_on_health: 0,
             light_level: 0,
             light_color: 0,
         },

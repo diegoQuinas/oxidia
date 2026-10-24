@@ -7,8 +7,6 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-tracing.workspace = true
-byteorder.workspace = true
 serde.workspace = true
 roxmltree.workspace = true
 

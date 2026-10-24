@@ -56,12 +56,12 @@ impl Game {
         let original_count = st.counts[src_idx];
         let cur = original_count.unwrap_or(1).max(1);
         let moved = if stackable { want.max(1).min(cur) } else { 1 };
-        let removed_fully;
-        if stackable && cur > moved {
+        
+        let removed_fully = if stackable && cur > moved {
             let left = cur - moved;
             st.counts[src_idx] = Some(left);
             st.items[src_idx].subtype = Some(left);
-            removed_fully = false;
+            false
         } else {
             st.items.remove(src_idx);
             st.server_ids.remove(src_idx);
@@ -69,8 +69,8 @@ impl Game {
             if src_idx < st.pre_creature_len {
                 st.pre_creature_len -= 1;
             }
-            removed_fully = true;
-        }
+            true
+        };
         Some((moved, removed_fully, original_count))
     }
 
@@ -78,17 +78,16 @@ impl Game {
     /// the down-items, merging into a same-type front stack (cap 100, spill on
     /// overflow). Returns `(merged_update, added)` wire items to broadcast at slot S.
     ///
-    /// `subtype_override` is the fluid type for non-stackable fluid items (e.g.
+    /// `item.subtype` is the fluid type for non-stackable fluid items (e.g.
     /// bucket with water). Pass `None` for regular non-stackable items; the
-    /// function uses it instead of the stackable-derived count.
+    /// function uses it instead of the stackable-derived count. Stackable inserts
+    /// ignore `item.subtype` and derive the count from `moved`.
     pub(super) fn add_to_ground_front(
         &mut self,
         to: Position,
         src_sid: u16,
-        client_id: u16,
         moved: u8,
-        subtype_override: Option<u8>,
-        animated: bool,
+        item: WireItem,
         stackable: bool,
     ) -> Option<(Option<WireItem>, Option<WireItem>)> {
         if !self.materialize(to) {
@@ -107,9 +106,9 @@ impl Game {
             if total > 100 {
                 let spill_count = u8::try_from(total - 100).unwrap_or(u8::MAX);
                 let spill_wi = WireItem {
-                    client_id,
+                    client_id: item.client_id,
                     subtype: Some(spill_count),
-                    animated,
+                    animated: item.animated,
                 };
                 st.items.insert(front, spill_wi);
                 st.server_ids.insert(front, src_sid);
@@ -119,15 +118,11 @@ impl Game {
                 Some((Some(merged_item), None))
             }
         } else {
-            let subtype = if stackable {
-                Some(moved)
-            } else {
-                subtype_override
-            };
+            let subtype = if stackable { Some(moved) } else { item.subtype };
             let wi = WireItem {
-                client_id,
+                client_id: item.client_id,
                 subtype,
-                animated,
+                animated: item.animated,
             };
             st.items.insert(front, wi);
             st.server_ids.insert(front, src_sid);
@@ -241,9 +236,16 @@ impl Game {
 
         let dest_creatures = self.creatures_on(to).len();
         let Some((dest_merged_update, dest_added)) = self.add_to_ground_front(
-            to, src_sid, client_id, moved, original_count, animated, stackable,
-        )
-        else {
+            to,
+            src_sid,
+            moved,
+            WireItem {
+                client_id,
+                subtype: original_count,
+                animated,
+            },
+            stackable,
+        ) else {
             return;
         };
         // Broadcast: all dest changes target the top down-item slot S = front + creatures.
@@ -442,10 +444,12 @@ impl Game {
                 let Some((merged, added)) = self.add_to_ground_front(
                     to,
                     it.server_id,
-                    it.client_id,
                     moved,
-                    it.count,
-                    it.animated,
+                    WireItem {
+                        client_id: it.client_id,
+                        subtype: it.count,
+                        animated: it.animated,
+                    },
                     meta_stackable,
                 ) else {
                     return;

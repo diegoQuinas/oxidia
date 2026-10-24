@@ -9,7 +9,7 @@
 //!
 //! The `config/monsters.xml` file defines named monster blueprints
 //! (looktype, health, speed, attack). Spawn entries in `world/map-spawn.xml`
-//! reference these names; unknown names fall back to hardcoded defaults.
+//! reference these names; unknown names are skipped.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -22,11 +22,16 @@ use rand::Rng;
 use rand::rngs::StdRng;
 
 /// Monster personality determines aggro and behavior.
+///
+/// TFS wildlife is not a personality: `hostile="0"` clears [`MonsterType::hostile`]
+/// so the creature never swings, and `runonhealth` (often equal to max HP on
+/// rabbits, deer, sheep) makes it flee a nearby player. Idle creatures still
+/// wander.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Personality {
     /// Attacks players on sight within aggro range.
     Aggressive,
-    /// Only attacks back when hit (current default).
+    /// Does not aggro on sight. Still retaliates when `hostile` is set.
     Neutral,
     /// Flees when HP drops below threshold.
     Coward,
@@ -44,8 +49,53 @@ impl Personality {
 
 /// Default aggro range in tiles for aggressive monsters.
 pub(crate) const DEFAULT_AGGRO_RANGE: i32 = 5;
+/// Chebyshev range at which a fleeing creature runs from a player.
+/// Roughly the client viewport, matching TFS `Monster::canSee`.
+pub(crate) const FLEE_SIGHT_RANGE: i32 = 8;
 /// Fraction of max_health (as numerator of 4) below which cowards flee.
 pub(crate) const COWARD_FLEE_THRESHOLD: u32 = 1; // flee when HP < max_health / 4
+
+/// TFS `<flag hostile>` / `<flag runonhealth>`, also accepted as attributes on
+/// the monster element (flat `config/monsters.xml`).
+///
+/// Missing `hostile` defaults to true — TFS's default, and the reason a rabbit
+/// with an unread flag was attacking.
+fn parse_behavior_flags(node: roxmltree::Node<'_, '_>) -> (bool, u32) {
+    let mut hostile = true;
+    let mut run_on_health = 0u32;
+    if let Some(v) = node.attribute("hostile") {
+        hostile = flag_truthy(v);
+    }
+    if let Some(v) = node
+        .attribute("runonhealth")
+        .or_else(|| node.attribute("run_on_health"))
+    {
+        run_on_health = v.parse().unwrap_or(0);
+    }
+    for flag in node.descendants().filter(|n| n.has_tag_name("flag")) {
+        if let Some(v) = flag.attribute("hostile") {
+            hostile = flag_truthy(v);
+        }
+        if let Some(v) = flag.attribute("runonhealth") {
+            run_on_health = v.parse().unwrap_or(0);
+        }
+    }
+    (hostile, run_on_health)
+}
+
+fn flag_truthy(v: &str) -> bool {
+    !matches!(v, "0" | "false" | "no")
+}
+
+/// Explicit `personality=` wins. Otherwise hostile creatures aggro and
+/// non-hostile ones (rabbits, deer, sheep) do not.
+fn personality_from_node(node: roxmltree::Node<'_, '_>, hostile: bool) -> Personality {
+    match node.attribute("personality") {
+        Some(s) => Personality::from_xml(Some(s)),
+        None if hostile => Personality::Aggressive,
+        None => Personality::Neutral,
+    }
+}
 
 /// A monster blueprint loaded from `config/monsters.xml`.
 /// These are the canonical stats for each named monster type.
@@ -67,6 +117,13 @@ pub(crate) struct MonsterType {
     pub(crate) personality: Personality,
     /// Aggro range in tiles.
     pub(crate) aggro_range: i32,
+    /// TFS `hostile`. `false` means never attack — no aggro, no retaliation.
+    /// Wildlife (`Rabbit`, `Deer`, `Sheep`) sets this to false.
+    pub(crate) hostile: bool,
+    /// TFS `runonhealth`: flee while current HP is at or below this.
+    /// `0` means this flag never triggers a flee. Rabbits set it to max health,
+    /// so they always run from a nearby player.
+    pub(crate) run_on_health: u32,
 }
 
 /// Parse `<monsters>` XML and return a name-indexed map.
@@ -132,7 +189,8 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
             "diamond" => Some(RaceType::Diamond),
             _ => None,
         }).or(Some(RaceType::Blood));
-        let personality = Personality::from_xml(node.attribute("personality"));
+        let (hostile, run_on_health) = parse_behavior_flags(node);
+        let personality = personality_from_node(node, hostile);
         let aggro_range = node
             .attribute("aggro_range")
             .or_else(|| node.attribute("aggrorange"))
@@ -153,6 +211,8 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
                 race,
                 personality,
                 aggro_range,
+                hostile,
+                run_on_health,
             },
         );
     }
@@ -271,7 +331,8 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
             .and_then(|s| s.parse().ok())
             .unwrap_or(200);
 
-        // Extract attack from <attacks><attack name="melee" .../>
+        // Melee max. No `<attack name="melee">` (rabbits, sheep) means no swing —
+        // the old default of 7 is what made a non-hostile rabbit hit for damage.
         let attack: u16 = root
             .descendants()
             .find(|n| n.has_tag_name("attack") && n.attribute("name") == Some("melee"))
@@ -289,7 +350,7 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
                         max_abs
                     })
             })
-            .unwrap_or(7);
+            .unwrap_or(0);
 
         // Extract <loot> section with item entries.
         let loot: Vec<MonsterDrop> = root
@@ -317,9 +378,11 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
             })
             .unwrap_or_default();
 
-        let personality = Personality::from_xml(root.attribute("personality"));
+        let (hostile, run_on_health) = parse_behavior_flags(root);
+        let personality = personality_from_node(root, hostile);
         let aggro_range = root
             .attribute("aggrorange")
+            .or_else(|| root.attribute("aggro_range"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_AGGRO_RANGE);
         map.insert(
@@ -337,6 +400,8 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
                 race,
                 personality,
                 aggro_range,
+                hostile,
+                run_on_health,
             },
         );
     }
@@ -346,11 +411,15 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
 
 /// Parse `<spawns>` XML and return a list of spawn entries.
 ///
-/// Expected format:
+/// Expected format (RME / TFS 1.4.2). `x` and `y` are offsets from the spawn
+/// center. The monster `z` attribute is the absolute floor and equals
+/// `centerz` in every real datapack; TFS ignores it and places the creature
+/// on `centerz` (`spawn.cpp` `loadFromXml`). Adding the two puts a surface
+/// spawn on floor 14, where a ground-floor viewer can never see it.
 /// ```xml
 /// <spawns>
-///   <spawn centerx="32153" centery="31124" centerz="0" radius="2">
-///     <monster name="Silver Rabbit" x="0" y="1" z="0" spawntime="60"/>
+///   <spawn centerx="32153" centery="31124" centerz="7" radius="2">
+///     <monster name="Silver Rabbit" x="0" y="1" z="7" spawntime="60"/>
 ///   </spawn>
 /// </spawns>
 /// ```
@@ -393,17 +462,15 @@ pub(crate) fn parse_spawns_xml(xml: &str) -> Result<Vec<MonsterSpawn>, FormatErr
                 .attribute("y")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            let dz: i8 = monster_node
-                .attribute("z")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
             let spawntime_s: u64 = monster_node
                 .attribute("spawntime")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(60);
             let x = (i32::from(cx)).wrapping_add(i32::from(dx)) as u16;
             let y = (i32::from(cy)).wrapping_add(i32::from(dy)) as u16;
-            let z = (i32::from(cz)).wrapping_add(i32::from(dz)) as u8;
+            // Floor is the spawn center's z. RME writes the same absolute floor
+            // on the monster node; TFS 1.4.2 does not add it (spawn.cpp).
+            let z = cz;
             let position = Position::new(x, y, z);
             spawns.push(MonsterSpawn {
                 position,
@@ -421,6 +488,8 @@ pub(crate) fn parse_spawns_xml(xml: &str) -> Result<Vec<MonsterSpawn>, FormatErr
                 race: Some(RaceType::Blood),
                 personality: Personality::Neutral,
                 aggro_range: DEFAULT_AGGRO_RANGE,
+                hostile: true,
+                run_on_health: 0,
             });
         }
     }
@@ -468,6 +537,10 @@ pub(crate) struct MonsterSpawn {
     pub(crate) personality: Personality,
     /// Aggro range in tiles.
     pub(crate) aggro_range: i32,
+    /// TFS `hostile`. Copied onto the respawned creature.
+    pub(crate) hostile: bool,
+    /// TFS `runonhealth`. Copied onto the respawned creature.
+    pub(crate) run_on_health: u32,
 }
 
 /// Runtime state for a single monster.
@@ -508,6 +581,10 @@ pub(crate) struct MonsterState {
     pub(crate) personality: Personality,
     /// Aggro range in tiles.
     pub(crate) aggro_range: i32,
+    /// TFS `hostile`. `false` = never attack (no aggro, no retaliation).
+    pub(crate) hostile: bool,
+    /// TFS `runonhealth`. Flee while `health <= run_on_health` (`0` = never).
+    pub(crate) run_on_health: u32,
     /// Light level emitted by this creature (0 = none).
     pub(crate) light_level: u8,
     /// Light color emitted by this creature.
@@ -521,6 +598,16 @@ impl MonsterState {
             return 0;
         }
         ((self.health * 100) / self.max_health).min(100) as u8
+    }
+
+    /// TFS `Monster::isFleeing`: HP at or below `runonhealth`, or the legacy
+    /// coward threshold (`health < max_health / 4`).
+    pub(crate) fn is_fleeing(&self) -> bool {
+        let coward = self.personality == Personality::Coward
+            && self.health.saturating_mul(4)
+                < self.max_health.saturating_mul(COWARD_FLEE_THRESHOLD);
+        let flagged = self.run_on_health > 0 && self.health <= self.run_on_health;
+        coward || flagged
     }
 }
 
@@ -625,6 +712,22 @@ mod tests {
     }
 
     #[test]
+    fn spawn_floor_is_centerz_not_center_plus_monster_z() {
+        // Real-map RME writes the absolute floor on both attributes. TFS uses
+        // centerz only; adding them hides every surface creature on floor 14.
+        let xml = r#"
+            <spawns>
+              <spawn centerx="32957" centery="32076" centerz="7" radius="2">
+                <monster name="Rat" x="1" y="-2" z="7" spawntime="60"/>
+              </spawn>
+            </spawns>
+        "#;
+        let spawns = parse_spawns_xml(xml).unwrap();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].position, Position::new(32958, 32074, 7));
+    }
+
+    #[test]
     fn roll_drops_returns_item_ids_and_counts() {
         let mut rng = StdRng::seed_from_u64(7);
         let drops = vec![MonsterDrop {
@@ -726,6 +829,29 @@ mod tests {
         let map = parse_in_temp_dir(&xml);
         let mt = map.get("testrat").expect("TestRat must be parsed");
         assert_eq!(mt.loot.len(), 3, "must have 3 loot entries");
+    }
+
+    #[test]
+    fn xml_parse_tfs_wildlife_flags() {
+        // Rabbit-shaped TFS XML: hostile=0, runonhealth == max health, no melee.
+        let xml = r#"<monster name="Rabbit" race="blood" speed="180">
+  <health now="15" max="15"/>
+  <look type="74" corpse="6017"/>
+  <flags>
+    <flag hostile="0"/>
+    <flag runonhealth="15"/>
+  </flags>
+  <loot>
+    <item id="2666" chance="82" countmax="2"/>
+  </loot>
+</monster>"#;
+        let map = parse_in_temp_dir(xml);
+        let rabbit = map.get("testrat").expect("index name is TestRat");
+        assert!(!rabbit.hostile, "hostile=0 must not attack");
+        assert_eq!(rabbit.run_on_health, 15);
+        assert_eq!(rabbit.max_health, 15);
+        assert_eq!(rabbit.personality, Personality::Neutral);
+        assert_eq!(rabbit.attack, 0, "no melee attack must not default to 7");
     }
 
     #[test]

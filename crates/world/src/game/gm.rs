@@ -525,6 +525,8 @@ impl Game {
             race: template.and_then(|t| t.race),
             personality: template.map(|t| t.personality).unwrap_or(Personality::Neutral),
             aggro_range: template.map(|t| t.aggro_range).unwrap_or(DEFAULT_AGGRO_RANGE),
+            hostile: template.map(|t| t.hostile).unwrap_or(true),
+            run_on_health: template.map(|t| t.run_on_health).unwrap_or(0),
             light_level: 0,
             light_color: 0,
         };
@@ -856,7 +858,11 @@ mod tests {
     fn gm_lua_test_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU16 = AtomicU16::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("oxidia-gm-{label}-{seq}"));
+        // Pid keeps nextest's per-test processes from sharing one directory.
+        let dir = std::env::temp_dir().join(format!(
+            "oxidia-gm-{label}-{}-{seq}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1482,5 +1488,34 @@ mod tests {
         );
         g.on_day_night_tick(5_000);
         assert_eq!(g.world_light_level, 35, "/night must not snap back to day");
+    }
+
+    #[test]
+    fn gm_summon_copies_wildlife_flags() {
+        // `/m rabbit` must not fall back to hostile=true / attack=7. That
+        // fallback is what made a summoned rabbit swing.
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        g.monster_types = super::super::parse_monsters_xml(
+            r#"<monsters>
+                <monster name="Rabbit" looktype="74" health="15" max_health="15" speed="180" attack="0" hostile="0" runonhealth="15"/>
+              </monsters>"#,
+        )
+        .unwrap();
+        let (gm, mut rx) = add_player(&mut g, Position::new(95, 117, 7));
+        g.players.get_mut(&gm).unwrap().gamemaster = true;
+        drain(&mut rx);
+
+        g.do_gm_command(gm, "/m rabbit".into());
+        let rabbit = g
+            .monsters
+            .values()
+            .next()
+            .expect("/m rabbit must place a creature");
+        assert_eq!(rabbit.name, "rabbit");
+        assert!(!rabbit.hostile, "summon must copy hostile=0");
+        assert_eq!(rabbit.run_on_health, 15);
+        assert_eq!(rabbit.attack, 0, "summon must not invent melee damage");
+        assert_eq!(rabbit.health, 15);
+        assert_eq!(rabbit.position, Position::new(95, 117, 7));
     }
 }

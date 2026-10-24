@@ -333,7 +333,11 @@ mod tests {
     fn test_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU16 = AtomicU16::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("oxidia-lua-{label}-{seq}"));
+        // Pid keeps nextest's per-test processes from sharing one directory.
+        let dir = std::env::temp_dir().join(format!(
+            "oxidia-lua-{label}-{}-{seq}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

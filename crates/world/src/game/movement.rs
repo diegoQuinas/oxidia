@@ -77,12 +77,28 @@ impl Game {
             return;
         }
         // Ensure destination chunks are loaded before the position commit.
+        // `chunks_around` covers every floor the 0x64 will describe; loading
+        // only ±1 left the upper stack blank and the client walking on a map
+        // the server then rejected.
         let dest_chunks: Vec<crate::map::ChunkId> =
             crate::map::chunks_around(to).into_iter().collect();
+        let load_started = std::time::Instant::now();
         self.chunks.ensure_loaded(&dest_chunks);
+        let missing = dest_chunks
+            .iter()
+            .filter(|cid| !self.chunks.chunks.contains_key(*cid))
+            .count();
+        let load_ms = load_started.elapsed().as_millis() as u64;
 
         if let Some(p) = self.players.get_mut(&id) {
             p.position = to;
+            // A click-path or follow queue from the old temple is meaningless
+            // here. Leaving it armed walks the player a few tiles at the new
+            // temple, then cancel_walk snaps them back.
+            p.go_to_position = None;
+            p.list_walk_dir.clear();
+            p.failed_repaths = None;
+            p.follow_target = None;
         }
 
         // A teleport can leave an open ground container out of range too.
@@ -150,8 +166,10 @@ impl Game {
             }
         }
 
-        // Mover's own view: full 0x64 carrying every in-range player plus self.
+        // Mover's own view: full 0x64 carrying every in-range creature plus self.
         // Build creatures (introduce = &mut self) BEFORE borrowing self.merged().
+        // Monsters must be in this packet — login includes them, and a teleport
+        // that omits them looks like an empty world until the next relog.
         let mut wire_creatures: Vec<PlacedCreature> = self
             .visible_from(to, id)
             .into_iter()
@@ -166,6 +184,18 @@ impl Game {
                 })
             })
             .collect();
+        for mid in self.monsters_visible_from(to) {
+            if let Some(mpos) = self.monsters.get(&mid).map(|m| m.position) {
+                if let Some(bytes) = self.introduce(id, mid) {
+                    wire_creatures.push(PlacedCreature {
+                        x: mpos.x,
+                        y: mpos.y,
+                        z: mpos.z,
+                        bytes,
+                    });
+                }
+            }
+        }
         if let Some(bytes) = self.introduce(id, id) {
             wire_creatures.push(PlacedCreature {
                 x: to.x,
@@ -187,7 +217,55 @@ impl Game {
                 &wire_creatures,
             ));
         }
+        let empty_floors = self.viewport_empty_floors(to);
+        tracing::info!(
+            id,
+            from = ?(from.x, from.y, from.z),
+            to = ?(to.x, to.y, to.z),
+            requested = dest_chunks.len(),
+            missing,
+            load_ms,
+            map_bytes = pkt.len(),
+            empty_floors = %empty_floors,
+            "teleport map sent"
+        );
         self.push(id, pkt);
+    }
+
+    /// Floors in the client's viewport whose 18×14 window has no ground at all.
+    /// An empty floor here is a hole in the map the client just received.
+    fn viewport_empty_floors(&self, center: Position) -> String {
+        let (z0, z1) = crate::map::viewport_floor_span(center.z);
+        let ax = i32::from(center.x) - 8;
+        let ay = i32::from(center.y) - 6;
+        let mut empty = Vec::new();
+        for z in z0..=z1 {
+            let offset = i32::from(center.z) - i32::from(z);
+            let mut ground = 0u16;
+            for nx in 0..18 {
+                for ny in 0..14 {
+                    let x = ax + nx + offset;
+                    let y = ay + ny + offset;
+                    if !(0..=i32::from(u16::MAX)).contains(&x)
+                        || !(0..=i32::from(u16::MAX)).contains(&y)
+                    {
+                        continue;
+                    }
+                    let p = Position::new(x as u16, y as u16, z);
+                    if self.chunks.has_ground(p) {
+                        ground += 1;
+                    }
+                }
+            }
+            if ground == 0 {
+                empty.push(z.to_string());
+            }
+        }
+        if empty.is_empty() {
+            "none".to_string()
+        } else {
+            empty.join(",")
+        }
     }
 
     pub(super) fn do_move(&mut self, id: u32, direction: Direction) {
@@ -215,35 +293,58 @@ impl Game {
                 crate::map::chunks_around(d).into_iter().collect();
             self.chunks.ensure_loaded(&move_chunks);
         }
-        let dest = raw_dest
-            .map(|d| self.resolve_vertical(from, d, diagonal))
-            .filter(|&d| {
-                // Ghost/noclip bypass walks through walls, creatures, etc.
-                if nocollide {
-                    return self.chunks.has_ground(d);
-                }
-                // A vertical landing (stair/height redirect) is reached with TFS
-                // FLAG_IGNOREBLOCKITEM | FLAG_IGNOREBLOCKCREATURE (game.cpp:799,815),
-                // so BOTH block-solid items AND a creature standing on the landing
-                // are ignored — it only needs to be a real tile. Tibia lets you
-                // stack onto whoever is on the landing (co-occupancy). Same-floor
-                // steps set no such flag, so they keep the full walkability +
-                // occupancy check (tile.cpp:564 still blocks).
-                if d.z != from.z {
-                    self.chunks.has_ground(d)
-                } else {
-                    self.chunks.is_walkable(d) && !self.tile_occupied(d, id)
-                }
-            });
+        let resolved = raw_dest.map(|d| self.resolve_vertical(from, d, diagonal));
+        let dest = resolved.filter(|&d| {
+            // Ghost/noclip bypass walks through walls, creatures, etc.
+            if nocollide {
+                return self.chunks.has_ground(d);
+            }
+            // A vertical landing (stair/height redirect) is reached with TFS
+            // FLAG_IGNOREBLOCKITEM | FLAG_IGNOREBLOCKCREATURE (game.cpp:799,815),
+            // so BOTH block-solid items AND a creature standing on the landing
+            // are ignored — it only needs to be a real tile. Tibia lets you
+            // stack onto whoever is on the landing (co-occupancy). Same-floor
+            // steps set no such flag, so they keep the full walkability +
+            // occupancy check (tile.cpp:564 still blocks).
+            if d.z != from.z {
+                self.chunks.has_ground(d)
+            } else {
+                self.chunks.is_walkable(d) && !self.tile_occupied(d, id)
+            }
+        });
 
         let Some(to) = dest else {
             // Blocked: keep the original facing and snap the mover back;
             // spectators see nothing. Matches TFS: a failed walk never turns the
             // player (only Ctrl+arrows / 0x6F-0x72 do). cancel_walk carries the
             // unchanged direction so the client also keeps facing where it was.
-            tracing::debug!(
-                id, dir = ?direction, diagonal,
+            let land = resolved.unwrap_or(from);
+            let reason = match raw_dest {
+                None => "out_of_bounds",
+                Some(d) => {
+                    if !self.chunks.has_ground(land) && !self.chunks.is_blocked(land) {
+                        "no_ground"
+                    } else if land.z != from.z {
+                        "vertical_rejected"
+                    } else if self.chunks.is_blocked(d) {
+                        "blocked"
+                    } else if self.tile_occupied(d, id) {
+                        "occupied"
+                    } else {
+                        "not_walkable"
+                    }
+                }
+            };
+            tracing::info!(
+                id,
+                dir = ?direction,
+                diagonal,
+                reason,
                 from = ?(from.x, from.y, from.z),
+                raw = ?raw_dest.map(|p| (p.x, p.y, p.z)),
+                land = ?(land.x, land.y, land.z),
+                has_ground = self.chunks.has_ground(land),
+                blocked = self.chunks.is_blocked(land),
                 "move blocked: cancel_walk"
             );
             self.push(id, walk::cancel_walk(cur_dir.to_byte()));

@@ -196,19 +196,59 @@ pub fn chunk_id(pos: Position) -> ChunkId {
     )
 }
 
-/// Compute the set of 27 `ChunkId`s within a ±1 floor and ±1 chunk range of `pos`
-/// (3×3 chunk grid × 3 floors). Floors are clamped to 0..=15.
+/// Floors the client will draw from `z`, plus one floor of stair slack.
+///
+/// Overground (`z <= 7`) the map description streams floors 7→0 — a ±1 window
+/// leaves roofs and upper stories blank. A step off the surface also needs z=8
+/// loaded so it isn't treated as a void. Underground streams `z-2..=z+2`, and a
+/// stair reveals one floor past that (`z±3`).
+pub fn viewport_floor_span(z: u8) -> (u8, u8) {
+    if z <= 7 {
+        let hi = 7.max(z.saturating_add(1)).min(8);
+        (0, hi)
+    } else {
+        (z.saturating_sub(3), z.saturating_add(3).min(15))
+    }
+}
+
+/// How many chunks to keep loaded on each side of the player's chunk.
+///
+/// 256-tile files already extend far past the 18×14 screen. A 5×5 grid made
+/// every step and the monster sweep pull hundreds of files (including missing
+/// ones) on the game thread, which froze movement. ±1 is enough horizontally;
+/// the void at the screen edge was unloaded floors, not a short chunk.
+const CHUNK_RADIUS: i16 = 1;
+
+/// Chunks the client can see from `pos`, plus stair slack.
+///
+/// Horizontally a 3×3 grid of 256-tile chunks. Vertically see
+/// [`viewport_floor_span`].
 pub fn chunks_around(pos: Position) -> HashSet<ChunkId> {
     let cx = (pos.x as i32 / CHUNK_DIM) as i16;
     let cy = (pos.y as i32 / CHUNK_DIM) as i16;
-    let cz = pos.z as i32;
+    let (z0, z1) = viewport_floor_span(pos.z);
     let mut ids = HashSet::new();
-    for dz in -1i32..=1 {
-        let nz = (cz + dz).clamp(0, 15) as u8;
-        for dcy in -1i16..=1 {
-            for dcx in -1i16..=1 {
-                ids.insert((cx + dcx, cy + dcy, nz));
+    for z in z0..=z1 {
+        for dcy in -CHUNK_RADIUS..=CHUNK_RADIUS {
+            for dcx in -CHUNK_RADIUS..=CHUNK_RADIUS {
+                ids.insert((cx + dcx, cy + dcy, z));
             }
+        }
+    }
+    ids
+}
+
+/// Same-floor 3×3 around `pos`. Enough for a creature to pathfind; does not
+/// pull the full viewport floor stack. Used so the sweep does not retain every
+/// floor of every monster.
+pub fn chunk_neighbors(pos: Position) -> [ChunkId; 9] {
+    let (cx, cy, z) = chunk_id(pos);
+    let mut ids = [(0, 0, 0); 9];
+    let mut i = 0;
+    for dcy in -1i16..=1 {
+        for dcx in -1i16..=1 {
+            ids[i] = (cx + dcx, cy + dcy, z);
+            i += 1;
         }
     }
     ids
@@ -220,6 +260,10 @@ pub fn chunks_around(pos: Position) -> HashSet<ChunkId> {
 pub struct ChunkManager {
     pub(crate) chunks: HashMap<ChunkId, Arc<Chunk>>,
     pub(crate) pinned: HashSet<ChunkId>,
+    /// Chunk ids we already failed to read. Without this, every step retries
+    /// `open` on files that do not exist (upper floors, map edges) and the
+    /// game thread stalls.
+    missing: HashSet<ChunkId>,
 }
 
 impl ChunkManager {
@@ -227,6 +271,7 @@ impl ChunkManager {
         Self {
             chunks: HashMap::new(),
             pinned: HashSet::new(),
+            missing: HashSet::new(),
         }
     }
 }
@@ -240,19 +285,26 @@ impl Default for ChunkManager {
 impl ChunkManager {
     /// Load chunks from `data/chunks/{z}/{x}_{y}.chunk` on demand.
     /// Silently skips missing or corrupt files — chunk just stays absent.
+    /// A miss is remembered so later steps do not hit the disk again.
     pub fn ensure_loaded(&mut self, ids: &[ChunkId]) {
         for &id in ids {
-            if self.chunks.contains_key(&id) {
+            if self.chunks.contains_key(&id) || self.missing.contains(&id) {
                 continue;
             }
             let path = format!("data/chunks/{}/{}_{}.chunk", id.2, id.0, id.1);
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(_) => {
+                    self.missing.insert(id);
+                    continue;
+                }
             };
             let chunk: Chunk = match bincode::deserialize(&bytes) {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(_) => {
+                    self.missing.insert(id);
+                    continue;
+                }
             };
             self.chunks.insert(id, Arc::new(chunk));
         }
@@ -2778,37 +2830,36 @@ mod tests {
     }
 
     #[test]
-    fn chunks_around_returns_27_chunk_ids() {
+    fn chunks_around_covers_overground_viewport_floors() {
         let pos = Position::new(512, 512, 7); // chunk (2, 2, 7)
         let ids = chunks_around(pos);
+        // floors 0..=8 × 3×3 chunks. The map description walks 7→0; z=8 is the
+        // stair-down slack. 256-tile chunks already cover the screen.
         assert_eq!(
             ids.len(),
-            27,
-            "chunks_around must return exactly 27 ChunkIds (3 floors × 3×3 grid)"
+            9 * 9,
+            "chunks_around at z=7 must cover floors 0..=8 × 3×3 chunks"
         );
-        // Center chunk
         assert!(ids.contains(&(2, 2, 7)), "center chunk must be included");
-        // Floor range: z-1 to z+1 (6, 7, 8)
+        for z in 0..=8 {
+            assert!(
+                ids.contains(&(2, 2, z)),
+                "floor {z} center chunk must be included"
+            );
+        }
         assert!(
-            ids.iter().any(|(_, _, z)| *z == 6),
-            "floor 6 (z-1) must be included"
+            !ids.contains(&(2, 2, 9)),
+            "floor 9 is not in the surface viewport"
         );
-        assert!(
-            ids.iter().any(|(_, _, z)| *z == 7),
-            "floor 7 (same floor) must be included"
-        );
-        assert!(
-            ids.iter().any(|(_, _, z)| *z == 8),
-            "floor 8 (z+1) must be included"
-        );
-        // x range: 1..=3 (cx-1, cx, cx+1)
+        // x range: 1..=3 (cx-1 ..= cx+1)
         for cx in 1..=3i16 {
             assert!(
                 ids.iter().any(|(x, _, _)| *x == cx),
                 "chunk_x {cx} must be included"
             );
         }
-        // y range: 1..=3 (cy-1, cy, cy+1)
+        assert!(!ids.contains(&(2 - 2, 2, 7)), "radius stops at ±1");
+        // y range: 1..=3 (cy-1 ..= cy+1)
         for cy in 1..=3i16 {
             assert!(
                 ids.iter().any(|(_, y, _)| *y == cy),
@@ -2819,18 +2870,24 @@ mod tests {
 
     #[test]
     fn chunks_around_at_origin() {
-        // At (0,0,0): floor clamping collapses dz=-1 into dz=0,
-        // yielding 3 floors: 0, 0, 1 → ~18 unique ChunkIds (floor 0×2 + floor 1).
+        // At (0,0,0) the overground span is floors 0..=7. x/y span a 3×3
+        // including negative chunk ids.
         let pos = Position::new(0, 0, 0);
         let ids = chunks_around(pos);
-        // Expect 18: 9 chunks on floor 0 (from dz=-1 and dz=0 both clamping to 0)
-        // + 9 chunks on floor 1.
-        assert_eq!(
-            ids.len(),
-            18,
-            "at origin, floor 0 appears twice (dz=-1+0 clamp to 0)"
-        );
+        assert_eq!(ids.len(), 8 * 9, "origin viewport is floors 0..=7 × 3×3");
         assert!(ids.contains(&(0, 0, 0)), "origin chunk must be included");
+        assert!(ids.contains(&(-1, -1, 0)), "negative chunk ids stay in range");
+        assert!(!ids.contains(&(0, 0, 8)), "z=0 does not pull in floor 8");
+    }
+
+    #[test]
+    fn chunks_around_underground_includes_stair_reveal() {
+        let ids = chunks_around(Position::new(512, 512, 10));
+        // z-3..=z+3 = 7..=13, × 3×3.
+        assert_eq!(ids.len(), 7 * 9);
+        assert!(ids.contains(&(2, 2, 7)));
+        assert!(ids.contains(&(2, 2, 13)));
+        assert!(!ids.contains(&(2, 2, 6)));
     }
 
     // -----------------------------------------------------------------

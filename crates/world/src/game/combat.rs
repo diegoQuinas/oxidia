@@ -37,12 +37,20 @@ impl Game {
     /// - Attacker on a PZ tile → push `0xB4` and do NOT set target
     ///   (`combat.cpp:294-297`, TFS `playerSetAttackedCreature`).
     /// - Unknown target (player or monster) is silently ignored.
-    /// Push the combat-status icons (red swords) to `id` based on their
-    /// current combat state and tile. Red swords when attacking and not in PZ.
+    ///   Push the combat-status icons (red swords) to `id` based on their
+    ///   current combat state and tile. Red swords when attacking and not in PZ.
     fn push_combat_icons(&mut self, id: u32) {
         let in_combat = self.players.get(&id).and_then(|p| p.attacking).is_some();
-        let in_pz = self.players.get(&id).map(|p| self.chunks.is_protection_zone(p.position)).unwrap_or(false);
-        let mask = if in_combat && !in_pz { enter_world::ICON_REDSWORDS } else { 0 };
+        let in_pz = self
+            .players
+            .get(&id)
+            .map(|p| self.chunks.is_protection_zone(p.position))
+            .unwrap_or(false);
+        let mask = if in_combat && !in_pz {
+            enter_world::ICON_REDSWORDS
+        } else {
+            0
+        };
         self.push(id, enter_world::icons(mask));
     }
 
@@ -147,12 +155,8 @@ impl Game {
         } else {
             enter_world::EFFECT_POFF
         };
-        let effect = enter_world::magic_effect(
-            victim_pos.x,
-            victim_pos.y,
-            victim_pos.z,
-            hit_effect,
-        );
+        let effect =
+            enter_world::magic_effect(victim_pos.x, victim_pos.y, victim_pos.z, hit_effect);
         for sid in &spectators {
             self.push(*sid, effect.clone());
         }
@@ -201,9 +205,11 @@ impl Game {
             }
         }
         // On-hit splash from player's race (always Blood by default).
-        if let Some(fluid) = self.players.get(&victim_id).and_then(|p| {
-            p.race.fluid_subtype()
-        }) {
+        if let Some(fluid) = self
+            .players
+            .get(&victim_id)
+            .and_then(|p| p.race.fluid_subtype())
+        {
             self.spawn_splash(victim_pos, ITEM_SMALLSPLASH, fluid);
         }
         // Death?
@@ -273,11 +279,8 @@ impl Game {
                     .unwrap_or(0);
                 let creatures = self.creatures_on(death_pos).len();
                 let sp = (front + creatures).min(9) as u8;
-                let pkt = tile_item::add_tile_item(
-                    (death_pos.x, death_pos.y, death_pos.z),
-                    sp,
-                    &wi,
-                );
+                let pkt =
+                    tile_item::add_tile_item((death_pos.x, death_pos.y, death_pos.z), sp, &wi);
                 // Push to all spectators EXCEPT the victim (non-reaping try_send).
                 for spec in self.spectators(death_pos, victim_id) {
                     if let Some(p) = self.players.get(&spec) {
@@ -285,7 +288,10 @@ impl Game {
                     }
                 }
                 {
-                    let st = self.dynamic.get_mut(&(death_pos.x, death_pos.y, death_pos.z)).unwrap();
+                    let st = self
+                        .dynamic
+                        .get_mut(&(death_pos.x, death_pos.y, death_pos.z))
+                        .unwrap();
                     let front = st.pre_creature_len;
                     st.items.insert(front, wi);
                     st.server_ids.insert(front, ITEM_FULLSPLASH);
@@ -396,12 +402,8 @@ impl Game {
         } else {
             enter_world::EFFECT_POFF
         };
-        let effect = enter_world::magic_effect(
-            victim_pos.x,
-            victim_pos.y,
-            victim_pos.z,
-            hit_effect,
-        );
+        let effect =
+            enter_world::magic_effect(victim_pos.x, victim_pos.y, victim_pos.z, hit_effect);
         for sid in &player_spectators {
             self.push(*sid, effect.clone());
         }
@@ -451,10 +453,12 @@ impl Game {
             self.spawn_splash(victim_pos, ITEM_SMALLSPLASH, fluid);
         }
 
-        // Retaliation: if the monster survived, start attacking back.
+        // Retaliation: hostile creatures that aren't fleeing swing back.
+        // TFS `hostile="0"` (rabbit, deer, sheep) never sets an attack target;
+        // `isFleeing` also skips the swing (`canUseSpell` bails on melee).
         if new_health > 0 {
             if let Some(m) = self.monsters.get_mut(&victim_id) {
-                if m.attacking.is_none() {
+                if m.attacking.is_none() && m.hostile && !m.is_fleeing() {
                     m.attacking = Some(attacker_id);
                     m.last_attack_ms = 0;
                 }
@@ -474,9 +478,18 @@ impl Game {
     fn do_monster_death(&mut self, victim_id: u32, now_ms: u64) {
         tracing::debug!(victim_id, "do_monster_death called");
         let (spawn_id, death_pos, loot, race, look_corpse) = match self.monsters.get(&victim_id) {
-            Some(m) => (m.spawn_id, m.position, m.loot.clone(), m.race, m.look_corpse),
+            Some(m) => (
+                m.spawn_id,
+                m.position,
+                m.loot.clone(),
+                m.race,
+                m.look_corpse,
+            ),
             None => {
-                tracing::warn!(victim_id, "do_monster_death called for already-dead monster");
+                tracing::warn!(
+                    victim_id,
+                    "do_monster_death called for already-dead monster"
+                );
                 return;
             }
         };
@@ -575,7 +588,7 @@ impl Game {
             }
             contents.push((item_id, count));
         }
-        tracing::info!(
+        tracing::debug!(
             pos = ?(pos.x, pos.y, pos.z),
             before, added = loot.len(),
             after = contents.len(),
@@ -617,7 +630,11 @@ impl Game {
             };
         }
         let Some(meta) = self.meta.item_meta(corpse_id) else {
-            tracing::warn!(?pos, corpse_id, "spawn_corpse: unknown corpse id (not in item registry)");
+            tracing::warn!(
+                ?pos,
+                corpse_id,
+                "spawn_corpse: unknown corpse id (not in item registry)"
+            );
             return;
         };
         let wi = WireItem {
@@ -637,7 +654,8 @@ impl Game {
         };
         // Mark this tile as having a corpse (persists across container open).
         self.corpse_tiles.insert((pos.x, pos.y, pos.z));
-        self.corpse_item_ids.insert((pos.x, pos.y, pos.z), corpse_id);
+        self.corpse_item_ids
+            .insert((pos.x, pos.y, pos.z), corpse_id);
         // Corpse sits above splashes (higher stackpos = renders on top).
         let sp = idx.min(9) as u8;
         match exclude_id {
@@ -785,6 +803,8 @@ impl Game {
                 race: spawn.race,
                 personality: spawn.personality,
                 aggro_range: spawn.aggro_range,
+                hostile: spawn.hostile,
+                run_on_health: spawn.run_on_health,
                 light_level: 0,
                 light_color: 0,
             };
@@ -821,7 +841,12 @@ impl Game {
         };
         let (attacker_pos, last_attack, fist_skill, target_distance) =
             match self.players.get(&attacker_id) {
-                Some(p) => (p.position, p.last_attack_ms, p.fist_skill, p.target_distance),
+                Some(p) => (
+                    p.position,
+                    p.last_attack_ms,
+                    p.fist_skill,
+                    p.target_distance,
+                ),
                 None => return,
             };
         let target_is_player = self.players.contains_key(&target_id);
@@ -868,7 +893,7 @@ impl Game {
             let viewers: Vec<u32> = self
                 .players
                 .iter()
-                .filter(|&(&sid, ref sp)| {
+                .filter(|&(&sid, sp)| {
                     Self::can_see(sp.position, target_pos) || sid == attacker_id || sid == target_id
                 })
                 .map(|(&sid, _)| sid)
@@ -898,11 +923,28 @@ impl Game {
             }
         };
         let target_is_player = self.players.contains_key(&target_id);
-        let (attacker_pos, last_attack, attack, target_distance) =
+        let (attacker_pos, last_attack, attack, target_distance, may_attack) =
             match self.monsters.get(&attacker_id) {
-                Some(m) => (m.position, m.last_attack_ms, m.attack, m.target_distance),
+                Some(m) => (
+                    m.position,
+                    m.last_attack_ms,
+                    m.attack,
+                    m.target_distance,
+                    m.hostile && !m.is_fleeing() && m.attack > 0,
+                ),
                 None => return,
             };
+        // Wildlife and anything under `runonhealth` must not swing, even if a
+        // stale target was set before the flag was noticed.
+        if !may_attack {
+            if let Some(m) = self.monsters.get_mut(&attacker_id) {
+                m.attacking = None;
+                if m.is_fleeing() || !m.hostile {
+                    m.follow_target = None;
+                }
+            }
+            return;
+        }
         // PZ check: attacker in PZ always clears; target PZ only matters for players.
         if self.chunks.is_protection_zone(attacker_pos)
             || (target_is_player && self.chunks.is_protection_zone(target_pos))
@@ -944,9 +986,7 @@ impl Game {
             let viewers: Vec<u32> = self
                 .players
                 .iter()
-                .filter(|&(&sid, ref sp)| {
-                    Self::can_see(sp.position, target_pos) || sid == target_id
-                })
+                .filter(|&(&sid, sp)| Self::can_see(sp.position, target_pos) || sid == target_id)
                 .map(|(&sid, _)| sid)
                 .collect();
             for sid in viewers {
@@ -965,6 +1005,20 @@ impl Game {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    /// RNG seed whose first `0..=attack` roll is a hit. Entropy (and an unlucky
+    /// seed) can roll 0, which leaves a 1 HP player alive.
+    fn seeded_hit(attack: u16) -> StdRng {
+        let mut seed = 1u64;
+        loop {
+            let mut probe = StdRng::seed_from_u64(seed);
+            if probe.gen_range(0..=attack) != 0 {
+                return StdRng::seed_from_u64(seed);
+            }
+            seed += 1;
+        }
+    }
 
     // -------------------------------------------------------------------------
     // M7 combat tests
@@ -1517,6 +1571,60 @@ mod tests {
     }
 
     #[test]
+    fn nonhostile_monster_does_not_retaliate_or_deal_damage() {
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().hostile = false;
+        g.monsters.get_mut(&m).unwrap().run_on_health = 50;
+        g.do_set_target(a, m);
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert!(
+            g.monsters[&m].attacking.is_none(),
+            "wildlife must not swing back when hit"
+        );
+
+        // A stale target must not deal damage either.
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.monsters.get_mut(&m).unwrap().attack = 20;
+        let hp_before = g.players[&a].health;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS * 2);
+        assert_eq!(
+            g.players[&a].health, hp_before,
+            "wildlife must not deal damage"
+        );
+        assert!(
+            g.monsters[&m].attacking.is_none(),
+            "stale target must be cleared"
+        );
+    }
+
+    #[test]
+    fn zero_attack_monster_does_not_damage_or_swing() {
+        // Missing `<attack name="melee">` now means attack 0, not the old
+        // default of 7. A hostile creature with no swing must not hurt anyone.
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (a, mut ra) = add_player(&mut g, Position::new(95, 117, 7));
+        let m = add_monster(&mut g, Position::new(96, 117, 7));
+        g.monsters.get_mut(&m).unwrap().attack = 0;
+        g.monsters.get_mut(&m).unwrap().attacking = Some(a);
+        g.monsters.get_mut(&m).unwrap().follow_target = Some(a);
+        let hp_before = g.players[&a].health;
+        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        assert_eq!(g.players[&a].health, hp_before);
+        assert!(
+            ra.try_recv().is_err(),
+            "a creature with no melee must not push a hit"
+        );
+        assert_eq!(g.monsters[&m].attacking, None, "swing target must clear");
+        assert_eq!(
+            g.monsters[&m].follow_target,
+            Some(a),
+            "hostile follow is independent of having a melee swing"
+        );
+    }
+
+    #[test]
     fn monster_combat_tick_attacks_player() {
         // Monster with a target (player) must deal damage on combat tick.
         let mut g = Game::from_static_map_arc(combat_map(false));
@@ -1548,7 +1656,10 @@ mod tests {
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.players.get_mut(&a).unwrap().health = 1;
         g.monsters.get_mut(&m).unwrap().attacking = Some(a);
-        g.monsters.get_mut(&m).unwrap().attack = 20; // guaranteed kill
+        g.monsters.get_mut(&m).unwrap().attack = 20;
+        // `gen_range(0..=attack)` includes a miss. Seed a hitting swing so a
+        // 1 HP player actually dies — entropy made this flake under nextest.
+        g.rng = seeded_hit(20);
 
         g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
 
@@ -1855,7 +1966,11 @@ mod tests {
         let contents = g.corpse_contents.get(&(96, 117, 7));
         assert!(contents.is_some(), "loot must be in corpse_contents");
         let items = contents.unwrap();
-        assert_eq!(items.len(), 1, "only 1 item should pass the 1.0 chance roll");
+        assert_eq!(
+            items.len(),
+            1,
+            "only 1 item should pass the 1.0 chance roll"
+        );
         assert_eq!(items[0].0, 100, "the item must be server_id 100");
     }
 
@@ -1886,6 +2001,8 @@ mod tests {
                 race: None,
                 personality: Personality::Aggressive,
                 aggro_range: DEFAULT_AGGRO_RANGE,
+                hostile: true,
+                run_on_health: 0,
             },
         );
         let m = add_monster(&mut g, Position::new(96, 117, 7));
@@ -1957,6 +2074,8 @@ mod tests {
                 race: None,
                 personality: Personality::Aggressive,
                 aggro_range: DEFAULT_AGGRO_RANGE,
+                hostile: true,
+                run_on_health: 0,
             },
         );
         let m = add_monster(&mut g, Position::new(96, 117, 7));
@@ -1972,6 +2091,43 @@ mod tests {
         // Tick at the exact boundary — respawn.
         g.process_respawns(200);
         assert_eq!(g.monsters.len(), 1, "respawn at exact boundary");
+    }
+
+    #[test]
+    fn respawn_copies_wildlife_flags() {
+        // A rabbit spawn must come back non-hostile, with runonhealth and no
+        // melee. Dropping those flags on respawn is what made wildlife attack.
+        let mut g = Game::from_static_map_arc(combat_map(false));
+        let (_a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
+        g.spawns.insert(
+            1,
+            MonsterSpawn {
+                position: Position::new(96, 117, 7),
+                respawn_interval_ms: 60_000,
+                respawn_at_ms: Some(0),
+                name: "Rabbit".into(),
+                look_type: 74,
+                look_corpse: 6017,
+                health: 15,
+                max_health: 15,
+                speed: 180,
+                attack: 0,
+                loot: vec![],
+                target_distance: 0,
+                race: Some(RaceType::Blood),
+                personality: Personality::Neutral,
+                aggro_range: DEFAULT_AGGRO_RANGE,
+                hostile: false,
+                run_on_health: 15,
+            },
+        );
+        g.process_respawns(0);
+        let rabbit = g.monsters.values().next().expect("rabbit respawned");
+        assert!(!rabbit.hostile, "respawn must keep hostile=0");
+        assert_eq!(rabbit.run_on_health, 15);
+        assert_eq!(rabbit.attack, 0, "respawn must not invent a melee swing");
+        assert_eq!(rabbit.personality, Personality::Neutral);
+        assert_eq!(rabbit.max_health, 15);
     }
 
     // -------------------------------------------------------------------------
@@ -2105,7 +2261,10 @@ mod tests {
         g.do_monster_death(m, 0);
 
         let key = (96, 117, 7);
-        let st = g.dynamic.get(&key).expect("death tile must be materialized");
+        let st = g
+            .dynamic
+            .get(&key)
+            .expect("death tile must be materialized");
         assert!(
             st.server_ids.contains(&3058),
             "monster death must spawn corpse (3058); sids: {:?}",
@@ -2133,16 +2292,27 @@ mod tests {
             mo.health = 1;
             // Three drops with distinct ids to count easily.
             mo.loot = vec![
-                MonsterDrop { item_id: 10, chance: 1.0, count_max: 1 },
-                MonsterDrop { item_id: 20, chance: 1.0, count_max: 1 },
-                MonsterDrop { item_id: 30, chance: 1.0, count_max: 1 },
+                MonsterDrop {
+                    item_id: 10,
+                    chance: 1.0,
+                    count_max: 1,
+                },
+                MonsterDrop {
+                    item_id: 20,
+                    chance: 1.0,
+                    count_max: 1,
+                },
+                MonsterDrop {
+                    item_id: 30,
+                    chance: 1.0,
+                    count_max: 1,
+                },
             ];
         }
         g.do_monster_death(m, 0);
 
         let key = (96, 117, 7);
-        let contents = g.corpse_contents.get(&key)
-            .expect("loot must be stored");
+        let contents = g.corpse_contents.get(&key).expect("loot must be stored");
         assert_eq!(
             contents.len(),
             3,
@@ -2248,9 +2418,21 @@ mod tests {
             let mo = g.monsters.get_mut(&m).unwrap();
             mo.look_corpse = 3058;
             mo.loot = vec![
-                MonsterDrop { item_id: 100, chance: 1.0, count_max: 1 },
-                MonsterDrop { item_id: 200, chance: 1.0, count_max: 1 },
-                MonsterDrop { item_id: 300, chance: 1.0, count_max: 1 },
+                MonsterDrop {
+                    item_id: 100,
+                    chance: 1.0,
+                    count_max: 1,
+                },
+                MonsterDrop {
+                    item_id: 200,
+                    chance: 1.0,
+                    count_max: 1,
+                },
+                MonsterDrop {
+                    item_id: 300,
+                    chance: 1.0,
+                    count_max: 1,
+                },
             ];
             mo.health = 1;
         }
@@ -2332,9 +2514,11 @@ mod tests {
         g.monsters.get_mut(&m).unwrap().look_corpse = 3058;
         // Use a loot server_id that is NOT the ground item (100).
         // 500 is a test loot item in the combat_map fixture.
-        g.monsters.get_mut(&m).unwrap().loot = vec![
-            MonsterDrop { item_id: 500, chance: 1.0, count_max: 1 },
-        ];
+        g.monsters.get_mut(&m).unwrap().loot = vec![MonsterDrop {
+            item_id: 500,
+            chance: 1.0,
+            count_max: 1,
+        }];
         g.monsters.get_mut(&m).unwrap().health = 1;
         g.do_monster_death(m, 0);
 
@@ -2370,14 +2554,8 @@ mod tests {
         let st = g.dynamic.get(&key).expect("tile must be materialized");
         let splash_idx = st.server_ids.iter().position(|&id| id == ITEM_FULLSPLASH);
         let corpse_idx = st.server_ids.iter().position(|&id| id == 3058);
-        assert!(
-            splash_idx.is_some(),
-            "blood splash must be in overlay"
-        );
-        assert!(
-            corpse_idx.is_some(),
-            "corpse must be in overlay"
-        );
+        assert!(splash_idx.is_some(), "blood splash must be in overlay");
+        assert!(corpse_idx.is_some(), "corpse must be in overlay");
         assert!(
             corpse_idx.unwrap() > splash_idx.unwrap(),
             "corpse must render above blood splash (higher index)"
