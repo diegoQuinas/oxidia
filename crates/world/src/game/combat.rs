@@ -200,11 +200,14 @@ impl Game {
                 self.push(*sid, pkt);
             }
         }
-        // On-hit splash from player's race (always Blood by default).
-        if let Some(fluid) = self
-            .players
-            .get(&victim_id)
-            .and_then(|p| p.race.fluid_subtype())
+        // On-hit splash from the player's race. A blocked or 0-damage swing
+        // leaves no blood on the tile (TFS only splashes when HP is lost).
+        if applied > 0
+            && new_health > 0
+            && let Some(fluid) = self
+                .players
+                .get(&victim_id)
+                .and_then(|p| p.race.fluid_subtype())
         {
             self.spawn_splash(victim_pos, ITEM_SMALLSPLASH, fluid);
         }
@@ -435,12 +438,14 @@ impl Game {
             }
         }
 
-        // On-hit splash from monster's race mapping.
-        if let Some(fluid) = self
-            .monsters
-            .get(&victim_id)
-            .and_then(|m| m.race)
-            .and_then(RaceType::fluid_subtype)
+        // On-hit splash from the monster's race. No floor blood on a 0-damage hit.
+        if applied > 0
+            && new_health > 0
+            && let Some(fluid) = self
+                .monsters
+                .get(&victim_id)
+                .and_then(|m| m.race)
+                .and_then(RaceType::fluid_subtype)
         {
             self.spawn_splash(victim_pos, ITEM_SMALLSPLASH, fluid);
         }
@@ -2323,7 +2328,13 @@ mod tests {
         let (a, _ra) = add_player(&mut g, Position::new(95, 117, 7));
         let (b, _rb) = add_player(&mut g, Position::new(96, 117, 7));
         g.do_set_target(a, b);
-        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        // A blocked swing deals 0 and must not splash; tick until one connects.
+        for tick in 1..=40u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            if g.dynamic.get(&(96, 117, 7)).is_some_and(|st| st.server_ids.contains(&ITEM_SMALLSPLASH)) {
+                break;
+            }
+        }
         // Player B's tile should contain ITEM_SMALLSPLASH after damage.
         let key = (96, 117, 7);
         let st = g
@@ -2388,7 +2399,12 @@ mod tests {
         let m = add_monster(&mut g, Position::new(96, 117, 7));
         g.monsters.get_mut(&m).unwrap().race = Some(RaceType::Blood);
         g.do_set_target(a, m);
-        g.on_combat_tick(MELEE_ATTACK_INTERVAL_MS);
+        for tick in 1..=40u64 {
+            g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
+            if g.dynamic.get(&(96, 117, 7)).is_some_and(|st| st.server_ids.contains(&ITEM_SMALLSPLASH)) {
+                break;
+            }
+        }
         let key = (96, 117, 7);
         let st = g
             .dynamic
