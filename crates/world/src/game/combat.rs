@@ -97,6 +97,7 @@ impl Game {
     /// physical-hit blood effect plus a floating damage number (`0xB4`), and
     /// fires `do_death` on 0 HP.
     fn apply_damage(&mut self, attacker_id: u32, victim_id: u32, dmg: i32) {
+        let (dmg, block) = self.mitigate_player(victim_id, dmg);
         let (health_before, new_health, max_health) = {
             let v = match self.players.get_mut(&victim_id) {
                 Some(p) => p,
@@ -149,12 +150,7 @@ impl Game {
             })
         };
         self.push(victim_id, stats);
-        // Hit effect: blood on damage, puff on miss.
-        let hit_effect = if applied > 0 {
-            enter_world::EFFECT_DRAWBLOOD
-        } else {
-            enter_world::EFFECT_POFF
-        };
+        let hit_effect = Self::hit_effect_for(block, applied);
         let effect =
             enter_world::magic_effect(victim_pos.x, victim_pos.y, victim_pos.z, hit_effect);
         for sid in &spectators {
@@ -363,6 +359,7 @@ impl Game {
     /// spectators, emits the physical-hit blood effect plus floating damage
     /// number, and fires `do_monster_death` on 0 HP.
     fn apply_monster_damage(&mut self, attacker_id: u32, victim_id: u32, dmg: i32, now_ms: u64) {
+        let (dmg, block) = self.mitigate_monster(victim_id, dmg);
         let (health_before, new_health) = {
             let m = match self.monsters.get_mut(&victim_id) {
                 Some(m) => m,
@@ -396,12 +393,7 @@ impl Game {
 
         // Compute actual damage applied.
         let applied = health_before.saturating_sub(new_health);
-        // Hit effect: blood on damage, puff on miss.
-        let hit_effect = if applied > 0 {
-            enter_world::EFFECT_DRAWBLOOD
-        } else {
-            enter_world::EFFECT_POFF
-        };
+        let hit_effect = Self::hit_effect_for(block, applied);
         let effect =
             enter_world::magic_effect(victim_pos.x, victim_pos.y, victim_pos.z, hit_effect);
         for sid in &player_spectators {
@@ -826,9 +818,174 @@ impl Game {
         }
     }
 
+    /// Inventory slot 1..=10, if occupied.
+    fn slot_item<'a>(p: &'a PlayerState, slot: u8) -> Option<&'a InvItem> {
+        p.inventory.get(usize::from(slot.wrapping_sub(1))).and_then(|s| s.as_ref())
+    }
+
+    /// TFS `Player::getWeapon`: left hand, then right. Shields and ammo are not
+    /// weapons. A distance weapon that takes ammo is replaced by the matching
+    /// ammo item (no match → that hand is empty).
+    fn weapon_hand(&self, p: &PlayerState) -> Option<(u8, InvItem)> {
+        for slot in [6u8, 5] {
+            let Some(item) = Self::slot_item(p, slot) else {
+                continue;
+            };
+            let Some(meta) = self.meta.item_meta(item.server_id) else {
+                continue;
+            };
+            match meta.weapon_type.as_str() {
+                "" | "shield" | "ammunition" => continue,
+                "distance" if !meta.ammo_type.is_empty() => {
+                    let Some(ammo) = Self::slot_item(p, 10) else {
+                        continue;
+                    };
+                    let Some(ammo_meta) = self.meta.item_meta(ammo.server_id) else {
+                        continue;
+                    };
+                    if ammo_meta.ammo_type != meta.ammo_type {
+                        continue;
+                    }
+                    return Some((slot, *ammo));
+                }
+                _ => return Some((slot, *item)),
+            }
+        }
+        None
+    }
+
+    /// Outgoing swing, TFS `WeaponMelee` / `WeaponDistance` / `useFist`.
+    /// Skills are all `fist_skill` until M14 (a fresh character is 10 in each).
+    /// Level is 1 until M14. Fight mode is attack (factor 1.0), the TFS default.
+    fn player_swing(&self, p: &PlayerState) -> (i32, i32, i32, bool, bool, i32, i32) {
+        let skill = p.fist_skill;
+        let Some((_, item)) = self.weapon_hand(p) else {
+            return (skill, combat::FIST_ATTACK_VALUE, 1, false, false, 0, -1);
+        };
+        let Some(meta) = self.meta.item_meta(item.server_id) else {
+            return (skill, combat::FIST_ATTACK_VALUE, 1, false, false, 0, -1);
+        };
+        let distance = meta.weapon_type == "distance" || meta.weapon_type == "ammunition";
+        let mut attack = meta.attack.max(0);
+        let mut takes_ammo = false;
+        let mut hit_chance = meta.hit_chance;
+        let mut max_hit = meta.max_hit_chance;
+        let mut range = i32::from(meta.shoot_range.max(1));
+        if distance && meta.weapon_type == "ammunition" {
+            // Damage item is the ammo; add the bow/crossbow attack and use its range.
+            takes_ammo = true;
+            for slot in [6u8, 5] {
+                let Some(hand) = Self::slot_item(p, slot) else {
+                    continue;
+                };
+                let Some(hand_meta) = self.meta.item_meta(hand.server_id) else {
+                    continue;
+                };
+                if hand_meta.weapon_type == "distance" && hand_meta.ammo_type == meta.ammo_type {
+                    attack += hand_meta.attack.max(0);
+                    range = i32::from(hand_meta.shoot_range.max(1));
+                    hit_chance = hand_meta.hit_chance;
+                    max_hit = hand_meta.max_hit_chance;
+                    break;
+                }
+            }
+        }
+        let skill = if meta.weapon_type == "wand" { 0 } else { skill };
+        (skill, attack, range, distance, takes_ammo, hit_chance, max_hit)
+    }
+
+    /// TFS `Player::getArmor`: head, necklace, armor, legs, feet, ring.
+    /// Vocation armor multiplier is 1.0 until M14.
+    fn player_armor(&self, p: &PlayerState) -> i32 {
+        [1u8, 2, 4, 7, 8, 9]
+            .into_iter()
+            .filter_map(|slot| Self::slot_item(p, slot))
+            .filter_map(|it| self.meta.item_meta(it.server_id))
+            .map(|m| m.armor)
+            .sum()
+    }
+
+    /// TFS `Player::getDefense` inputs, then `combat::player_defense`.
+    fn player_defense(&self, p: &PlayerState) -> i32 {
+        let skill_level = p.fist_skill;
+        let mut defense_skill = skill_level;
+        let mut defense_value = 7;
+        let mut shield_def: Option<i32> = None;
+        let mut weapon_def: Option<i32> = None;
+        let mut weapon_extra = 0;
+        let mut weapon_skill = skill_level;
+        for slot in [5u8, 6] {
+            let Some(it) = Self::slot_item(p, slot) else {
+                continue;
+            };
+            let Some(meta) = self.meta.item_meta(it.server_id) else {
+                continue;
+            };
+            match meta.weapon_type.as_str() {
+                "shield" => {
+                    let d = meta.defense;
+                    if shield_def.is_none_or(|cur| d > cur) {
+                        shield_def = Some(d);
+                    }
+                }
+                "" | "ammunition" => {}
+                other => {
+                    weapon_def = Some(meta.defense);
+                    weapon_extra = meta.extra_defense;
+                    weapon_skill = if other == "wand" { 0 } else { skill_level };
+                }
+            }
+        }
+        if weapon_def.is_some() {
+            defense_value = weapon_def.unwrap_or(0) + weapon_extra;
+            defense_skill = weapon_skill;
+        }
+        if let Some(sd) = shield_def {
+            defense_value = if weapon_def.is_some() {
+                sd + weapon_extra
+            } else {
+                sd
+            };
+            defense_skill = skill_level;
+        }
+        combat::player_defense(defense_skill, defense_value)
+    }
+
+    /// TFS `Creature::blockHit` for a player victim. Shield check is always on
+    /// for melee/distance (both set `blockedByShield`). The 2-charges-per-second
+    /// `blockCount` limit is skipped: swings are 2 s apart, so a 1v1 always
+    /// has a charge.
+    fn mitigate_player(&mut self, victim_id: u32, damage: i32) -> (i32, combat::BlockKind) {
+        let (defense, armor) = match self.players.get(&victim_id) {
+            Some(p) => (self.player_defense(p), self.player_armor(p)),
+            None => return (damage.max(0), combat::BlockKind::None),
+        };
+        combat::apply_defense_armor(&mut self.rng, damage, defense, armor, true)
+    }
+
+    /// Monster `<defenses defense/armor>`, same `blockHit` steps.
+    fn mitigate_monster(&mut self, victim_id: u32, damage: i32) -> (i32, combat::BlockKind) {
+        let (defense, armor) = self
+            .monsters
+            .get(&victim_id)
+            .map(|m| m.name.to_ascii_lowercase())
+            .and_then(|name| self.monster_types.get(&name))
+            .map(|t| (t.defense, t.armor))
+            .unwrap_or((0, 0));
+        combat::apply_defense_armor(&mut self.rng, damage, defense, armor, defense > 0)
+    }
+
+    fn hit_effect_for(block: combat::BlockKind, applied: u32) -> u8 {
+        match block {
+            combat::BlockKind::Defense => enter_world::EFFECT_POFF,
+            combat::BlockKind::Armor => enter_world::EFFECT_BLOCKHIT,
+            combat::BlockKind::None if applied > 0 => enter_world::EFFECT_DRAWBLOOD,
+            combat::BlockKind::None => enter_world::EFFECT_POFF,
+        }
+    }
+
     /// Process a player's attack against `target_id`.
-    /// Supports both melee (range 1) and ranged (range > 1) based on
-    /// the player's `target_distance` field. Ranged attacks require LOS.
+    /// Range comes from the equipped weapon (fist = 1). Ranged attacks require LOS.
     fn process_player_attack(&mut self, attacker_id: u32, target_id: u32, now_ms: u64) {
         let target_pos = match self.creature_position(target_id) {
             Some(pos) => pos,
@@ -839,16 +996,11 @@ impl Game {
                 return;
             }
         };
-        let (attacker_pos, last_attack, fist_skill, target_distance) =
-            match self.players.get(&attacker_id) {
-                Some(p) => (
-                    p.position,
-                    p.last_attack_ms,
-                    p.fist_skill,
-                    p.target_distance,
-                ),
-                None => return,
-            };
+        let (attacker_pos, last_attack, swing) = match self.players.get(&attacker_id) {
+            Some(p) => (p.position, p.last_attack_ms, self.player_swing(p)),
+            None => return,
+        };
+        let (skill, attack_value, weapon_range, distance, takes_ammo, hit_chance, max_hit) = swing;
         let target_is_player = self.players.contains_key(&target_id);
         if self.chunks.is_protection_zone(attacker_pos)
             || (target_is_player && self.chunks.is_protection_zone(target_pos))
@@ -866,22 +1018,53 @@ impl Game {
         }
         let dx = (i32::from(attacker_pos.x) - i32::from(target_pos.x)).abs();
         let dy = (i32::from(attacker_pos.y) - i32::from(target_pos.y)).abs();
-        let range = target_distance.max(1);
+        let range = weapon_range.max(1);
         if dx.max(dy) > RANGED_MAX_DISTANCE.min(range) {
             return;
         }
         // Ranged attacks need clear sight (no projectile-blocking tiles between).
         // Uses is_sight_clear with same_floor=true so only the direct line matters,
         // not the floor-above fallback that can_throw_object_to depends on.
-        let ranged = range > 1 || dx.max(dy) > 1;
+        let ranged = distance || range > 1 || dx.max(dy) > 1;
         if ranged && !self.chunks.is_sight_clear(attacker_pos, target_pos, true) {
             return;
         }
-        let dmg = combat::fist_damage(&mut self.rng, 1, fist_skill);
         if let Some(p) = self.players.get_mut(&attacker_id) {
             p.last_attack_ms = now_ms;
-            p.target_distance = target_distance; // preserve — future weapons may change it
         }
+        let level = 1u32;
+        let dmg = if distance {
+            let dist = dx.max(dy).max(0) as u32;
+            let chance = combat::distance_hit_chance(skill, dist, hit_chance, max_hit, takes_ammo);
+            if chance < self.rng.gen_range(1..=100) {
+                // Miss: puff on the target, no HP change. Ammo is not consumed.
+                let effect = enter_world::magic_effect(
+                    target_pos.x,
+                    target_pos.y,
+                    target_pos.z,
+                    enter_world::EFFECT_POFF,
+                );
+                for sid in self.spectators(target_pos, u32::MAX) {
+                    self.push(sid, effect.clone());
+                }
+                return;
+            }
+            let max = combat::max_weapon_damage(level, skill, attack_value, combat::ATTACK_FACTOR).max(0);
+            let min = combat::distance_min_damage(level, target_is_player).min(max);
+            if max == 0 {
+                0
+            } else {
+                self.rng.gen_range(min..=max)
+            }
+        } else {
+            combat::melee_damage(
+                &mut self.rng,
+                level,
+                skill,
+                attack_value,
+                combat::ATTACK_FACTOR,
+            )
+        };
         // Projectile effect for ranged attacks.
         if ranged {
             let effect = enter_world::magic_effect(

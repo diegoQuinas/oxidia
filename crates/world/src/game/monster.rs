@@ -124,6 +124,10 @@ pub(crate) struct MonsterType {
     /// `0` means this flag never triggers a flee. Rabbits set it to max health,
     /// so they always run from a nearby player.
     pub(crate) run_on_health: u32,
+    /// TFS `<defenses defense>`. Used as the shield-block value in `blockHit`.
+    pub(crate) defense: i32,
+    /// TFS `<defenses armor>`. Subtracted after defense in `blockHit`.
+    pub(crate) armor: i32,
 }
 
 /// Parse `<monsters>` XML and return a name-indexed map.
@@ -213,6 +217,8 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
                 aggro_range,
                 hostile,
                 run_on_health,
+                defense: 0,
+                armor: 0,
             },
         );
     }
@@ -378,6 +384,18 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
             })
             .unwrap_or_default();
 
+        let (defense, armor) = root
+            .descendants()
+            .find(|n| n.has_tag_name("defenses"))
+            .map(|n| {
+                let defense = n
+                    .attribute("defense")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let armor = n.attribute("armor").and_then(|s| s.parse().ok()).unwrap_or(0);
+                (defense, armor)
+            })
+            .unwrap_or((0, 0));
         let (hostile, run_on_health) = parse_behavior_flags(root);
         let personality = personality_from_node(root, hostile);
         let aggro_range = root
@@ -402,6 +420,8 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
                 aggro_range,
                 hostile,
                 run_on_health,
+                defense,
+                armor,
             },
         );
     }

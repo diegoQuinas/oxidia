@@ -357,6 +357,8 @@ struct PlayerState {
     /// persisted; reset on login/logout.
     speed: u16,
     /// Combat attack range (1 = melee, N = ranged). Default 1.
+    /// Player swings use the equipped weapon's shoot range instead.
+    #[allow(dead_code)]
     target_distance: i32,
     /// Equipment slots 1..=10, indexed 0..=9. `None` = empty slot.
     inventory: [Option<InvItem>; 10],

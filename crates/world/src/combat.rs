@@ -72,10 +72,136 @@ pub fn melee_damage(
 
 /// Fist (unarmed) swing: `attack_value = 7`, `attack_factor = 1.0`.
 ///
-/// Convenience wrapper for the M7 loop (no inventory yet). M10 will call
-/// `melee_damage` directly with the real equipped weapon values.
+/// Convenience wrapper for the M7 loop (no inventory yet). Equipped weapons
+/// call `melee_damage` directly with the item's attack value.
 pub fn fist_damage(rng: &mut impl Rng, level: u32, fist_skill: i32) -> i32 {
     melee_damage(rng, level, fist_skill, FIST_ATTACK_VALUE, ATTACK_FACTOR)
+}
+
+/// Why a swing was fully absorbed. Mirrors TFS `BlockType_t` for the two
+/// cases melee actually produces (`BLOCK_DEFENSE`, `BLOCK_ARMOR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    None,
+    /// Shield / defense roll ate the hit (`CONST_ME_POFF`).
+    Defense,
+    /// Armor ate the remainder (`CONST_ME_BLOCKHIT`).
+    Armor,
+}
+
+/// TFS `Player::getDefense` (player.cpp), vocation multiplier 1.0, fight mode
+/// attack (factor 1.0). Integer truncation matches the `int32_t` return.
+///
+/// `skill == 0` (wand / unknown weapon type, attack mode) returns 1.
+pub fn player_defense(skill: i32, defense_value: i32) -> i32 {
+    if skill == 0 {
+        return 1;
+    }
+    ((skill as f64 / 4.0 + 2.23) * defense_value as f64 * 0.15) as i32
+}
+
+/// TFS `Creature::blockHit` defense + armor steps (creature.cpp).
+///
+/// Defense (when `check_defense`) subtracts `uniform(defense/2, defense)`.
+/// Armor then subtracts `uniform(armor/2, armor - (armor % 2 + 1))` when
+/// `armor > 3`, or 1 when `0 < armor <= 3`. A non-positive remainder is a
+/// full block and skips the later step.
+///
+/// `defense` and `armor` are the already-resolved creature values (player
+/// formula, or a monster's `<defenses>` attributes).
+pub fn apply_defense_armor(
+    rng: &mut impl Rng,
+    mut damage: i32,
+    defense: i32,
+    armor: i32,
+    check_defense: bool,
+) -> (i32, BlockKind) {
+    if damage <= 0 {
+        return (0, BlockKind::None);
+    }
+    if check_defense && defense > 0 {
+        let lo = defense / 2;
+        let hi = defense.max(lo);
+        damage -= rng.gen_range(lo..=hi);
+        if damage <= 0 {
+            return (0, BlockKind::Defense);
+        }
+    }
+    if armor > 3 {
+        let hi = armor - (armor % 2 + 1);
+        let lo = armor / 2;
+        let hi = hi.max(lo);
+        damage -= rng.gen_range(lo..=hi);
+    } else if armor > 0 {
+        damage -= 1;
+    }
+    if damage <= 0 {
+        (0, BlockKind::Armor)
+    } else {
+        (damage, BlockKind::None)
+    }
+}
+
+/// TFS `WeaponDistance::useWeapon` hit chance (weapons.cpp).
+///
+/// `hit_chance != 0` is used as-is. Otherwise the chance depends on distance
+/// skill, Chebyshev distance, and `max_hit_chance` (`-1` derives 90 for a
+/// bow/crossbow that takes ammo, 75 for a one-handed thrown weapon).
+pub fn distance_hit_chance(
+    skill: i32,
+    distance: u32,
+    hit_chance: i32,
+    max_hit_chance: i32,
+    takes_ammo: bool,
+) -> i32 {
+    if hit_chance != 0 {
+        return hit_chance;
+    }
+    let skill = skill.max(0) as u32;
+    let cap = if max_hit_chance != -1 {
+        max_hit_chance.max(0) as u32
+    } else if takes_ammo {
+        90
+    } else {
+        75
+    };
+    let chance = match cap {
+        75 => match distance {
+            1 | 5 => skill.min(74) + 1,
+            2 => ((skill.min(28) as f64) * 2.40) as u32 + 8,
+            3 => ((skill.min(45) as f64) * 1.55) as u32 + 6,
+            4 => ((skill.min(58) as f64) * 1.25) as u32 + 3,
+            6 => ((skill.min(90) as f64) * 0.80) as u32 + 3,
+            7 => ((skill.min(104) as f64) * 0.70) as u32 + 2,
+            _ => 0,
+        },
+        90 => match distance {
+            1 | 5 => ((skill.min(74) as f64) * 1.20) as u32 + 1,
+            2 => ((skill.min(28) as f64) * 3.20) as u32,
+            3 => skill.min(45) * 2,
+            4 => ((skill.min(58) as f64) * 1.55) as u32,
+            6 | 7 => skill.min(90),
+            _ => 0,
+        },
+        100 => match distance {
+            1 | 5 => ((skill.min(73) as f64) * 1.35) as u32 + 1,
+            2 => ((skill.min(30) as f64) * 3.20) as u32 + 4,
+            3 => ((skill.min(48) as f64) * 2.05) as u32 + 2,
+            4 => ((skill.min(65) as f64) * 1.50) as u32 + 2,
+            6 => ((skill.min(87) as f64) * 1.20) as u32 - 4,
+            7 => ((skill.min(90) as f64) * 1.10) as u32 + 1,
+            _ => 0,
+        },
+        other => other,
+    };
+    chance as i32
+}
+
+/// Minimum of a distance roll. TFS `WeaponDistance::getWeaponDamage`:
+/// `ceil(level * 0.1)` against a player, `ceil(level * 0.2)` against a monster.
+pub fn distance_min_damage(level: u32, target_is_player: bool) -> i32 {
+    let factor = if target_is_player { 0.1 } else { 0.2 };
+    (level as f64 * factor).ceil() as i32
 }
 
 // ---------------------------------------------------------------------------
@@ -207,5 +333,45 @@ mod tests {
         let mut rng2 = StdRng::seed_from_u64(1);
         let results2: Vec<i32> = (0..5).map(|_| fist_damage(&mut rng2, 1, 10)).collect();
         assert_eq!(results, results2);
+    }
+
+    /// Sword attack 40, skill 10, level 1, factor 1.0:
+    /// skill_term = (2.5+1)*(40/3) = 46.666…; *1.03 = 48.066…; round = 48.
+    #[test]
+    fn weapon_attack_value_scales_max() {
+        assert_eq!(max_weapon_damage(1, 10, 40, 1.0), 48);
+    }
+
+    /// Unarmed defense: skill 10, value 7.
+    /// (10/4 + 2.23) * 7 * 0.15 = 4.73 * 1.05 = 4.9665 → truncates to 4.
+    #[test]
+    fn unarmed_defense_truncates_like_tfs() {
+        assert_eq!(player_defense(10, 7), 4);
+    }
+
+    /// Armor 10 reduces by uniform(5, 9) — TFS `armor - (armor % 2 + 1)`.
+    #[test]
+    fn armor_reduction_stays_in_tfs_window() {
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..200 {
+            let (left, kind) = apply_defense_armor(&mut rng, 20, 0, 10, false);
+            assert!((11..=15).contains(&left), "left {left}");
+            assert_eq!(kind, BlockKind::None);
+        }
+    }
+
+    /// A defense roll that exceeds the incoming hit is a full shield block.
+    #[test]
+    fn defense_can_fully_block() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let (left, kind) = apply_defense_armor(&mut rng, 1, 20, 10, true);
+        assert_eq!(left, 0);
+        assert_eq!(kind, BlockKind::Defense);
+    }
+
+    /// Bow (takes ammo) at distance 1, skill 10: min(10, 74)*1.20 + 1 = 13.
+    #[test]
+    fn bow_hit_chance_at_one_tile() {
+        assert_eq!(distance_hit_chance(10, 1, 0, -1, true), 13);
     }
 }

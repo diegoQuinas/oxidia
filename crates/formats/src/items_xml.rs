@@ -84,6 +84,22 @@ pub struct ItemXmlAttrs {
     pub light_level: u8,
     /// Light color emitted by this item (0 = default).
     pub light_color: u8,
+    /// Weapon attack (`attack`). 0 if absent.
+    pub attack: i32,
+    /// Defense (`defense`). 0 if absent.
+    pub defense: i32,
+    /// Extra defense added while a shield is worn (`extradefense`).
+    pub extra_defense: i32,
+    /// Armor rating (`armor`). 0 if absent.
+    pub armor: i32,
+    /// Shoot / throw range in tiles (`range`). 1 if absent (TFS default).
+    pub shoot_range: u8,
+    /// Ammunition type (`ammoType`): "arrow", "bolt", … Empty if none.
+    pub ammo_type: String,
+    /// Explicit hit chance (`hitChance`). 0 means "use the distance formula".
+    pub hit_chance: i32,
+    /// Cap for the distance hit-chance formula (`maxHitChance`). -1 = derive.
+    pub max_hit_chance: i32,
 }
 
 impl Default for ItemXmlAttrs {
@@ -101,6 +117,14 @@ impl Default for ItemXmlAttrs {
             container_size: 0,
             light_level: 0,
             light_color: 0,
+            attack: 0,
+            defense: 0,
+            extra_defense: 0,
+            armor: 0,
+            shoot_range: 1,
+            ammo_type: String::new(),
+            hit_chance: 0,
+            max_hit_chance: -1,
         }
     }
 }
@@ -174,6 +198,22 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
                 attrs.light_level = value.parse::<u8>().unwrap_or(0);
             } else if key.eq_ignore_ascii_case("lightColor") {
                 attrs.light_color = value.parse::<u8>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("attack") {
+                attrs.attack = value.parse::<i32>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("defense") {
+                attrs.defense = value.parse::<i32>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("extradefense") {
+                attrs.extra_defense = value.parse::<i32>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("armor") {
+                attrs.armor = value.parse::<i32>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("range") {
+                attrs.shoot_range = value.parse::<u8>().unwrap_or(1).max(1);
+            } else if key.eq_ignore_ascii_case("ammoType") {
+                attrs.ammo_type = value.to_ascii_lowercase();
+            } else if key.eq_ignore_ascii_case("hitChance") {
+                attrs.hit_chance = value.parse::<i32>().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("maxHitChance") {
+                attrs.max_hit_chance = value.parse::<i32>().unwrap_or(-1);
             }
         }
         for id in ids {
@@ -209,6 +249,30 @@ pub fn parse_items_xml(xml: &str) -> Result<ItemsXml, FormatError> {
             }
             if attrs.light_color != 0 {
                 entry.light_color = attrs.light_color;
+            }
+            if attrs.attack != 0 {
+                entry.attack = attrs.attack;
+            }
+            if attrs.defense != 0 {
+                entry.defense = attrs.defense;
+            }
+            if attrs.extra_defense != 0 {
+                entry.extra_defense = attrs.extra_defense;
+            }
+            if attrs.armor != 0 {
+                entry.armor = attrs.armor;
+            }
+            if attrs.shoot_range != 1 {
+                entry.shoot_range = attrs.shoot_range;
+            }
+            if !attrs.ammo_type.is_empty() {
+                entry.ammo_type = attrs.ammo_type.clone();
+            }
+            if attrs.hit_chance != 0 {
+                entry.hit_chance = attrs.hit_chance;
+            }
+            if attrs.max_hit_chance != -1 {
+                entry.max_hit_chance = attrs.max_hit_chance;
             }
         }
     }

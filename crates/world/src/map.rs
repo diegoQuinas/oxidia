@@ -107,6 +107,41 @@ pub struct ItemMeta {
     pub light_level: u8,
     /// Light color emitted by this item (0 = default white).
     pub light_color: u8,
+    /// `items.xml` weaponType, lowercased. Empty if not a weapon.
+    #[serde(default)]
+    pub weapon_type: String,
+    /// Weapon attack value. 0 if absent.
+    #[serde(default)]
+    pub attack: i32,
+    /// Defense value. 0 if absent.
+    #[serde(default)]
+    pub defense: i32,
+    /// Extra defense contributed while a shield is also worn.
+    #[serde(default)]
+    pub extra_defense: i32,
+    /// Armor rating. 0 if absent.
+    #[serde(default)]
+    pub armor: i32,
+    /// Shoot range in tiles. 1 if absent.
+    #[serde(default = "default_shoot_range")]
+    pub shoot_range: u8,
+    /// Ammunition type ("arrow", "bolt", …). Empty if the item takes none.
+    #[serde(default)]
+    pub ammo_type: String,
+    /// Explicit hit chance. 0 = use the TFS distance formula.
+    #[serde(default)]
+    pub hit_chance: i32,
+    /// Distance formula cap. -1 = derive from weapon shape.
+    #[serde(default = "default_max_hit_chance")]
+    pub max_hit_chance: i32,
+}
+
+fn default_shoot_range() -> u8 {
+    1
+}
+
+fn default_max_hit_chance() -> i32 {
+    -1
 }
 
 impl ItemMeta {
@@ -1219,6 +1254,15 @@ impl StaticMap {
                     is_fluid: it.is_fluid_or_splash(),
                     light_level: x.map(|a| a.light_level).unwrap_or(0),
                     light_color: x.map(|a| a.light_color).unwrap_or(0),
+                    weapon_type: x.map(|a| a.weapon_type.clone()).unwrap_or_default(),
+                    attack: x.map(|a| a.attack).unwrap_or(0),
+                    defense: x.map(|a| a.defense).unwrap_or(0),
+                    extra_defense: x.map(|a| a.extra_defense).unwrap_or(0),
+                    armor: x.map(|a| a.armor).unwrap_or(0),
+                    shoot_range: x.map(|a| a.shoot_range).unwrap_or(1),
+                    ammo_type: x.map(|a| a.ammo_type.clone()).unwrap_or_default(),
+                    hit_chance: x.map(|a| a.hit_chance).unwrap_or(0),
+                    max_hit_chance: x.map(|a| a.max_hit_chance).unwrap_or(-1),
                 },
             );
         }
@@ -1716,6 +1760,15 @@ mod tests {
             is_fluid: false,
             light_level: 0,
             light_color: 0,
+            weapon_type: String::new(),
+            attack: 0,
+            defense: 0,
+            extra_defense: 0,
+            armor: 0,
+            shoot_range: 1,
+            ammo_type: String::new(),
+            hit_chance: 0,
+            max_hit_chance: -1,
         };
         bincode_round_trip(&meta);
     }
