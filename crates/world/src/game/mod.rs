@@ -2079,15 +2079,6 @@ impl Game {
                 // 2b. Click-to-move GoTo (0x64)
                 // -------------------------------------------------------------
 
-                // Player in PZ — stop auto-walk.
-                if self.chunks.is_protection_zone(pos) {
-                    if let Some(p) = self.players.get_mut(&id) {
-                        p.go_to_position = None;
-                        p.list_walk_dir.clear();
-                    }
-                    continue;
-                }
-
                 // Arrival detection: exact tile match.
                 // The character must step onto the target tile, not stop adjacent.
                 if pos == target {
