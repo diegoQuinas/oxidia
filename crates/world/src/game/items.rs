@@ -56,7 +56,7 @@ impl Game {
         let original_count = st.counts[src_idx];
         let cur = original_count.unwrap_or(1).max(1);
         let moved = if stackable { want.max(1).min(cur) } else { 1 };
-        
+
         let removed_fully = if stackable && cur > moved {
             let left = cur - moved;
             st.counts[src_idx] = Some(left);
@@ -376,7 +376,11 @@ impl Game {
                 };
                 self.broadcast_source(from, from_stackpos, removed_fully, src_idx);
 
-                let cnt = if stackable { Some(moved) } else { original_count };
+                let cnt = if stackable {
+                    Some(moved)
+                } else {
+                    original_count
+                };
                 if let Some(p) = self.players.get_mut(&id) {
                     p.inventory[(slot - 1) as usize] = Some(InvItem {
                         server_id: src_sid,

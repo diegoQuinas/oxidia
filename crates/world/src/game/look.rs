@@ -236,6 +236,7 @@ mod tests {
                 race: RaceType::Blood,
                 attacking: None,
                 last_attack_ms: 0,
+                pz_locked_until_ms: 0,
                 sex: 0, // female
                 gamemaster: false,
                 ghost: false,

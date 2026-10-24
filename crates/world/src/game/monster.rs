@@ -179,20 +179,23 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
             .or_else(|| node.attribute("look_corpse"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let race = node.attribute("race").and_then(|s| match s {
-            "blood" => Some(RaceType::Blood),
-            "venom" => Some(RaceType::Venom),
-            "fire" => Some(RaceType::Fire),
-            "energy" => Some(RaceType::Energy),
-            "drown" => Some(RaceType::Drown),
-            "physical" => Some(RaceType::Physical),
-            "earth" => Some(RaceType::Earth),
-            "holy" => Some(RaceType::Holy),
-            "death" => Some(RaceType::Death),
-            "undead" => Some(RaceType::Undead),
-            "diamond" => Some(RaceType::Diamond),
-            _ => None,
-        }).or(Some(RaceType::Blood));
+        let race = node
+            .attribute("race")
+            .and_then(|s| match s {
+                "blood" => Some(RaceType::Blood),
+                "venom" => Some(RaceType::Venom),
+                "fire" => Some(RaceType::Fire),
+                "energy" => Some(RaceType::Energy),
+                "drown" => Some(RaceType::Drown),
+                "physical" => Some(RaceType::Physical),
+                "earth" => Some(RaceType::Earth),
+                "holy" => Some(RaceType::Holy),
+                "death" => Some(RaceType::Death),
+                "undead" => Some(RaceType::Undead),
+                "diamond" => Some(RaceType::Diamond),
+                _ => None,
+            })
+            .or(Some(RaceType::Blood));
         let (hostile, run_on_health) = parse_behavior_flags(node);
         let personality = personality_from_node(node, hostile);
         let aggro_range = node
@@ -241,7 +244,9 @@ pub(crate) fn parse_monsters_xml(xml: &str) -> Result<HashMap<String, MonsterTyp
 ///   </attacks>
 /// </monster>
 /// ```
-pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, MonsterType>, FormatError> {
+pub fn parse_monsters_data_dir(
+    data_dir: &Path,
+) -> Result<HashMap<String, MonsterType>, FormatError> {
     let root_xml = std::fs::read_to_string(data_dir.join("monsters.xml")).map_err(|e| {
         FormatError::InvalidNode {
             what: Box::leak(format!("cannot read monsters.xml index: {e}").into_boxed_str()),
@@ -267,13 +272,12 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
 
         // Read and parse the individual monster XML
         let individual_path = data_dir.join(file);
-        let individual_xml = std::fs::read_to_string(&individual_path).map_err(|e| {
-            FormatError::InvalidNode {
+        let individual_xml =
+            std::fs::read_to_string(&individual_path).map_err(|e| FormatError::InvalidNode {
                 what: Box::leak(
                     format!("cannot read {}: {e}", individual_path.display()).into_boxed_str(),
                 ),
-            }
-        })?;
+            })?;
 
         let ind_doc =
             roxmltree::Document::parse(&individual_xml).map_err(|_| FormatError::InvalidNode {
@@ -282,13 +286,14 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
                 ),
             })?;
 
-        let root = ind_doc.root().first_element_child().ok_or(
-            FormatError::InvalidNode {
+        let root = ind_doc
+            .root()
+            .first_element_child()
+            .ok_or(FormatError::InvalidNode {
                 what: Box::leak(
                     format!("{} has no root element", individual_path.display()).into_boxed_str(),
                 ),
-            },
-        )?;
+            })?;
 
         // Extract race from root monster element
         let race = root.attribute("race").and_then(|s| match s {
@@ -325,8 +330,14 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
             .descendants()
             .find(|n| n.has_tag_name("health"))
             .map(|n| {
-                let now: u32 = n.attribute("now").and_then(|s| s.parse().ok()).unwrap_or(50);
-                let max: u32 = n.attribute("max").and_then(|s| s.parse().ok()).unwrap_or(50);
+                let now: u32 = n
+                    .attribute("now")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(50);
+                let max: u32 = n
+                    .attribute("max")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(50);
                 (now, max)
             })
             .unwrap_or((50, 50));
@@ -347,12 +358,10 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
                     .and_then(|s| s.parse().ok())
                     .or_else(|| {
                         // Fall back to min/max format: min="-N" max="-M"
-                        let max_abs: Option<u16> = n
-                            .attribute("max")
-                            .and_then(|s| {
-                                let v: i16 = s.parse().ok()?;
-                                Some(v.unsigned_abs())
-                            });
+                        let max_abs: Option<u16> = n.attribute("max").and_then(|s| {
+                            let v: i16 = s.parse().ok()?;
+                            Some(v.unsigned_abs())
+                        });
                         max_abs
                     })
             })
@@ -392,7 +401,10 @@ pub fn parse_monsters_data_dir(data_dir: &Path) -> Result<HashMap<String, Monste
                     .attribute("defense")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
-                let armor = n.attribute("armor").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let armor = n
+                    .attribute("armor")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
                 (defense, armor)
             })
             .unwrap_or((0, 0));
@@ -668,8 +680,16 @@ mod tests {
     fn roll_drops_all_succeed_at_chance_1() {
         let mut rng = StdRng::seed_from_u64(42);
         let drops = vec![
-            MonsterDrop { item_id: 100, chance: 1.0, count_max: 1 },
-            MonsterDrop { item_id: 200, chance: 1.0, count_max: 1 },
+            MonsterDrop {
+                item_id: 100,
+                chance: 1.0,
+                count_max: 1,
+            },
+            MonsterDrop {
+                item_id: 200,
+                chance: 1.0,
+                count_max: 1,
+            },
         ];
         let result = roll_drops(&mut rng, &drops);
         assert_eq!(result.len(), 2, "all drops must succeed at chance 1.0");
@@ -694,8 +714,16 @@ mod tests {
         // With a seeded RNG, run twice: results may vary per item.
         let mut rng = StdRng::seed_from_u64(999);
         let drops = vec![
-            MonsterDrop { item_id: 100, chance: 0.5, count_max: 1 },
-            MonsterDrop { item_id: 200, chance: 0.5, count_max: 1 },
+            MonsterDrop {
+                item_id: 100,
+                chance: 0.5,
+                count_max: 1,
+            },
+            MonsterDrop {
+                item_id: 200,
+                chance: 0.5,
+                count_max: 1,
+            },
         ];
         let result = roll_drops(&mut rng, &drops);
         // At least one item may be present — we can't assert exact count
@@ -717,10 +745,7 @@ mod tests {
         let result = roll_drops(&mut rng, &drops);
         assert_eq!(result.len(), 1);
         let count = result[0].1;
-        assert!(
-            (1..=10).contains(&count),
-            "count {count} must be in 1..=10"
-        );
+        assert!((1..=10).contains(&count), "count {count} must be in 1..=10");
     }
 
     #[test]
@@ -879,7 +904,10 @@ mod tests {
         let xml = sample_monster_xml(r#"<loot></loot>"#);
         let map = parse_in_temp_dir(&xml);
         let mt = map.get("testrat").expect("TestRat must be parsed");
-        assert_eq!(mt.look_corpse, 5964, "look corpse must be parsed from <look corpse='5964'/>");
+        assert_eq!(
+            mt.look_corpse, 5964,
+            "look corpse must be parsed from <look corpse='5964'/>"
+        );
     }
 
     #[test]

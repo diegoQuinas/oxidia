@@ -94,11 +94,11 @@ pub(super) fn hole_bypass_map() -> Arc<StaticMap> {
         spawn_file: None,
         house_file: None,
         tiles: vec![
-            ground(100, 100),  // start
-            hole(101, 100),    // FloorChange::DOWN — blocked in A*
-            ground(102, 100),  // target
-            ground(100, 99),   // bypass route: north
-            ground(101, 99),   // bypass route: north-east
+            ground(100, 100), // start
+            hole(101, 100),   // FloorChange::DOWN — blocked in A*
+            ground(102, 100), // target
+            ground(100, 99),  // bypass route: north
+            ground(101, 99),  // bypass route: north-east
         ],
         towns: vec![Town {
             id: 1,
@@ -385,10 +385,11 @@ pub(super) fn add_player(g: &mut Game, pos: Position) -> (u32, mpsc::Receiver<Ve
             known: HashSet::new(),
             health: 150,
             max_health: 150,
-                fist_skill: 10,
-                race: RaceType::Blood,
-                attacking: None,
+            fist_skill: 10,
+            race: RaceType::Blood,
+            attacking: None,
             last_attack_ms: 0,
+            pz_locked_until_ms: 0,
             sex: 1, // male (default)
             gamemaster: false,
             ghost: false,

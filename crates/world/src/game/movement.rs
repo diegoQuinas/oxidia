@@ -105,12 +105,10 @@ impl Game {
         self.auto_close_ground_containers(id);
 
         // PZ badge: resend icons if we crossed a protection-zone boundary.
+        // Teleport into a temple does not clear a PZ lock (TFS keeps both
+        // ICON_PIGEON and ICON_REDSWORDS).
         if self.chunks.is_protection_zone(from) != self.chunks.is_protection_zone(to) {
-            let mask = if self.chunks.is_protection_zone(to) {
-                enter_world::ICON_PIGEON
-            } else {
-                0
-            };
+            let mask = self.client_icon_mask(id);
             self.push(id, enter_world::icons(mask));
         }
 
@@ -315,6 +313,26 @@ impl Game {
             }
         });
 
+        // TFS `Tile::queryAdd`: a PZ-locked player may move inside a protection
+        // zone and may leave one, but may not step into one. Ghost/noclip keeps
+        // bypassing movement rules. Checked on the resolved landing so a stair
+        // that drops into a temple is rejected too.
+        if let Some(to) = dest {
+            let entering_pz =
+                self.chunks.is_protection_zone(to) && !self.chunks.is_protection_zone(from);
+            if entering_pz && !nocollide && self.is_pz_locked(id) {
+                tracing::info!(
+                    id,
+                    from = ?(from.x, from.y, from.z),
+                    to = ?(to.x, to.y, to.z),
+                    "move blocked: pz locked"
+                );
+                self.push_status_message(id, PZ_LOCK_MESSAGE.as_bytes());
+                self.push(id, walk::cancel_walk(cur_dir.to_byte()));
+                return;
+            }
+        }
+
         let Some(to) = dest else {
             // Blocked: keep the original facing and snap the mover back;
             // spectators see nothing. Matches TFS: a failed walk never turns the
@@ -380,12 +398,9 @@ impl Game {
 
         // PZ badge: if the mover crossed a protection-zone boundary, resend the
         // icons packet so the client shows/hides the dove (TFS getClientIcons).
+        // A player who leaves PZ while still locked must keep the red swords.
         if self.chunks.is_protection_zone(from) != self.chunks.is_protection_zone(to) {
-            let mask = if self.chunks.is_protection_zone(to) {
-                enter_world::ICON_PIGEON
-            } else {
-                0
-            };
+            let mask = self.client_icon_mask(id);
             self.push(id, enter_world::icons(mask));
         }
 
@@ -574,15 +589,15 @@ impl Game {
         // queryAdd(FLAG_PATHFINDING) — monsters have no vertical resolution.
         // Protection zones are rejected unless the monster is already inside
         // (it may leave, but not enter).
-        let Some(to) = from
-            .offset(dx, dy)
-            .filter(|&d| {
-                self.chunks.is_walkable(d)
-                    && !self.tile_occupied(d, id)
-                    && self.chunks.floor_change_at(d.x as i32, d.y as i32, d.z as i32).is_empty()
-                    && !self.monster_entering_pz(Some(from), d)
-            })
-        else {
+        let Some(to) = from.offset(dx, dy).filter(|&d| {
+            self.chunks.is_walkable(d)
+                && !self.tile_occupied(d, id)
+                && self
+                    .chunks
+                    .floor_change_at(d.x as i32, d.y as i32, d.z as i32)
+                    .is_empty()
+                && !self.monster_entering_pz(Some(from), d)
+        }) else {
             // Blocked. Drop the rest of the queued path so later steps, which
             // assumed this one landed, are not played from the old tile.
             if let Some(m) = self.monsters.get_mut(&id) {
@@ -1180,6 +1195,113 @@ mod tests {
             [enter_world::OP_ICONS, 0x00, 0x00],
             "icons cleared on leaving PZ"
         );
+    }
+
+    #[test]
+    fn attacking_a_player_blocks_pz_entry_until_the_lock_expires() {
+        // TFS `Tile::queryAdd` + `Player::onAttackedCreature`: only a player
+        // target sets `pzLocked` (red swords). That lock blocks PZ entry for
+        // `PZ_LOCK_MS` after the target is cleared.
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
+        let (attacker, mut rx) = add_player(&mut g, Position::new(91, 117, 7));
+        let (victim, _rv) = add_player(&mut g, Position::new(92, 117, 7));
+
+        g.do_set_target(attacker, victim);
+        assert!(g.is_pz_locked(attacker), "attacking a player PZ-locks");
+        let icons = drain_find_icons(&mut rx).expect("red swords on lock");
+        assert_eq!(
+            icons,
+            [
+                enter_world::OP_ICONS,
+                (enter_world::ICON_REDSWORDS & 0xFF) as u8,
+                (enter_world::ICON_REDSWORDS >> 8) as u8,
+            ]
+        );
+
+        g.do_move(attacker, Direction::West);
+        assert_eq!(
+            g.players[&attacker].position,
+            Position::new(91, 117, 7),
+            "locked player must not step into PZ"
+        );
+        let mut saw = false;
+        while let Ok(pkt) = rx.try_recv() {
+            if pkt.first() == Some(&0xB4)
+                && pkt
+                    .windows(PZ_LOCK_MESSAGE.len())
+                    .any(|w| w == PZ_LOCK_MESSAGE.as_bytes())
+            {
+                saw = true;
+            }
+        }
+        assert!(saw, "rejection uses the TFS PZ-lock message");
+
+        g.do_set_target(attacker, 0);
+        assert!(
+            g.is_pz_locked(attacker),
+            "clearing the target does not lift the lock"
+        );
+        g.now_ms = PZ_LOCK_MS;
+        assert!(!g.is_pz_locked(attacker), "lock ends at pzLocked");
+        g.do_move(attacker, Direction::West);
+        assert_eq!(
+            g.players[&attacker].position,
+            Position::new(90, 117, 7),
+            "expired lock may enter PZ"
+        );
+    }
+
+    #[test]
+    fn attacking_a_monster_does_not_show_red_swords_or_block_pz() {
+        // TFS 1.4.2: a monster target calls `addInFightTicks()` but does not
+        // set `pzLocked`, so ICON_REDSWORDS stays off and the temple is open.
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
+        let (attacker, mut rx) = add_player(&mut g, Position::new(91, 117, 7));
+        let monster = add_monster(&mut g, Position::new(92, 117, 7));
+
+        g.do_set_target(attacker, monster);
+        assert!(!g.is_pz_locked(attacker), "monster attack must not PZ-lock");
+        let icons = drain_find_icons(&mut rx);
+        assert_ne!(
+            icons.as_deref(),
+            Some(
+                &[
+                    enter_world::OP_ICONS,
+                    (enter_world::ICON_REDSWORDS & 0xFF) as u8,
+                    (enter_world::ICON_REDSWORDS >> 8) as u8,
+                ][..]
+            ),
+            "monster attack must not show red swords"
+        );
+
+        g.do_move(attacker, Direction::West);
+        assert_eq!(
+            g.players[&attacker].position,
+            Position::new(90, 117, 7),
+            "hunting a monster must not block PZ entry"
+        );
+    }
+
+    #[test]
+    fn pz_lock_refreshes_while_attacking_and_icons_clear_on_expiry() {
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
+        let (attacker, mut rx) = add_player(&mut g, Position::new(91, 117, 7));
+        let (victim, _rv) = add_player(&mut g, Position::new(92, 117, 7));
+        g.do_set_target(attacker, victim);
+        while rx.try_recv().is_ok() {}
+
+        // Still fighting 30s later: the countdown restarts (TFS onAttacking).
+        // Hold the swing so this test does not depend on the damage roll.
+        g.players.get_mut(&attacker).unwrap().last_attack_ms = 30_000;
+        g.on_combat_tick(30_000);
+        assert_eq!(g.players[&attacker].pz_locked_until_ms, 30_000 + PZ_LOCK_MS);
+
+        g.do_set_target(attacker, 0);
+        while rx.try_recv().is_ok() {}
+        g.on_combat_tick(30_000 + PZ_LOCK_MS);
+        assert!(!g.is_pz_locked(attacker));
+        let icons = drain_find_icons(&mut rx).expect("icons pushed when the lock expires");
+        assert_eq!(icons, [enter_world::OP_ICONS, 0x00, 0x00]);
     }
 
     // ---- underground walk-out-and-back map consistency (live desync repro) ----

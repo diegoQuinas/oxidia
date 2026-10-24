@@ -84,7 +84,11 @@ impl Game {
                     Some(ContainerItem {
                         server_id: sid,
                         client_id: m.client_id,
-                        count: if m.stackable || m.is_fluid { Some(cnt) } else { None },
+                        count: if m.stackable || m.is_fluid {
+                            Some(cnt)
+                        } else {
+                            None
+                        },
                         animated: m.animated,
                     })
                 })
@@ -278,11 +282,11 @@ impl Game {
             let mut best_color = 0u8;
             for slot in &p.inventory {
                 let Some(it) = slot else { continue };
-            let (ll, lc) = match self.meta.item_meta(it.server_id) {
-                Some(m) if m.light_level > 0 => (m.light_level, m.light_color),
-                _ => Self::item_light(it.server_id),
-            };
-            if ll > max_level {
+                let (ll, lc) = match self.meta.item_meta(it.server_id) {
+                    Some(m) if m.light_level > 0 => (m.light_level, m.light_color),
+                    _ => Self::item_light(it.server_id),
+                };
+                if ll > max_level {
                     max_level = ll;
                     best_color = lc;
                 }
@@ -788,7 +792,8 @@ impl Game {
                     .unwrap_or(false);
                 let creatures = self.creatures_on(pos).len();
                 let from_stackpos = if idx < pre { idx } else { idx + creatures }.min(9) as u8;
-                let Some((_moved, removed_fully, _)) = self.take_from_ground(pos, idx, 1, stackable)
+                let Some((_moved, removed_fully, _)) =
+                    self.take_from_ground(pos, idx, 1, stackable)
                 else {
                     return;
                 };
@@ -1234,7 +1239,11 @@ impl Game {
             };
             self.broadcast_source(from_pos, from_stackpos, removed_fully, src_idx);
 
-            let cnt = if stackable { Some(moved) } else { original_count };
+            let cnt = if stackable {
+                Some(moved)
+            } else {
+                original_count
+            };
             let item = ContainerItem {
                 server_id: src_sid,
                 client_id,
@@ -2928,7 +2937,11 @@ mod tests {
         g.do_use_item(player, pos.x, pos.y, pos.z, stackpos, 0);
 
         let st = g.dynamic.get(&(pos.x, pos.y, pos.z)).unwrap();
-        assert_eq!(st.items.len(), before_len, "toggle must not add a second item");
+        assert_eq!(
+            st.items.len(),
+            before_len,
+            "toggle must not add a second item"
+        );
         assert!(
             st.server_ids.contains(&2051),
             "ground torch must light, ids: {:?}",
@@ -2978,7 +2991,10 @@ mod tests {
         // Container endpoint: pos_y = 0x40 | cid, pos_z = slot index.
         g.do_use_item(player, 0xFFFF, 0x40, 0, 0, 0);
 
-        let item = &g.players[&player].open_containers[0].as_ref().unwrap().items[0];
+        let item = &g.players[&player].open_containers[0]
+            .as_ref()
+            .unwrap()
+            .items[0];
         assert_eq!(item.server_id, 2051, "torch inside a bag must light");
         assert_eq!(item.client_id, 2921);
         assert_eq!(

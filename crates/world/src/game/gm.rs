@@ -523,8 +523,12 @@ impl Game {
             follow_target: None,
             target_distance: template.map(|t| t.target_distance).unwrap_or(0),
             race: template.and_then(|t| t.race),
-            personality: template.map(|t| t.personality).unwrap_or(Personality::Neutral),
-            aggro_range: template.map(|t| t.aggro_range).unwrap_or(DEFAULT_AGGRO_RANGE),
+            personality: template
+                .map(|t| t.personality)
+                .unwrap_or(Personality::Neutral),
+            aggro_range: template
+                .map(|t| t.aggro_range)
+                .unwrap_or(DEFAULT_AGGRO_RANGE),
             hostile: template.map(|t| t.hostile).unwrap_or(true),
             run_on_health: template.map(|t| t.run_on_health).unwrap_or(0),
             light_level: 0,
@@ -859,10 +863,8 @@ mod tests {
         static COUNTER: AtomicU16 = AtomicU16::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         // Pid keeps nextest's per-test processes from sharing one directory.
-        let dir = std::env::temp_dir().join(format!(
-            "oxidia-gm-{label}-{}-{seq}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("oxidia-gm-{label}-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -682,7 +682,9 @@ impl ChunkManager {
         let mut is_walkable = |x: u16, y: u16| -> bool {
             let pos = Position::new(x, y, z);
             let walkable = self.is_walkable(pos)
-                && self.floor_change_at(x as i32, y as i32, z as i32).is_empty()
+                && self
+                    .floor_change_at(x as i32, y as i32, z as i32)
+                    .is_empty()
                 && !(avoid_pz && pos != start && self.is_protection_zone(pos));
             if walkable {
                 let cx = x as i32 / CHUNK_DIM;
@@ -2936,7 +2938,10 @@ mod tests {
         let ids = chunks_around(pos);
         assert_eq!(ids.len(), 8 * 9, "origin viewport is floors 0..=7 × 3×3");
         assert!(ids.contains(&(0, 0, 0)), "origin chunk must be included");
-        assert!(ids.contains(&(-1, -1, 0)), "negative chunk ids stay in range");
+        assert!(
+            ids.contains(&(-1, -1, 0)),
+            "negative chunk ids stay in range"
+        );
         assert!(!ids.contains(&(0, 0, 8)), "z=0 does not pull in floor 8");
     }
 
@@ -3526,7 +3531,10 @@ mod tests {
 
         let path = chunks.get_path_matching(start, target, &[], &params, condition);
 
-        assert!(!path.is_empty(), "A* must find a detour around the hole tile");
+        assert!(
+            !path.is_empty(),
+            "A* must find a detour around the hole tile"
+        );
 
         // Trace the path and verify no intermediate step lands on the hole tile.
         let hole_x = 101i32;
@@ -3542,7 +3550,8 @@ mod tests {
             assert!(
                 i32::from(cur.x) != hole_x || i32::from(cur.y) != hole_y,
                 "path must not route through the hole tile at (101, 100); intermediate step landed on ({}, {})",
-                cur.x, cur.y,
+                cur.x,
+                cur.y,
             );
         }
     }

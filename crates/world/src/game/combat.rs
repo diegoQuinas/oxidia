@@ -37,21 +37,63 @@ impl Game {
     /// - Attacker on a PZ tile → push `0xB4` and do NOT set target
     ///   (`combat.cpp:294-297`, TFS `playerSetAttackedCreature`).
     /// - Unknown target (player or monster) is silently ignored.
-    ///   Push the combat-status icons (red swords) to `id` based on their
-    ///   current combat state and tile. Red swords when attacking and not in PZ.
-    fn push_combat_icons(&mut self, id: u32) {
-        let in_combat = self.players.get(&id).and_then(|p| p.attacking).is_some();
-        let in_pz = self
-            .players
-            .get(&id)
-            .map(|p| self.chunks.is_protection_zone(p.position))
-            .unwrap_or(false);
-        let mask = if in_combat && !in_pz {
-            enter_world::ICON_REDSWORDS
-        } else {
-            0
+    /// Status-icon mask for `id` (TFS `Player::getClientIcons`).
+    ///
+    /// `ICON_PIGEON` on a protection-zone tile. `ICON_REDSWORDS` while PZ-locked,
+    /// including inside a PZ (a temple teleport does not clear the lock).
+    /// `ICON_SWORDS` is the infight badge and is suppressed in PZ; the lock that
+    /// actually blocks entry is the red swords.
+    pub(super) fn client_icon_mask(&self, id: u32) -> u16 {
+        let Some(p) = self.players.get(&id) else {
+            return 0;
         };
+        let mut mask = 0u16;
+        if self.chunks.is_protection_zone(p.position) {
+            mask |= enter_world::ICON_PIGEON;
+        }
+        if p.pz_locked_until_ms > self.now_ms {
+            mask |= enter_world::ICON_REDSWORDS;
+        }
+        mask
+    }
+
+    /// Push the combat-status icons to `id`.
+    fn push_combat_icons(&mut self, id: u32) {
+        let mask = self.client_icon_mask(id);
         self.push(id, enter_world::icons(mask));
+    }
+
+    /// True while the player's TFS `pzLocked` timer has not expired.
+    pub(super) fn is_pz_locked(&self, id: u32) -> bool {
+        self.players
+            .get(&id)
+            .is_some_and(|p| p.pz_locked_until_ms > self.now_ms)
+    }
+
+    /// Start or refresh the PZ lock (`Player::addInFightTicks` / `pzLocked`).
+    /// Does not push icons; the caller does that when the visible mask changes.
+    fn refresh_pz_lock(&mut self, id: u32) {
+        let until = self.now_ms.saturating_add(PZ_LOCK_MS);
+        if let Some(p) = self.players.get_mut(&id) {
+            p.pz_locked_until_ms = until;
+        }
+    }
+
+    /// Drop expired locks and clear the red-swords badge.
+    fn expire_pz_locks(&mut self) {
+        let now = self.now_ms;
+        let expired: Vec<u32> = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.pz_locked_until_ms != 0 && p.pz_locked_until_ms <= now)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in expired {
+            if let Some(p) = self.players.get_mut(&id) {
+                p.pz_locked_until_ms = 0;
+            }
+            self.push_combat_icons(id);
+        }
     }
 
     pub(super) fn do_set_target(&mut self, id: u32, target_id: u32) {
@@ -87,6 +129,11 @@ impl Game {
             // Prime last_attack_ms = 0 so the first tick whose now_ms >=
             // MELEE_ATTACK_INTERVAL_MS swings immediately.
             p.last_attack_ms = 0;
+        }
+        // TFS `setAttackedCreature` → `onAttackedCreature`: `pzLocked` (red
+        // swords) is set only for a player target. A monster target does not.
+        if self.players.contains_key(&target_id) {
+            self.refresh_pz_lock(id);
         }
         self.push_combat_icons(id);
     }
@@ -678,6 +725,7 @@ impl Game {
     /// each whose attack interval has elapsed, rolls one swing. Out-of-range or
     /// missing targets clear the fight without damage.
     pub(super) fn on_combat_tick(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
         // --- Player attackers (existing) ---
         let player_fights: Vec<(u32, u32)> = self
             .players
@@ -687,6 +735,19 @@ impl Game {
         for (attacker_id, target_id) in player_fights {
             self.process_player_attack(attacker_id, target_id, now_ms);
         }
+        // TFS refreshes `pzLocked` only while the attacked creature is a player
+        // (`onAttackedCreature`). A monster target must not start or extend it.
+        let still_pvp: Vec<(u32, u32)> = self
+            .players
+            .iter()
+            .filter_map(|(&id, p)| p.attacking.map(|tid| (id, tid)))
+            .collect();
+        for (id, tid) in still_pvp {
+            if self.players.contains_key(&tid) {
+                self.refresh_pz_lock(id);
+            }
+        }
+        self.expire_pz_locks();
 
         // --- Monster attackers (M12.3) ---
         let monster_fights: Vec<(u32, u32)> = self
@@ -825,7 +886,9 @@ impl Game {
 
     /// Inventory slot 1..=10, if occupied.
     fn slot_item<'a>(p: &'a PlayerState, slot: u8) -> Option<&'a InvItem> {
-        p.inventory.get(usize::from(slot.wrapping_sub(1))).and_then(|s| s.as_ref())
+        p.inventory
+            .get(usize::from(slot.wrapping_sub(1)))
+            .and_then(|s| s.as_ref())
     }
 
     /// TFS `Player::getWeapon`: left hand, then right. Shields and ammo are not
@@ -896,7 +959,9 @@ impl Game {
             }
         }
         let skill = if meta.weapon_type == "wand" { 0 } else { skill };
-        (skill, attack, range, distance, takes_ammo, hit_chance, max_hit)
+        (
+            skill, attack, range, distance, takes_ammo, hit_chance, max_hit,
+        )
     }
 
     /// TFS `Player::getArmor`: head, necklace, armor, legs, feet, ring.
@@ -1054,7 +1119,8 @@ impl Game {
                 }
                 return;
             }
-            let max = combat::max_weapon_damage(level, skill, attack_value, combat::ATTACK_FACTOR).max(0);
+            let max =
+                combat::max_weapon_damage(level, skill, attack_value, combat::ATTACK_FACTOR).max(0);
             let min = combat::distance_min_damage(level, target_is_player).min(max);
             if max == 0 {
                 0
@@ -2337,7 +2403,10 @@ mod tests {
         // A blocked swing deals 0 and must not splash; tick until one connects.
         for tick in 1..=40u64 {
             g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
-            if g.dynamic.get(&(96, 117, 7)).is_some_and(|st| st.server_ids.contains(&ITEM_SMALLSPLASH)) {
+            if g.dynamic
+                .get(&(96, 117, 7))
+                .is_some_and(|st| st.server_ids.contains(&ITEM_SMALLSPLASH))
+            {
                 break;
             }
         }
@@ -2407,7 +2476,10 @@ mod tests {
         g.do_set_target(a, m);
         for tick in 1..=40u64 {
             g.on_combat_tick(tick * MELEE_ATTACK_INTERVAL_MS);
-            if g.dynamic.get(&(96, 117, 7)).is_some_and(|st| st.server_ids.contains(&ITEM_SMALLSPLASH)) {
+            if g.dynamic
+                .get(&(96, 117, 7))
+                .is_some_and(|st| st.server_ids.contains(&ITEM_SMALLSPLASH))
+            {
                 break;
             }
         }

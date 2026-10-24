@@ -252,17 +252,19 @@ impl LuaRuntime {
 
         let light_actions = Arc::clone(&actions);
         let do_set_creature_light = lua
-            .create_function(move |_, (player_id, light_level, light_color): (u32, u8, u8)| {
-                light_actions
-                    .lock()
-                    .unwrap()
-                    .push(GameAction::SetCreatureLight {
-                        player_id,
-                        light_level,
-                        light_color,
-                    });
-                Ok(())
-            })
+            .create_function(
+                move |_, (player_id, light_level, light_color): (u32, u8, u8)| {
+                    light_actions
+                        .lock()
+                        .unwrap()
+                        .push(GameAction::SetCreatureLight {
+                            player_id,
+                            light_level,
+                            light_color,
+                        });
+                    Ok(())
+                },
+            )
             .expect("create_function for do_set_creature_light must not fail");
         lua.globals()
             .set("do_set_creature_light", do_set_creature_light)
@@ -334,10 +336,8 @@ mod tests {
         static COUNTER: AtomicU16 = AtomicU16::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         // Pid keeps nextest's per-test processes from sharing one directory.
-        let dir = std::env::temp_dir().join(format!(
-            "oxidia-lua-{label}-{}-{seq}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("oxidia-lua-{label}-{}-{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

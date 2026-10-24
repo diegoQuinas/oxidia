@@ -32,8 +32,7 @@ use self::lua::LuaRuntime;
 #[allow(unused_imports)]
 pub(super) use self::monster::{
     DEFAULT_AGGRO_RANGE, FLEE_SIGHT_RANGE, MonsterDrop, MonsterSpawn, MonsterState, MonsterType,
-    Personality, parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml,
-    roll_drops,
+    Personality, parse_monsters_data_dir, parse_monsters_xml, parse_spawns_xml, roll_drops,
 };
 use self::npc::{NPC_ID_BASE, NpcState, npc_outfit, parse_npc_spawns_xml};
 use self::xml_registry::XmlRegistry;
@@ -62,6 +61,15 @@ const PUSH_CAPACITY: usize = 256;
 /// Attack interval for the no-vocation fist melee, matching TFS vocations.xml
 /// "None" attackspeed (`player.cpp:351-358`).
 pub const MELEE_ATTACK_INTERVAL_MS: u64 = 2000;
+
+/// How long a player stays PZ-locked after the last attack on another player.
+/// TFS `config.lua` `pzLocked` (milliseconds). Refreshed while that player
+/// target is set, so the countdown starts when the fight ends.
+pub const PZ_LOCK_MS: u64 = 60_000;
+
+/// TFS `RETURNVALUE_PLAYERISPZLOCKED` (`tools.cpp`).
+pub const PZ_LOCK_MESSAGE: &str =
+    "You can not enter a protection zone after attacking another player.";
 
 /// How often the global combat tick fires. Finer than the attack interval so
 /// timing granularity is good; cheap enough that the actor is not taxed.
@@ -337,6 +345,17 @@ struct PlayerState {
     /// `CombatTick { now_ms }`. Initialized to 0 so the first eligible tick
     /// swings immediately (mirrors TFS `doAttacking` priming logic).
     last_attack_ms: u64,
+    /// TFS `pzLocked` expiry in the same monotonic-ms space as `now_ms`.
+    /// `0` means not locked. While `> now_ms`, the player cannot step into a
+    /// protection zone (`tile.cpp` `queryAdd` → `RETURNVALUE_PLAYERISPZLOCKED`)
+    /// and the client shows `ICON_REDSWORDS`.
+    ///
+    /// Set only when this player attacks another player (`Player::onAttackedCreature`
+    /// in TFS 1.4.2). A monster target refreshes infight in TFS but does not set
+    /// `pzLocked`, so hunting does not show red swords and does not block PZ.
+    /// Refreshed on each combat tick while the current target is still a player,
+    /// so the 60s countdown starts when that fight ends.
+    pz_locked_until_ms: u64,
     /// Character sex: 0 = female, 1 = male (TFS outfits.xml `type` convention).
     /// Determines which gendered outfit catalog is sent in the 0xC8 window.
     sex: u8,
@@ -1545,11 +1564,12 @@ impl Game {
             )
             .collect();
 
+        let avoid_pz = self.is_pz_locked(id);
         let params = pathfinding::FindPathParams {
             full_search: false,
             clear_sight: false,
             max_search_dist: 20,
-            avoid_pz: false,
+            avoid_pz,
         };
         let tpos = target_pos;
         let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |pos| {
@@ -1590,13 +1610,12 @@ impl Game {
             Some(p) => p.position,
             None => return,
         };
-        // Can always walk within PZ. Entering PZ is only blocked if in combat.
-        if self.chunks.is_protection_zone(target) {
-            let in_combat = self.players.get(&id).and_then(|p| p.attacking).is_some();
-            if in_combat {
-                self.push_cannot_move(id, "You may not enter a protection zone while in combat.");
-                return;
-            }
+        // Walking inside a PZ is always allowed. Clicking a PZ tile while
+        // PZ-locked is rejected up front (the step check in `do_move` is the
+        // same rule for arrow keys and for a path that only crosses a PZ).
+        if self.chunks.is_protection_zone(target) && self.is_pz_locked(id) {
+            self.push_cannot_move(id, PZ_LOCK_MESSAGE);
+            return;
         }
         if pos.z != target.z {
             self.push_cannot_move(id, "You cannot walk to a different floor.");
@@ -1633,11 +1652,12 @@ impl Game {
             )
             .collect();
 
+        let avoid_pz = self.is_pz_locked(id);
         let params = pathfinding::FindPathParams {
             full_search: false,
             clear_sight: false,
             max_search_dist: 20,
-            avoid_pz: false,
+            avoid_pz,
         };
         let tpos = target;
         let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |p| p == tpos);
@@ -1988,11 +2008,12 @@ impl Game {
                         )
                         .collect();
 
+                    let avoid_pz = self.is_pz_locked(id);
                     let params = pathfinding::FindPathParams {
                         full_search: false,
                         clear_sight: false,
                         max_search_dist: 20,
-                        avoid_pz: false,
+                        avoid_pz,
                     };
                     let tpos = target_pos;
                     let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |p| {
@@ -2092,11 +2113,12 @@ impl Game {
                         )
                         .collect();
 
+                    let avoid_pz = self.is_pz_locked(id);
                     let params = pathfinding::FindPathParams {
                         full_search: false,
                         clear_sight: false,
                         max_search_dist: 20,
-                        avoid_pz: false,
+                        avoid_pz,
                     };
                     let tpos = target;
                     let condition: pathfinding::FrozenPathingConditionCall =
@@ -2156,18 +2178,8 @@ impl Game {
                     if let Some(p) = self.players.get_mut(&id) {
                         p.last_walk_ms = self.now_ms;
                     }
-                    // Check if next step would enter PZ.
-                    let next_pos = pos.offset(direction.delta().0, direction.delta().1);
-                    if let Some(np) = next_pos {
-                        if self.chunks.is_protection_zone(np) {
-                            if let Some(p) = self.players.get_mut(&id) {
-                                p.go_to_position = None;
-                                p.list_walk_dir.clear();
-                            }
-                            self.push_cannot_move(id, "You cannot walk there.");
-                            continue;
-                        }
-                    }
+                    // PZ entry is rejected inside `do_move` when the player is
+                    // locked. A peaceful click-path may enter a temple.
                     let pos_before = self.players.get(&id).map(|p| p.position);
                     self.do_move(id, direction);
                     // If the move was blocked (position unchanged), stop silently.
@@ -3288,9 +3300,9 @@ mod tests {
     }
 
     #[test]
-    fn ai_tick_clears_goto_on_pz_entry() {
+    fn ai_tick_peaceful_player_may_step_into_pz() {
         // wide_combat_map_with_pz: (90,117) is PZ, (91..116,117) non-PZ.
-        // Start at (91,117), step west into (90,117)PZ.
+        // A player who has not attacked may click-walk into the temple.
         let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
         let (pid, mut rx) = add_player(&mut g, Position::new(91, 117, 7));
         {
@@ -3298,19 +3310,50 @@ mod tests {
             p.go_to_position = Some(Position::new(80, 117, 7));
             p.list_walk_dir.push_back(Direction::West);
         }
-        // Tick: step west onto PZ tile (90,117)
         g.on_monster_ai_tick(0, 1000);
         while rx.try_recv().is_ok() {}
-        let p = g.players.get(&pid).unwrap();
-        // After stepping into PZ, goto must be cleared
-        assert!(
-            p.go_to_position.is_none(),
-            "goto must be cleared when stepping into PZ"
+        assert_eq!(
+            g.players.get(&pid).unwrap().position,
+            Position::new(90, 117, 7),
+            "peaceful click-walk may enter a protection zone"
         );
+    }
+
+    #[test]
+    fn ai_tick_pz_locked_player_cannot_step_into_pz() {
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
+        let (pid, mut rx) = add_player(&mut g, Position::new(91, 117, 7));
+        let (victim, _rv) = add_player(&mut g, Position::new(92, 117, 7));
+        g.do_set_target(pid, victim);
+        while rx.try_recv().is_ok() {}
+        {
+            let p = g.players.get_mut(&pid).unwrap();
+            p.go_to_position = Some(Position::new(80, 117, 7));
+            p.list_walk_dir.push_back(Direction::West);
+        }
+        g.on_monster_ai_tick(0, 1000);
+        let mut saw_lock = false;
+        while let Ok(pkt) = rx.try_recv() {
+            if pkt.first() == Some(&0xB4)
+                && pkt
+                    .windows(PZ_LOCK_MESSAGE.len())
+                    .any(|w| w == PZ_LOCK_MESSAGE.as_bytes())
+            {
+                saw_lock = true;
+            }
+        }
+        let p = g.players.get(&pid).unwrap();
+        assert_eq!(
+            p.position,
+            Position::new(91, 117, 7),
+            "PZ-locked click-walk must not enter the temple"
+        );
+        assert!(p.go_to_position.is_none(), "blocked step clears goto");
         assert!(
             p.list_walk_dir.is_empty(),
-            "walk queue must be cleared when stepping into PZ"
+            "blocked step clears the walk queue"
         );
+        assert!(saw_lock, "blocked step must explain the PZ lock");
     }
 
     #[test]
@@ -4102,7 +4145,10 @@ mod tests {
             0,
         );
         assert!(g.monsters.is_empty(), "unknown names must not spawn");
-        assert!(g.spawns.is_empty(), "unknown names must not register a spawn");
+        assert!(
+            g.spawns.is_empty(),
+            "unknown names must not register a spawn"
+        );
     }
 
     #[test]
@@ -4136,7 +4182,10 @@ mod tests {
         g.on_monster_ai_tick(4, 1000);
         let rabbit = &g.monsters[&id];
         assert!(rabbit.attacking.is_none(), "loaded rabbit must not aggro");
-        assert!(rabbit.follow_target.is_none(), "loaded rabbit must not chase");
+        assert!(
+            rabbit.follow_target.is_none(),
+            "loaded rabbit must not chase"
+        );
         assert!(
             chebyshev(rabbit.position, Position::new(95, 117, 7))
                 > chebyshev(start, Position::new(95, 117, 7)),
