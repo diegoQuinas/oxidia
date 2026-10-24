@@ -572,15 +572,23 @@ impl Game {
         // monsters (not solid), but players still block.
         // Floor-change tiles (holes, stairs) are rejected per TFS
         // queryAdd(FLAG_PATHFINDING) — monsters have no vertical resolution.
+        // Protection zones are rejected unless the monster is already inside
+        // (it may leave, but not enter).
         let Some(to) = from
             .offset(dx, dy)
             .filter(|&d| {
                 self.chunks.is_walkable(d)
                     && !self.tile_occupied(d, id)
                     && self.chunks.floor_change_at(d.x as i32, d.y as i32, d.z as i32).is_empty()
+                    && !self.monster_entering_pz(Some(from), d)
             })
         else {
-            return; // blocked — skip silently
+            // Blocked. Drop the rest of the queued path so later steps, which
+            // assumed this one landed, are not played from the old tile.
+            if let Some(m) = self.monsters.get_mut(&id) {
+                m.list_walk_dir.clear();
+            }
+            return;
         };
 
         // Commit direction and position.
@@ -2754,6 +2762,44 @@ mod tests {
             g.monsters.get(&mid).unwrap().position,
             Position::new(100, 100, 7),
             "monster must not step onto a floor-change tile"
+        );
+    }
+
+    #[test]
+    fn monster_does_not_step_into_protection_zone() {
+        // wide_combat_map_with_pz: x=90,y=117 is PZ; x=91 is not.
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
+        let mid = add_monster(&mut g, Position::new(91, 117, 7));
+        g.monsters
+            .get_mut(&mid)
+            .unwrap()
+            .list_walk_dir
+            .push_back(Direction::West);
+
+        g.do_move_monster(mid, Direction::West);
+
+        assert_eq!(
+            g.monsters.get(&mid).unwrap().position,
+            Position::new(91, 117, 7),
+            "monster must not enter a protection zone"
+        );
+        assert!(
+            g.monsters.get(&mid).unwrap().list_walk_dir.is_empty(),
+            "rejected PZ step must drop the rest of the queued path"
+        );
+    }
+
+    #[test]
+    fn monster_already_in_protection_zone_may_leave() {
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
+        let mid = add_monster(&mut g, Position::new(90, 117, 7));
+
+        g.do_move_monster(mid, Direction::East);
+
+        assert_eq!(
+            g.monsters.get(&mid).unwrap().position,
+            Position::new(91, 117, 7),
+            "monster already in a protection zone must be able to leave"
         );
     }
 

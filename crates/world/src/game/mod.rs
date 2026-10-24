@@ -984,14 +984,23 @@ impl Game {
     }
 
     /// Can this monster take one step onto `to`? Same checks as `do_move_monster`:
-    /// walkable, not occupied, no floor-change (monsters don't use stairs).
+    /// walkable, not occupied, no floor-change (monsters don't use stairs),
+    /// and not entering a protection zone. A monster already inside may leave.
     fn monster_can_step(&self, id: u32, to: Position) -> bool {
+        let from = self.monsters.get(&id).map(|m| m.position);
         self.chunks.is_walkable(to)
             && !self.tile_occupied(to, id)
             && self
                 .chunks
                 .floor_change_at(to.x as i32, to.y as i32, to.z as i32)
                 .is_empty()
+            && !self.monster_entering_pz(from, to)
+    }
+
+    /// True when `to` is a protection zone and the monster is not already in one.
+    fn monster_entering_pz(&self, from: Option<Position>, to: Position) -> bool {
+        self.chunks.is_protection_zone(to)
+            && !from.is_some_and(|p| self.chunks.is_protection_zone(p))
     }
 
     /// One step that increases distance from `threat`. Prefers the step most
@@ -1540,6 +1549,7 @@ impl Game {
             full_search: false,
             clear_sight: false,
             max_search_dist: 20,
+            avoid_pz: false,
         };
         let tpos = target_pos;
         let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |pos| {
@@ -1627,6 +1637,7 @@ impl Game {
             full_search: false,
             clear_sight: false,
             max_search_dist: 20,
+            avoid_pz: false,
         };
         let tpos = target;
         let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |p| p == tpos);
@@ -1743,16 +1754,24 @@ impl Game {
                     None => continue,
                 };
                 if let Some(pid) = self.nearest_player_in_range(mpos, arange) {
-                    if let Some(m) = self.monsters.get_mut(&id) {
-                        m.attacking = Some(pid);
-                        m.follow_target = Some(pid);
-                        m.last_attack_ms = 0;
+                    let target_in_pz = self
+                        .players
+                        .get(&pid)
+                        .is_some_and(|p| self.chunks.is_protection_zone(p.position));
+                    // A player inside a protection zone is not a valid target.
+                    // Re-acquiring them would pin the monster to the PZ edge.
+                    if !target_in_pz {
+                        if let Some(m) = self.monsters.get_mut(&id) {
+                            m.attacking = Some(pid);
+                            m.follow_target = Some(pid);
+                            m.last_attack_ms = 0;
+                        }
                     }
                 }
             }
 
             // --- Path refresh ---
-            let (follow_target, needs_refresh, terp, target_distance) = {
+            let (mut follow_target, needs_refresh, terp, target_distance) = {
                 let m = match self.monsters.get(&id) {
                     Some(m) => m,
                     None => continue,
@@ -1765,7 +1784,29 @@ impl Game {
                 )
             };
 
-            if needs_refresh {
+            // Chase target stepped into a protection zone: drop the fight and
+            // step away so the monster wanders instead of camping the border.
+            if let Some(tid) = follow_target {
+                let target_in_pz = self
+                    .players
+                    .get(&tid)
+                    .is_some_and(|p| self.chunks.is_protection_zone(p.position));
+                if target_in_pz {
+                    let tpos = self.players.get(&tid).map(|p| p.position);
+                    let away = tpos.and_then(|tp| self.flee_step(id, terp, tp));
+                    if let Some(m) = self.monsters.get_mut(&id) {
+                        m.attacking = None;
+                        m.follow_target = None;
+                        m.list_walk_dir.clear();
+                        if let Some(dir) = away {
+                            m.list_walk_dir.push_back(dir);
+                        }
+                    }
+                    follow_target = None;
+                }
+            }
+
+            if needs_refresh && follow_target.is_some() {
                 let Some(target_id) = follow_target else {
                     continue;
                 };
@@ -1796,6 +1837,7 @@ impl Game {
                     full_search: false,
                     clear_sight: false,
                     max_search_dist: 20,
+                    avoid_pz: true,
                 };
                 let tpos = target_pos;
                 let td = target_distance.max(1) as u32;
@@ -1950,6 +1992,7 @@ impl Game {
                         full_search: false,
                         clear_sight: false,
                         max_search_dist: 20,
+                        avoid_pz: false,
                     };
                     let tpos = target_pos;
                     let condition: pathfinding::FrozenPathingConditionCall = Box::new(move |p| {
@@ -2053,6 +2096,7 @@ impl Game {
                         full_search: false,
                         clear_sight: false,
                         max_search_dist: 20,
+                        avoid_pz: false,
                     };
                     let tpos = target;
                     let condition: pathfinding::FrozenPathingConditionCall =
@@ -3801,6 +3845,37 @@ mod tests {
         assert!(
             monster.follow_target.is_some(),
             "aggressive monster should set follow_target"
+        );
+    }
+
+    #[test]
+    fn monster_wanders_off_when_chase_target_enters_pz() {
+        // Player on the PZ tile, monster on the adjacent tile, still chasing.
+        let mut g = Game::from_static_map_arc(wide_combat_map_with_pz());
+        let (pid, _rx) = add_player(&mut g, Position::new(90, 117, 7));
+        let m = add_monster_with_personality(
+            &mut g,
+            Position::new(91, 117, 7),
+            Personality::Aggressive,
+        );
+        g.monsters.get_mut(&m).unwrap().attacking = Some(pid);
+        g.monsters.get_mut(&m).unwrap().follow_target = Some(pid);
+
+        g.on_monster_ai_tick((m % 10) as u8, 1000);
+
+        let monster = g.monsters.get(&m).unwrap();
+        assert!(
+            monster.attacking.is_none() && monster.follow_target.is_none(),
+            "chase must drop when the target is in a protection zone"
+        );
+        assert_ne!(
+            monster.position,
+            Position::new(91, 117, 7),
+            "monster must step away from the PZ instead of camping the border"
+        );
+        assert!(
+            !g.chunks.is_protection_zone(monster.position),
+            "step away must not enter the protection zone"
         );
     }
 

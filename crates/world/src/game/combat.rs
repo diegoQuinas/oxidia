@@ -1139,6 +1139,12 @@ impl Game {
         {
             if let Some(m) = self.monsters.get_mut(&attacker_id) {
                 m.attacking = None;
+                // Drop the chase too. Leaving follow_target set parks the
+                // monster on the PZ edge instead of letting it wander off.
+                if target_is_player && self.chunks.is_protection_zone(target_pos) {
+                    m.follow_target = None;
+                    m.list_walk_dir.clear();
+                }
             }
             return;
         }

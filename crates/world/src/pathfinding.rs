@@ -10,6 +10,9 @@ pub struct FindPathParams {
     pub full_search: bool,
     pub clear_sight: bool,
     pub max_search_dist: i32,
+    /// When set, protection-zone tiles are not walkable except the start tile
+    /// (so a creature already inside can still path out).
+    pub avoid_pz: bool,
 }
 pub type FrozenPathingConditionCall = Box<dyn Fn(Position) -> bool>;
 #[derive(Clone, Copy)]
@@ -266,6 +269,7 @@ mod tests {
                 full_search: false,
                 clear_sight: false,
                 max_search_dist: 30,
+                avoid_pz: false,
             },
             &|p| p == Position::new(8, 8, 7),
             &mut |x, y| x < 20 && y < 20,
@@ -283,6 +287,7 @@ mod tests {
                 full_search: false,
                 clear_sight: false,
                 max_search_dist: 30,
+                avoid_pz: false,
             },
             &|_| false,
             &mut |x, y| x == 5 && y == 5,

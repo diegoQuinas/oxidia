@@ -678,9 +678,12 @@ impl ChunkManager {
         // is_walkable closure with chunk-edge preload guard: when the A* frontier
         // reaches within 20 tiles of its chunk's edge, trigger ensure_loaded on
         // the adjacent chunk so the pathfinding never hits an unloaded tile.
+        let avoid_pz = params.avoid_pz;
         let mut is_walkable = |x: u16, y: u16| -> bool {
-            let walkable = self.is_walkable(Position::new(x, y, z))
-                && self.floor_change_at(x as i32, y as i32, z as i32).is_empty();
+            let pos = Position::new(x, y, z);
+            let walkable = self.is_walkable(pos)
+                && self.floor_change_at(x as i32, y as i32, z as i32).is_empty()
+                && !(avoid_pz && pos != start && self.is_protection_zone(pos));
             if walkable {
                 let cx = x as i32 / CHUNK_DIM;
                 let cy = y as i32 / CHUNK_DIM;
@@ -1644,7 +1647,11 @@ impl StaticMap {
         condition: pathfinding::FrozenPathingConditionCall,
     ) -> VecDeque<Direction> {
         let creature_coords: Vec<(u16, u16)> = creatures.iter().map(|p| (p.x, p.y)).collect();
-        let mut is_walkable = |x: u16, y: u16| self.is_walkable(Position::new(x, y, start.z));
+        let avoid_pz = params.avoid_pz;
+        let mut is_walkable = |x: u16, y: u16| {
+            let pos = Position::new(x, y, start.z);
+            self.is_walkable(pos) && !(avoid_pz && pos != start && self.is_protection_zone(pos))
+        };
         pathfinding::get_path_matching(
             start,
             target,
@@ -3513,6 +3520,7 @@ mod tests {
             full_search: false,
             clear_sight: false,
             max_search_dist: 30,
+            avoid_pz: false,
         };
         let condition: FrozenPathingConditionCall = Box::new(move |p| p == target);
 
