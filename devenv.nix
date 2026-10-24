@@ -40,8 +40,13 @@
 
   # https://devenv.sh/basics/
   enterShell = ''
-    hello         # Run scripts directly
-    git --version # Use packages
+    # Commit gate lives in .githooks/pre-commit (check && test && rebuild && bounce).
+    # core.hooksPath replaces .git/hooks, so this must stay set for the gate to run.
+    git config core.hooksPath .githooks
+    if [ -z "''${OXIDIA_HOOK:-}" ]; then
+      hello         # Run scripts directly
+      git --version # Use packages
+    fi
   '';
 
   # https://devenv.sh/tasks/

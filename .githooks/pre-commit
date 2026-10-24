@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Commit gate: cargo check && cargo test && rebuild && bounce the server.
+#
+# A failing check or test aborts the commit and leaves the running server alone.
+# The server is stopped only after the new binary exists, then started detached
+# so it survives this hook. Skip with `git commit --no-verify` or
+# OXIDIA_SKIP_HOOK=1. OXIDIA_RELEASE=1 rebuilds and restarts the release binary.
+set -euo pipefail
+
+if [[ "${OXIDIA_SKIP_HOOK:-}" == 1 ]]; then
+  echo "oxidia hook: skipped (OXIDIA_SKIP_HOOK=1)"
+  exit 0
+fi
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+# System rustup has no default toolchain; cargo only works inside devenv.
+if [[ -z "${DEVENV_ROOT:-}" ]]; then
+  # OXIDIA_HOOK keeps devenv's enterShell from printing the greeting into the commit.
+  OXIDIA_HOOK=1 exec devenv shell -q -- bash "$root/.githooks/pre-commit"
+fi
+
+if [[ ! -f config/server.toml ]]; then
+  echo "oxidia hook: config/server.toml is missing (copy config/server.toml.example)" >&2
+  exit 1
+fi
+
+read_port() {
+  local key="$1" fallback="$2" value
+  value="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" config/server.toml | head -n 1)"
+  if [[ -z "$value" ]]; then
+    echo "$fallback"
+  else
+    echo "$value"
+  fi
+}
+
+login_port="$(read_port login_port 7171)"
+game_port="$(read_port game_port 7172)"
+state_dir="$root/.devenv"
+pidfile="$state_dir/server.pid"
+logfile="$state_dir/server.log"
+mkdir -p "$state_dir"
+
+profile_args=()
+bin="$root/target/debug/oxidia"
+if [[ "${OXIDIA_RELEASE:-}" == 1 ]]; then
+  profile_args=(--release)
+  bin="$root/target/release/oxidia"
+fi
+
+stashed=0
+restore_stash() {
+  if [[ "$stashed" == 1 ]]; then
+    stashed=0
+    git stash pop -q || echo "oxidia hook: could not restore unstaged changes; see git stash list" >&2
+  fi
+}
+trap restore_stash EXIT
+
+# Test and build the index, not unstaged edits, so the bounced server matches the commit.
+if ! git diff --quiet; then
+  git stash push --keep-index -q -m "oxidia-pre-commit"
+  stashed=1
+fi
+
+echo "oxidia hook: check"
+cargo check --workspace --all-targets
+
+echo "oxidia hook: tests"
+cargo test --workspace
+
+echo "oxidia hook: rebuild"
+cargo build -p server --bin oxidia "${profile_args[@]}"
+
+port_pids() {
+  ss -lptnH "sport = :$login_port" "sport = :$game_port" 2>/dev/null \
+    | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' \
+    | sort -u
+}
+
+port_listening() {
+  local port="$1"
+  ss -lntH "sport = :$port" 2>/dev/null | grep -q .
+}
+
+stop_server() {
+  local -a pids=()
+  local pid seen=" "
+
+  if [[ -f "$pidfile" ]]; then
+    pid="$(tr -d '[:space:]' <"$pidfile" || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      pids+=("$pid")
+      seen+="$pid "
+    fi
+  fi
+
+  while read -r pid; do
+    [[ -z "$pid" || "$seen" == *" $pid "* ]] && continue
+    pids+=("$pid")
+    seen+="$pid "
+  done < <(port_pids || true)
+
+  if command -v pgrep >/dev/null 2>&1; then
+    while read -r pid; do
+      [[ -z "$pid" || "$seen" == *" $pid "* ]] && continue
+      pids+=("$pid")
+      seen+="$pid "
+    done < <(pgrep -x oxidia || true)
+  fi
+
+  if ((${#pids[@]} == 0)); then
+    echo "oxidia hook: server was not running"
+    return 0
+  fi
+
+  echo "oxidia hook: stopping server (${pids[*]}) — SIGTERM saves online players"
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+
+  local i alive
+  for i in $(seq 1 40); do
+    alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+      fi
+    done
+    if [[ "$alive" == 0 ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "oxidia hook: server did not exit, sending SIGKILL" >&2
+  kill -KILL "${pids[@]}" 2>/dev/null || true
+  sleep 0.5
+}
+
+wait_ports_free() {
+  local i
+  for i in $(seq 1 40); do
+    if ! port_listening "$login_port" && ! port_listening "$game_port"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "oxidia hook: ports $login_port/$game_port still busy" >&2
+  return 1
+}
+
+echo "oxidia hook: restart"
+stop_server
+wait_ports_free
+
+{
+  printf '\n===== %s oxidia hook restart =====\n' "$(date -Is)"
+} >>"$logfile"
+
+# New session, and ignore SIGHUP, so the server survives the hook and devenv shell.
+setsid nohup "$bin" "$root/config/server.toml" >>"$logfile" 2>&1 < /dev/null &
+server_pid=$!
+echo "$server_pid" >"$pidfile"
+disown "$server_pid" 2>/dev/null || true
+
+deadline=$((SECONDS + 90))
+while ((SECONDS < deadline)); do
+  if port_listening "$login_port" && port_listening "$game_port"; then
+    echo "oxidia hook: server up on $login_port/$game_port (pid $server_pid, log $logfile)"
+    exit 0
+  fi
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    echo "oxidia hook: server exited before listening. Last log lines:" >&2
+    tail -n 40 "$logfile" >&2 || true
+    exit 1
+  fi
+  sleep 0.5
+done
+
+echo "oxidia hook: server did not listen within 90s. Last log lines:" >&2
+tail -n 40 "$logfile" >&2 || true
+exit 1
