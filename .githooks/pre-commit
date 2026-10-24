@@ -72,8 +72,7 @@ echo "oxidia hook: tests"
 cargo test --workspace
 
 echo "oxidia hook: rebuild"
-cargo build -p server --bin oxidia "${profile_args[@]}"
-
+cargo build -p server --bin oxidia "${profile_args[@]}" --release
 port_pids() {
   ss -lptnH "sport = :$login_port" "sport = :$game_port" 2>/dev/null \
     | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' \
