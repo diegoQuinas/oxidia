@@ -820,22 +820,30 @@ impl Game {
         self.push_status_message(id, format!("{who} speed set to {value}.").as_bytes());
     }
 
-    /// `/day` — force day phase (light transitions gradually from 35 to 215).
+    /// `/day` — force full daylight (215).
+    ///
+    /// Day interpolates 35 → 215, so elapsed 0 is dawn (dark) — the opposite of
+    /// what `/help` promises. Snap to the end of the phase (noon). The next tick
+    /// rolls into night, which also starts at 215, so the level does not jump.
     fn gm_day(&mut self, id: u32) {
         self.day_phase = DayPhase::Day;
-        self.phase_elapsed_ms = 0;
+        self.phase_elapsed_ms = self.day_duration_ms;
         self.world_light_level = self.current_world_light_level();
         self.broadcast_world_light();
-        self.push_status_message(id, b"World light set to day (dawn).");
+        self.push_status_message(id, b"World light set to day.");
     }
 
-    /// `/night` — force night phase (light transitions gradually from 215 to 35).
+    /// `/night` — force full night (35).
+    ///
+    /// Night interpolates 215 → 35, so elapsed 0 is dusk (bright). Snap to the
+    /// end of the phase (midnight). The next tick rolls into day, which also
+    /// starts at 35, so the level does not jump.
     fn gm_night(&mut self, id: u32) {
         self.day_phase = DayPhase::Night;
-        self.phase_elapsed_ms = 0;
+        self.phase_elapsed_ms = self.night_duration_ms;
         self.world_light_level = self.current_world_light_level();
         self.broadcast_world_light();
-        self.push_status_message(id, b"World light set to night (dusk).");
+        self.push_status_message(id, b"World light set to night.");
     }
 }
 
@@ -1435,5 +1443,44 @@ mod tests {
             visible.contains(&gm),
             "GM's visible_from must include ghost GM"
         );
+    }
+
+    #[test]
+    fn day_and_night_commands_set_matching_light() {
+        let mut g = Game::from_static_map_arc(walk_map());
+        let (gm, mut rx) = add_player(&mut g, Position::new(100, 100, 7));
+        g.players.get_mut(&gm).unwrap().gamemaster = true;
+        drain(&mut rx);
+
+        g.do_gm_command(gm, "/day".into());
+        assert_eq!(g.day_phase, DayPhase::Day);
+        assert_eq!(
+            g.world_light_level, 215,
+            "/day must broadcast full daylight, not dawn"
+        );
+        let pkts = drain(&mut rx);
+        assert!(
+            pkts.iter()
+                .any(|p| p.first() == Some(&0x82) && p.get(1) == Some(&215)),
+            "must broadcast world light 215, got {pkts:?}"
+        );
+        // Next cycle tick rolls into night, which starts at the same level.
+        g.on_day_night_tick(5_000);
+        assert_eq!(g.world_light_level, 215, "/day must not snap back to night");
+
+        g.do_gm_command(gm, "/night".into());
+        assert_eq!(g.day_phase, DayPhase::Night);
+        assert_eq!(
+            g.world_light_level, 35,
+            "/night must broadcast full night, not dusk"
+        );
+        let pkts = drain(&mut rx);
+        assert!(
+            pkts.iter()
+                .any(|p| p.first() == Some(&0x82) && p.get(1) == Some(&35)),
+            "must broadcast world light 35, got {pkts:?}"
+        );
+        g.on_day_night_tick(5_000);
+        assert_eq!(g.world_light_level, 35, "/night must not snap back to day");
     }
 }
